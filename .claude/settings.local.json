@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "mcp__plugin_context7_context7__resolve-library-id",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(git merge:*)",
+      "Bash(echo:*)",
+      "Bash(powershell -Command \"((Get-Content ''C:\\Program Files (x86)\\Steam\\steamapps\\common\\assettocorsa\\apps\\lua\\ac-tracer\\tracks\\ier_daytona.csv'')[13] -split '','') | Select-String ''brake''\")",
+      "Bash(powershell -Command:*)",
+      "Bash(git push)",
+      "Bash(ls:*)",
+      "Bash(powershell -File:*)",
+      "Bash(git fetch:*)",
+      "Bash(git stash:*)",
+      "Bash(git pull:*)",
+      "Bash(testsrun.cmd)",
+      "Bash(cmd /c \"tests\\\\run.cmd\")",
+      "Bash(luajit:*)",
+      "Bash(cmd.exe /c \"cd /d \"\"C:\\\\Program Files \\(x86\\)\\\\Steam\\\\steamapps\\\\common\\\\assettocorsa\\\\apps\\\\lua\\\\ac-tracer\"\" && \"\"%LOCALAPPDATA%\\\\Programs\\\\LuaJIT\\\\bin\\\\luajit.exe\"\" tests/test_runner.lua 2>&1\")",
+      "Bash(where:*)",
+      "Bash(dir:*)",
+      "Bash(find:*)",
+      "Bash(mv ACPythonDocumentation.md reference/)",
+      "Bash(mv config.ini reference/)",
+      "Bash(mv stdlib:*)",
+      "Bash(mv stdlib64:*)",
+      "Bash(mv third_party reference/)"
+    ]
+  }
+}
