@@ -288,11 +288,12 @@ def index():
                 transition: background-color 0.3s;
             }
             @keyframes collision-flash {
-                0%, 100% { background-color: transparent; }
-                50% { background-color: rgba(229, 57, 53, 0.15); }
+                0%, 100% { background-color: rgba(229, 57, 53, 0.1); }
+                50% { background-color: rgba(229, 57, 53, 0.35); }
             }
             .driver-item.colliding {
-                animation: collision-flash 0.6s ease-in-out infinite;
+                animation: collision-flash 1s ease-in-out infinite;
+                border-color: rgba(229, 57, 53, 0.5);
             }
             .driver-item button {
                 padding: 8px 12px;

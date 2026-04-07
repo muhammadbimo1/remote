@@ -48,6 +48,19 @@ local lastCommandSeq = 0
 local updateAccum = 0
 local UPDATE_INTERVAL = 0.1 -- 100 ms
 
+-- Collision flags: set by ac.onCarCollision callbacks, consumed by telemetry writer
+local collisionFlags = {}
+local registeredCollisionCars = 0
+
+local function registerCollisionCallbacks(carCount)
+  for i = registeredCollisionCars, carCount - 1 do
+    ac.onCarCollision(i, function()
+      collisionFlags[i] = true
+    end)
+  end
+  registeredCollisionCars = carCount
+end
+
 -- Cached driver data for the UI (rebuilt each telemetry tick)
 local driverRows = {}
 
@@ -228,7 +241,8 @@ local function updateTelemetry()
     c.lap_count = car.lapCount
     c.is_in_pit = car.isInPitlane and 1 or 0
     c.is_connected = car.isConnected and 1 or 0
-    c.is_colliding = car.collisionDepth > 0 and 1 or 0
+    c.is_colliding = collisionFlags[i] and 1 or 0
+    collisionFlags[i] = false
     writeWchar(c.driver_name, car:driverName(), 64)
   end
 
@@ -242,6 +256,10 @@ function script.update(dt)
   updateAccum = updateAccum + dt
   if updateAccum < UPDATE_INTERVAL then return end
   updateAccum = 0
+
+  if sim.carsCount > registeredCollisionCars then
+    registerCollisionCallbacks(sim.carsCount)
+  end
 
   updateTelemetry()
   processCommands()
