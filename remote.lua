@@ -60,7 +60,7 @@ local CUSTOM_TO_CSP = {
   [2] = ac.CameraMode.Cockpit,
   [3] = ac.CameraMode.Helicopter,
   [4] = ac.CameraMode.Car,
-  [5] = ac.CameraMode.Free,
+  [5] = ac.CameraMode.OnBoardFree,
 }
 
 local CSP_TO_CUSTOM = {
@@ -68,9 +68,9 @@ local CSP_TO_CUSTOM = {
   [ac.CameraMode.Cockpit]     = 2,
   [ac.CameraMode.Helicopter]  = 3,
   [ac.CameraMode.Car]         = 4,
-  [ac.CameraMode.Free]        = 5,
-  [ac.CameraMode.Drivable]    = 2,
   [ac.CameraMode.OnBoardFree] = 5,
+  [ac.CameraMode.Drivable]    = 2,
+  [ac.CameraMode.Free]        = 5,
 }
 
 local CAMERA_NAMES = {
@@ -123,7 +123,7 @@ local function changeCamera(cam, carIndex, subCam)
       end
     end
   elseif cam == 5 then
-    ac.setCurrentCamera(ac.CameraMode.Free)
+    ac.setCurrentCamera(ac.CameraMode.OnBoardFree)
   end
 end
 
@@ -257,7 +257,7 @@ local COLOR_OFFLINE = rgbm(0.5, 0.5, 0.5, 1.0)
 local COLOR_DEFAULT = rgbm(1.0, 1.0, 1.0, 1.0)
 local COLOR_DIM     = rgbm(0.6, 0.6, 0.6, 1.0)
 
-local CAMERA_LABELS = { 'Track', 'Cockpit', 'Heli', 'F6', 'Free' }
+local CAMERA_LABELS = { 'Track', 'Cockpit', 'Heli', 'F6', 'Orbit' }
 
 function script.windowMain(dt)
   local focusedCar = sim.focusedCar

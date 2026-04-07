@@ -444,7 +444,7 @@ def index():
             <button data-cam="2" onclick="changeCamera(2)">Cockpit</button>
             <button data-cam="3" onclick="changeCamera(3)">Heli</button>
             <button data-cam="4" onclick="changeCamera(4)">F6</button>
-            <button data-cam="5" onclick="changeCamera(5)">Free</button>
+            <button data-cam="5" onclick="changeCamera(5)">Orbit</button>
         </div>
         <div id="subcam-bar" class="subcam-bar" style="display:none"></div>
 
