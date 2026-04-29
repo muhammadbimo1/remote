@@ -48,18 +48,16 @@ local lastCommandSeq = 0
 local updateAccum = 0
 local UPDATE_INTERVAL = 0.1 -- 100 ms
 
--- Collision flags: set by ac.onCarCollision callbacks, consumed by telemetry writer
+-- Collision flags: consumed (and reset) by telemetry writer.
+-- Callback fires reliably only for the local car; damage-array deltas
+-- cover remote cars since damage state is replicated online.
 local collisionFlags = {}
-local registeredCollisionCars = 0
+local prevDamageSum = {}
 
-local function registerCollisionCallbacks(carCount)
-  for i = registeredCollisionCars, carCount - 1 do
-    ac.onCarCollision(i, function()
-      collisionFlags[i] = true
-    end)
-  end
-  registeredCollisionCars = carCount
-end
+ac.onCarCollision(-1, function(carIndex)
+  collisionFlags[carIndex] = true
+end)
+
 
 -- Cached driver data for the UI (rebuilt each telemetry tick)
 local driverRows = {}
@@ -150,7 +148,12 @@ local function processCommands()
     local driver = cmdPage.target_driver
     local camera = cmdPage.target_camera
     local subCam = cmdPage.target_car_camera
-    ac.focusCar(driver)
+    -- Only refocus when the driver actually changes. Calling ac.focusCar on
+    -- the already-focused car queues an internal camera reset that clobbers
+    -- the setCurrentCamera below on the following frame.
+    if driver >= 0 and driver ~= sim.focusedCar then
+      ac.focusCar(driver)
+    end
     changeCamera(camera, driver, subCam)
   end
 end
@@ -241,7 +244,10 @@ local function updateTelemetry()
     c.lap_count = car.lapCount
     c.is_in_pit = car.isInPitlane and 1 or 0
     c.is_connected = car.isConnected and 1 or 0
-    c.is_colliding = collisionFlags[i] and 1 or 0
+    local dmgSum = car.damage[0] + car.damage[1] + car.damage[2] + car.damage[3] + car.damage[4]
+    local dmgJumped = prevDamageSum[i] ~= nil and dmgSum > prevDamageSum[i] + 0.01
+    prevDamageSum[i] = dmgSum
+    c.is_colliding = (collisionFlags[i] or dmgJumped) and 1 or 0
     collisionFlags[i] = false
     writeWchar(c.driver_name, car:driverName(), 64)
   end
@@ -256,10 +262,6 @@ function script.update(dt)
   updateAccum = updateAccum + dt
   if updateAccum < UPDATE_INTERVAL then return end
   updateAccum = 0
-
-  if sim.carsCount > registeredCollisionCars then
-    registerCollisionCallbacks(sim.carsCount)
-  end
 
   updateTelemetry()
   processCommands()
