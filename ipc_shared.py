@@ -14,6 +14,7 @@ class CarData(ctypes.Structure):
     _pack_ = 4
     _fields_ = [
         ('car_id', c_int32),
+        ('session_id', c_int32),            # online server entry-list slot
         ('position', c_int32),              # realtime leaderboard pos (1-based)
         ('normalized_spline_pos', c_float),  # 0.0-1.0 track position
         ('speed_kmh', c_float),
@@ -24,7 +25,9 @@ class CarData(ctypes.Structure):
         ('is_in_pit', c_int32),
         ('is_connected', c_int32),
         ('is_colliding', c_int32),
+        ('is_rolled_over', c_int32),
         ('driver_name', c_wchar * 64),
+        ('team_name', c_wchar * 64),
     ]
 
 
@@ -38,6 +41,7 @@ class TelemetryPage(ctypes.Structure):
         ('car_cameras_count', c_int32),
         ('current_car_camera', c_int32),
         ('track_length', c_float),
+        ('session_type', c_int32),          # 1 = race, 0 = other (practice/qualify/hotlap)
         ('cars', CarData * MAX_CARS),
     ]
 

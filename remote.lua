@@ -17,8 +17,10 @@ local telemPage = ac.writeMemoryMappedFile(TELEM_TAG, [[
   int car_cameras_count;
   int current_car_camera;
   float track_length;
+  int session_type;
   struct {
     int car_id;
+    int session_id;
     int position;
     float normalized_spline_pos;
     float speed_kmh;
@@ -29,7 +31,9 @@ local telemPage = ac.writeMemoryMappedFile(TELEM_TAG, [[
     int is_in_pit;
     int is_connected;
     int is_colliding;
+    int is_rolled_over;
     wchar_t driver_name[64];
+    wchar_t team_name[64];
   } cars[128];
 //<__EXPAL:0:4>]])
 
@@ -51,8 +55,22 @@ local UPDATE_INTERVAL = 0.1 -- 100 ms
 -- Collision flags: consumed (and reset) by telemetry writer.
 -- Callback fires reliably only for the local car; damage-array deltas
 -- cover remote cars since damage state is replicated online.
+-- Severity gate: kerb hits and wall brushes trigger the callback/damage
+-- without any real impact, so we require a minimum speed drop in the
+-- same tick before reporting a collision.
+local COLLISION_SPEED_DROP_KMH = 12
 local collisionFlags = {}
 local prevDamageSum = {}
+local prevSpeedKmh = {}
+
+-- Rollover detection: car.up.y < 0.5 means chassis is tilted > 60° from
+-- vertical (cos(60°) = 0.5). Asymmetric thresholds + a hold counter
+-- prevent flicker during hard landings or curb hops.
+local ROLLOVER_UP_Y_ENTER = 0.5   -- cos(60°)
+local ROLLOVER_UP_Y_EXIT  = 0.6   -- cos(~53°)
+local ROLLOVER_HOLD_TICKS = 2     -- ~200ms at 10 Hz telemetry
+local rolloverState = {}
+local rolloverTickCount = {}
 
 ac.onCarCollision(-1, function(carIndex)
   collisionFlags[carIndex] = true
@@ -230,11 +248,13 @@ local function updateTelemetry()
   telemPage.car_cameras_count = focusedCar and focusedCar.carCamerasCount or 0
   telemPage.current_car_camera = sim.carCameraIndex
   telemPage.track_length = sim.trackLengthM
+  telemPage.session_type = (sim.raceSessionType == ac.SessionType.Race) and 1 or 0
 
   for i = 0, carCount - 1 do
     local car = ac.getCar(i)
     local c = telemPage.cars[i]
     c.car_id = i
+    c.session_id = car.sessionID
     c.position = car.racePosition
     c.normalized_spline_pos = car.splinePosition
     c.speed_kmh = car.speedKmh
@@ -247,9 +267,28 @@ local function updateTelemetry()
     local dmgSum = car.damage[0] + car.damage[1] + car.damage[2] + car.damage[3] + car.damage[4]
     local dmgJumped = prevDamageSum[i] ~= nil and dmgSum > prevDamageSum[i] + 0.01
     prevDamageSum[i] = dmgSum
-    c.is_colliding = (collisionFlags[i] or dmgJumped) and 1 or 0
+    local speedDrop = prevSpeedKmh[i] and (prevSpeedKmh[i] - car.speedKmh) or 0
+    prevSpeedKmh[i] = car.speedKmh
+    local hardImpact = speedDrop >= COLLISION_SPEED_DROP_KMH
+    c.is_colliding = ((collisionFlags[i] or dmgJumped) and hardImpact) and 1 or 0
     collisionFlags[i] = false
+
+    local upY = car.up.y
+    local threshold = rolloverState[i] and ROLLOVER_UP_Y_EXIT or ROLLOVER_UP_Y_ENTER
+    if upY < threshold then
+      rolloverTickCount[i] = (rolloverTickCount[i] or 0) + 1
+    else
+      rolloverTickCount[i] = 0
+    end
+    local rolledOver = (rolloverTickCount[i] or 0) >= ROLLOVER_HOLD_TICKS
+    if rolledOver ~= (rolloverState[i] == true) then
+      ac.log(string.format('Car #%d rollover %s (up.y=%.2f)', i, rolledOver and 'STARTED' or 'ENDED', upY))
+      rolloverState[i] = rolledOver
+    end
+    c.is_rolled_over = rolledOver and 1 or 0
+
     writeWchar(c.driver_name, car:driverName(), 64)
+    writeWchar(c.team_name, ac.getDriverTeam(i), 64)
   end
 
   telemPage.packet_id = telemPage.packet_id + 1
