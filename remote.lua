@@ -18,6 +18,7 @@ local telemPage = ac.writeMemoryMappedFile(TELEM_TAG, [[
   int current_car_camera;
   float track_length;
   int session_type;
+  wchar_t timetable_url[128];
   struct {
     int car_id;
     int session_id;
@@ -249,6 +250,13 @@ local function updateTelemetry()
   telemPage.current_car_camera = sim.carCameraIndex
   telemPage.track_length = sim.trackLengthM
   telemPage.session_type = (sim.raceSessionType == ac.SessionType.Race) and 1 or 0
+  local serverIP = ac.getServerIP()
+  local httpPort = ac.getServerPortHTTP()
+  local timetableURL = ''
+  if serverIP ~= nil and serverIP ~= '' and httpPort ~= nil and httpPort >= 0 then
+    timetableURL = 'http://' .. serverIP .. ':' .. tostring(httpPort) .. '/timetable.json'
+  end
+  writeWchar(telemPage.timetable_url, timetableURL, 128)
 
   for i = 0, carCount - 1 do
     local car = ac.getCar(i)

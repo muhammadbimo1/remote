@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from ipc_shared import TelemetryPage
 import remote_web
@@ -77,6 +78,58 @@ class TimetableOffsetTest(unittest.TestCase):
         self.assertEqual(matched, 1)
         with remote_web._resync_lock:
             self.assertEqual(remote_web.progress_offsets, {2: 3.0})
+
+
+class TimetableUrlTest(unittest.TestCase):
+    def test_timetable_url_comes_from_telemetry(self):
+        telem = TelemetryPage()
+        telem.timetable_url = "http://103.129.148.255:14103/timetable.json"
+
+        self.assertEqual(
+            remote_web.get_timetable_url(telem),
+            "http://103.129.148.255:14103/timetable.json")
+
+    def test_blank_timetable_url_disables_polling(self):
+        telem = TelemetryPage()
+        telem.timetable_url = ""
+
+        self.assertEqual(remote_web.get_timetable_url(telem), "")
+
+
+class TimetablePollTest(unittest.TestCase):
+    def setUp(self):
+        self.old_ac_connected = remote_web.ac_connected
+        remote_web.ac_connected = True
+
+    def tearDown(self):
+        remote_web.ac_connected = self.old_ac_connected
+        with remote_web._resync_lock:
+            remote_web.progress_offsets.clear()
+        remote_web.last_poll_status = 'idle'
+        remote_web.last_poll_error = ''
+        remote_web.last_poll_matched = 0
+
+    def test_local_race_applies_timetable_even_if_server_session_type_is_stale(self):
+        telem = TelemetryPage()
+        telem.session_type = 1
+        telem.car_count = 1
+
+        car = telem.cars[0]
+        car.car_id = 0
+        car.session_id = 18
+        car.lap_count = 4
+        car.is_connected = 1
+
+        with patch.object(remote_web, 'fetch_timetable', return_value={
+            'SessionType': 'PRACTICE',
+            'EntryList': [{'CarID': 18, 'Ping': 12, 'Laps': 7}],
+        }):
+            remote_web.poll_timetable_once('http://example.test/timetable.json', telem)
+
+        self.assertEqual(remote_web.last_poll_status, 'ok')
+        self.assertEqual(remote_web.last_poll_matched, 1)
+        with remote_web._resync_lock:
+            self.assertEqual(remote_web.progress_offsets, {0: 3.0})
 
 
 if __name__ == "__main__":

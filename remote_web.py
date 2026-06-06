@@ -48,14 +48,11 @@ CLASS_COLORS = {
 }
 
 # --- Timetable re-sync (poll AC server /timetable.json) ---
-TIMETABLE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'timetable_config.json')
 TIMETABLE_POLL_INTERVAL = 60.0
 TIMETABLE_TIMEOUT = 3.0
 
 _resync_lock = threading.Lock()
 progress_offsets = {}        # { car_id:int -> float lap-count correction }
-_config_lock = threading.Lock()
-timetable_url = ''
 last_poll_time = 0.0
 last_poll_status = 'idle'    # 'idle' | 'ok' | 'not_configured' | 'disabled_not_race' | 'http_error' | 'unreachable' | 'bad_response'
 last_poll_error = ''
@@ -259,17 +256,9 @@ def _compute_gap_seconds(ahead, behind, track_length):
     return gap_meters / speed_ms
 
 
-def load_timetable_config():
-    """Read timetable_config.json into the global URL. Silent on missing file."""
-    global timetable_url
-    try:
-        with open(TIMETABLE_CONFIG_PATH, 'r') as f:
-            cfg = json.load(f)
-        url = (cfg.get('url') or '').strip()
-    except (OSError, ValueError):
-        url = ''
-    with _config_lock:
-        timetable_url = url
+def get_timetable_url(telem):
+    """Return the AC server timetable URL provided by the Lua mmap."""
+    return (getattr(telem, 'timetable_url', '') or '').strip()
 
 
 def _validate_timetable_url(url):
@@ -283,23 +272,6 @@ def _validate_timetable_url(url):
         return False, 'URL missing host'
     if not parsed.path.endswith('/timetable.json'):
         return False, "URL path must end with /timetable.json"
-    return True, ''
-
-
-def save_timetable_config(url):
-    """Validate and persist the timetable URL. Returns (ok, error_message)."""
-    global timetable_url
-    url = (url or '').strip()
-    ok, err = _validate_timetable_url(url)
-    if not ok:
-        return False, err
-    try:
-        with open(TIMETABLE_CONFIG_PATH, 'w') as f:
-            json.dump({'url': url}, f)
-    except OSError as e:
-        return False, 'write failed: {}'.format(e)
-    with _config_lock:
-        timetable_url = url
     return True, ''
 
 
@@ -374,38 +346,45 @@ def apply_timetable_offsets(data, telem):
     return matched
 
 
+def poll_timetable_once(url, telem):
+    """Fetch and apply one timetable snapshot. Local AC telemetry is the
+    source of truth for race/non-race state; some server timetable endpoints
+    can lag and report a stale SessionType."""
+    global last_poll_time, last_poll_status, last_poll_error
+    if telem is None or not ac_connected:
+        last_poll_status = 'not_configured'
+        last_poll_error = 'no telemetry'
+        return False
+    if telem.session_type != 1:
+        last_poll_status = 'disabled_not_race'
+        last_poll_error = ''
+        return False
+
+    data = fetch_timetable(url)
+    if data is None:
+        return False
+
+    matched = apply_timetable_offsets(data, telem)
+    last_poll_time = time.time()
+    last_poll_status = 'ok'
+    last_poll_error = ''
+    print('[remote_web] timetable poll ok: matched={}'.format(matched))
+    return True
+
+
 def timetable_poll_loop():
     """Daemon thread: poll the timetable URL every TIMETABLE_POLL_INTERVAL
     seconds during race sessions only."""
     global last_poll_time, last_poll_status, last_poll_error
     while True:
         try:
-            with _config_lock:
-                url = timetable_url
-
+            telem = read_telemetry()
+            url = get_timetable_url(telem) if telem is not None else ''
             if not url:
                 last_poll_status = 'not_configured'
-                last_poll_error = ''
+                last_poll_error = 'no server HTTP endpoint'
             else:
-                telem = read_telemetry()
-                if telem is None or not ac_connected:
-                    last_poll_status = 'not_configured'
-                    last_poll_error = 'no telemetry'
-                elif telem.session_type != 1:
-                    last_poll_status = 'disabled_not_race'
-                    last_poll_error = ''
-                else:
-                    data = fetch_timetable(url)
-                    if data is not None:
-                        if str(data.get('SessionType') or '').upper() != 'RACE':
-                            last_poll_status = 'disabled_not_race'
-                            last_poll_error = ''
-                        else:
-                            matched = apply_timetable_offsets(data, telem)
-                            last_poll_time = time.time()
-                            last_poll_status = 'ok'
-                            last_poll_error = ''
-                            print('[remote_web] timetable poll ok: matched={}'.format(matched))
+                poll_timetable_once(url, telem)
         except Exception as e:
             last_poll_status = 'bad_response'
             last_poll_error = 'internal: {}'.format(e)
@@ -456,8 +435,7 @@ def build_update_data(telem, cars_with_gaps=None):
 
     with _resync_lock:
         offsets_active = any(abs(v) > 1e-6 for v in progress_offsets.values())
-    with _config_lock:
-        url = timetable_url
+    url = get_timetable_url(telem)
 
     return {
         'current_driver': telem.focused_car,
@@ -565,24 +543,10 @@ def handle_toggle_director_debug():
     emit('director_debug_status', {'enabled': state}, broadcast=True)
 
 
-@socketio.on('set_timetable_url')
-def handle_set_timetable_url(payload):
-    url = (payload or {}).get('url', '') if isinstance(payload, dict) else ''
-    ok, err = save_timetable_config(url)
-    emit('timetable_url', {
-        'ok': ok,
-        'url': timetable_url,
-        'error': err,
-    }, broadcast=True)
-
-
 @socketio.on('get_timetable_url')
 def handle_get_timetable_url():
-    with _config_lock:
-        url = timetable_url
     emit('timetable_url', {
         'ok': True,
-        'url': url,
         'status': last_poll_status,
         'last_poll': last_poll_time,
         'error': last_poll_error,
@@ -820,9 +784,10 @@ def index():
             .timetable-bar {
                 display: flex;
                 align-items: center;
-                gap: 8px;
+                justify-content: center;
+                width: 22px;
                 margin-bottom: 8px;
-                padding: 6px 10px;
+                padding: 6px 0;
                 background: var(--bg-panel);
                 border: 1px solid var(--border-subtle);
             }
@@ -838,49 +803,6 @@ def index():
             .timetable-bar .tt-dot.err { background: var(--live-red); box-shadow: 0 0 8px var(--live-red-glow); }
             .timetable-bar .tt-dot.idle { background: var(--text-dim); }
             .timetable-bar .tt-dot.warn { background: var(--accent-amber); box-shadow: 0 0 8px var(--accent-amber-glow); }
-            .timetable-bar .tt-label {
-                font-family: 'Oswald', sans-serif;
-                font-size: 0.72em;
-                text-transform: uppercase;
-                letter-spacing: 0.18em;
-                color: var(--text-muted);
-                flex: 0 0 auto;
-            }
-            .timetable-bar input {
-                flex: 1 1 auto;
-                min-width: 0;
-                padding: 5px 8px;
-                background: var(--bg-base);
-                border: 1px solid var(--border-strong);
-                color: var(--text-primary);
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 0.78em;
-                outline: none;
-            }
-            .timetable-bar input:focus { border-color: var(--accent-amber); }
-            .timetable-bar button {
-                padding: 5px 12px;
-                background: var(--bg-elev);
-                color: var(--text-primary);
-                border: 1px solid var(--border-strong);
-                font-family: 'Oswald', sans-serif;
-                font-size: 0.78em;
-                text-transform: uppercase;
-                letter-spacing: 0.14em;
-                cursor: pointer;
-                transition: background-color 0.12s, border-color 0.12s;
-                flex: 0 0 auto;
-            }
-            .timetable-bar button:hover { background: var(--bg-elev-hi); border-color: var(--accent-amber); }
-            .timetable-bar .tt-status {
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 0.68em;
-                color: var(--text-dim);
-                letter-spacing: 0.12em;
-                text-transform: uppercase;
-                flex: 0 0 auto;
-            }
-
             .subcam-bar {
                 display: flex;
                 gap: 6px;
@@ -1215,11 +1137,7 @@ def index():
                 .subcam-bar button { padding: 4px 2px; font-size: 0.62em; }
                 .class-filter-bar { gap: 4px; margin-bottom: 5px; min-height: 26px; }
                 .class-filter-bar button { padding: 4px 7px; font-size: 0.58em; letter-spacing: 0.1em; }
-                .timetable-bar { gap: 5px; padding: 4px 6px; margin-bottom: 5px; }
-                .timetable-bar .tt-label { display: none; }
-                .timetable-bar .tt-status { display: none; }
-                .timetable-bar input { padding: 3px 5px; font-size: 0.68em; }
-                .timetable-bar button { padding: 3px 8px; font-size: 0.66em; letter-spacing: 0.1em; }
+                .timetable-bar { width: 20px; padding: 4px 0; margin-bottom: 5px; }
                 .drivers-grid {
                     grid-template-columns: repeat(2, 1fr);
                     grid-auto-rows: auto;
@@ -1396,21 +1314,6 @@ def index():
                     }
                 });
 
-                var ttInput = document.getElementById('timetable-input');
-                var ttSave = document.getElementById('timetable-save');
-                if (ttInput) {
-                    ttInput.addEventListener('input', function() { timetableInputDirty = true; });
-                    ttInput.addEventListener('keydown', function(e) {
-                        if (e.key === 'Enter') { e.preventDefault(); ttSave && ttSave.click(); }
-                    });
-                }
-                if (ttSave) {
-                    ttSave.addEventListener('click', function() {
-                        var url = ttInput ? ttInput.value.trim() : '';
-                        socket.emit('set_timetable_url', { url: url });
-                        timetableInputDirty = false;
-                    });
-                }
                 socket.emit('get_timetable_url');
             });
 
@@ -1424,10 +1327,8 @@ def index():
                 if (btn) btn.classList.toggle('active', data.enabled);
             });
 
-            var timetableInputDirty = false;
             function setTimetableDot(status) {
                 var dot = document.getElementById('timetable-dot');
-                var st = document.getElementById('timetable-status');
                 if (!dot) return;
                 dot.classList.remove('ok', 'err', 'idle', 'warn');
                 var label = '';
@@ -1440,15 +1341,10 @@ def index():
                     case 'bad_response': dot.classList.add('err'); label = 'Error'; break;
                     default: dot.classList.add('idle'); label = status || '';
                 }
-                if (st) st.textContent = label;
-                dot.title = 'Timetable poll: ' + (status || 'unknown');
+                dot.title = 'Timetable sync: ' + (label || status || 'unknown');
             }
 
             socket.on('timetable_url', function(data) {
-                var inp = document.getElementById('timetable-input');
-                if (inp && !timetableInputDirty) {
-                    inp.value = data.url || '';
-                }
                 if (data.status) setTimetableDot(data.status);
                 if (data.error) console.log('[timetable] ' + data.error);
             });
@@ -1484,10 +1380,6 @@ def index():
 
                 // Timetable status dot reflects last poll outcome
                 if (data.timetable_status) setTimetableDot(data.timetable_status);
-                var inp = document.getElementById('timetable-input');
-                if (inp && !timetableInputDirty && typeof data.timetable_url === 'string') {
-                    inp.value = data.timetable_url;
-                }
 
                 // Highlight active camera button
                 document.querySelectorAll('.camera-buttons button[data-cam]').forEach(function(btn) {
@@ -1615,11 +1507,7 @@ def index():
             <button id="auto-dir-dbg-btn" onclick="socket.emit('toggle_director_debug')" title="Verbose director scoring logs to server stdout">Dbg<span class="cam-cap">DG</span></button>
         </div>
         <div id="timetable-bar" class="timetable-bar">
-            <span id="timetable-dot" class="tt-dot idle" title="Timetable poll: idle"></span>
-            <span class="tt-label">Timetable</span>
-            <input type="text" id="timetable-input" placeholder="http://server-ip:port/timetable.json" autocomplete="off" spellcheck="false" />
-            <button id="timetable-save" type="button">Save</button>
-            <span id="timetable-status" class="tt-status"></span>
+            <span id="timetable-dot" class="tt-dot idle" title="Timetable sync: idle"></span>
         </div>
         <div id="subcam-bar" class="subcam-bar" style="display:none"></div>
         <div id="class-filter-bar" class="class-filter-bar"></div>
@@ -1635,7 +1523,6 @@ def index():
     return render_template_string(html)
 
 if __name__ == '__main__':
-    load_timetable_config()
     threading.Thread(target=monitor_telemetry, daemon=True).start()
     threading.Thread(target=timetable_poll_loop, daemon=True).start()
     socketio.run(app, host='0.0.0.0')

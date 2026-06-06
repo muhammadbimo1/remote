@@ -42,6 +42,7 @@ class TelemetryPage(ctypes.Structure):
         ('current_car_camera', c_int32),
         ('track_length', c_float),
         ('session_type', c_int32),          # 1 = race, 0 = other (practice/qualify/hotlap)
+        ('timetable_url', c_wchar * 128),
         ('cars', CarData * MAX_CARS),
     ]
 
