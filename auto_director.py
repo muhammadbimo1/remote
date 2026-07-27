@@ -8,12 +8,15 @@ from collections import defaultdict
 
 
 class AutoDirector:
+    IDLE_REASONS = {'default', 'leader', 'class_leader', 'front_runner'}
+
     def __init__(self):
         self.enabled = False
         self.current_focus = None        # car_id currently shown
         self.focus_start = 0.0           # when we cut to current car
         self.last_cut_time = 0.0
         self.min_dwell = 24.0             # current min dwell (varies by reason)
+        self.max_idle_dwell = 45.0        # no-action shots can breathe before rotating
 
         # Previous frame state (keyed by car_id)
         self.prev_positions = {}
@@ -280,11 +283,13 @@ class AutoDirector:
         # overrides logging and hysteresis comparison below).
         current_car = None
         current_score = 0
+        current_reason = 'default'
         current_parts = {}
-        for car, sc, _, pts in scores:
+        for car, sc, rsn, pts in scores:
             if car['car_id'] == self.current_focus:
                 current_car = car
                 current_score = sc
+                current_reason = rsn
                 current_parts = pts
                 break
 
@@ -342,6 +347,14 @@ class AutoDirector:
                                 score=best_score, parts=best_parts,
                                 current_score=0, current_parts={},
                                 hysteresis=hysteresis)
+
+        # Idle mode: once nothing real is happening, avoid cycling through
+        # barely-different front-runners just because the current shot is stale.
+        if (best_car['car_id'] != self.current_focus
+                and best_reason in self.IDLE_REASONS
+                and current_reason in self.IDLE_REASONS
+                and elapsed < self.max_idle_dwell):
+            return None
 
         # Hysteresis: scale with context (computed above).
         if (best_car['car_id'] != self.current_focus
