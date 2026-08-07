@@ -1,0 +1,621 @@
+/* ===========================================================================
+   Broadcaster Remote — app layer on top of Amber Console.
+
+   Amber Console is monochrome by law: one hue, five intensities, no red, no
+   green, no gradients. Every state this panel used to encode with colour now
+   rides on ramp position, inverse video, blink, or a text token. See the state
+   table in the header comment of each block below.
+
+   Load order matters: amber-console.min.css first, this file second.
+   =========================================================================== */
+
+:root {
+    /* Snapshots of the two inverse-video tokens, taken here where the gas
+       palette resolves them. .driver-item.colliding redefines --on-fill and
+       --fill on itself to invert its subtree, and cannot read its own new
+       values to build the swap — these keep the originals reachable. */
+    --rm-on-fill: var(--on-fill);
+    --rm-fill: var(--fill);
+
+    /* Fallback for anything carrying no class. */
+    --rm-class-shade: var(--ink-trace);
+}
+
+/* Class ramp. Four steps, assigned by class sort order and applied as a class
+   rather than an inline style, so .driver-item.colliding can override the shade
+   when it inverts its subtree — an inline custom property could not be beaten.
+   The badge text is what actually names the class; the shade is a scanning aid. */
+.cls-1 { --rm-class-shade: var(--amber-100); }
+.cls-2 { --rm-class-shade: var(--amber-90); }
+.cls-3 { --rm-class-shade: var(--amber-70); }
+.cls-4 { --rm-class-shade: var(--amber-50); }
+
+/* ---------------------------------------------------------------------------
+   Frame
+
+   .ac-bloom is deliberately NOT on the frame. It paints a viewport-sized
+   backdrop-filter, and this panel rebuilds the whole driver grid at 10 Hz —
+   every rebuild would drag a full-screen re-blur with it, on a machine that is
+   also running Assetto Corsa. The two token overrides below are the part of
+   .ac-bloom worth having (a hotter glow), and they cost nothing.
+   --------------------------------------------------------------------------- */
+.ac-screen {
+    --glow-text: 0 0 2px rgba(var(--gas-4), 0.75), 0 0 9px rgba(var(--gas-2), 0.4), 0 0 26px rgba(var(--gas-3), 0.2);
+    --glow-box: 0 0 11px rgba(var(--gas-1), 0.4), 0 0 34px rgba(var(--gas-2), 0.16), inset 0 0 14px rgba(var(--gas-1), 0.1);
+
+    /* The framework sets min-height so the frame can grow with the document.
+       Here the grid must fill exactly one screen and never scroll. */
+    height: 100vh;
+    height: 100svh;
+    min-height: 0;
+}
+
+.ac-screen__body {
+    --ac-screen-pad: 10px 12px;
+    gap: var(--space-2);
+    min-height: 0;
+}
+
+body {
+    overflow: hidden;
+}
+
+/* ---------------------------------------------------------------------------
+   Status bar — AC link, focused car, timetable sync
+
+   Was: green/red pulsing dot. Now: LINK:OK steady vs LINK:NONE blinking, and
+   the timetable dot becomes a TT: badge, because a dot cannot say anything
+   without a second hue.
+   --------------------------------------------------------------------------- */
+#ac-status {
+    justify-content: space-between;
+    gap: var(--space-4);
+    font-size: var(--type-small);
+    padding: 4px var(--space-3);
+    flex-shrink: 0;
+}
+
+#ac-status .status-left,
+#ac-status .status-right {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    min-width: 0;
+}
+
+#ac-status .label-link {
+    letter-spacing: 0.1em;
+}
+
+/* Link down is the one alarm in this region: inverse video carries it when
+   prefers-reduced-motion suppresses the blink. */
+#ac-status.ac-disconnected .label-link {
+    background: var(--fill);
+    color: var(--on-fill);
+    padding: 2px 8px;
+    text-shadow: none;
+}
+
+#ac-status .status-sub {
+    color: var(--ink-dim);
+}
+
+#ac-status .ac-readout--inline {
+    gap: var(--space-2);
+}
+
+#ac-status .ac-readout__label {
+    font-size: var(--type-micro);
+    font-family: var(--font-micro);
+    padding: 3px 8px;
+}
+
+#ac-status .ac-readout__value {
+    font-size: var(--type-small);
+}
+
+/* ---------------------------------------------------------------------------
+   Camera bar
+
+   Camera selection is a tablist: exactly one is live. Auto/Dbg sit in their own
+   group so the filled (inverse) treatment reads as one selection per region,
+   not two competing ones.
+   --------------------------------------------------------------------------- */
+.control-bar {
+    display: flex;
+    gap: var(--space-2);
+    align-items: stretch;
+    flex-shrink: 0;
+}
+
+.camera-buttons {
+    flex: 1 1 auto;
+    gap: var(--space-2);
+    flex-wrap: nowrap;
+}
+
+.dir-group {
+    display: flex;
+    gap: var(--space-2);
+    flex: 0 0 auto;
+    padding-left: var(--space-2);
+    border-left: var(--border-w) solid var(--stroke-dim);
+}
+
+.control-bar .ac-tab,
+.dir-group .ac-btn {
+    flex: 1 1 0;
+    min-width: 0;
+    font-size: var(--type-body);
+    /* The framework's 20px dead-space bottom padding is a full-screen soft key.
+       This bar is seven keys wide above a dense grid. */
+    padding: 5px 8px 7px;
+    border-radius: var(--radius-sm);
+    text-align: center;
+}
+
+.dir-group .ac-btn {
+    min-width: 68px;
+}
+
+.cam-cap {
+    display: block;
+    margin-top: 3px;
+    font-family: var(--font-micro);
+    font-size: var(--type-micro);
+    letter-spacing: var(--tracking-micro);
+    color: var(--ink-dim);
+    text-shadow: none;
+}
+
+.ac-tab--active .cam-cap,
+.ac-btn--filled .cam-cap {
+    color: var(--on-fill);
+    opacity: 0.75;
+}
+
+/* ---------------------------------------------------------------------------
+   Subcam bar / class filter bar
+   --------------------------------------------------------------------------- */
+.subcam-bar {
+    display: flex;
+    gap: var(--space-2);
+    flex-shrink: 0;
+}
+
+.subcam-bar .ac-btn {
+    flex: 1 1 0;
+    min-width: 0;
+    padding: 3px 8px;
+}
+
+.class-filter-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    overflow-x: auto;
+    flex-shrink: 0;
+}
+
+.class-filter-bar .ac-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex: 0 0 auto;
+    padding: 3px 10px;
+}
+
+/* Square, 2px-stroked — the ramp shade the class uses in the grid. The All
+   button carries no .cls-N, so it falls back to the trace step. */
+.class-swatch {
+    width: 10px;
+    height: 10px;
+    flex: 0 0 auto;
+    border: var(--border-w) solid currentColor;
+    background: var(--rm-class-shade);
+}
+
+/* ---------------------------------------------------------------------------
+   Driver grid
+
+   Density override: the framework's 22/18px floor is a full-screen instrument
+   scale. This grid shows the whole entry list at once, so the type tokens are
+   stepped down for the grid subtree only. Silkscreen badges stay at 8px, which
+   is the size it is drawn for.
+   --------------------------------------------------------------------------- */
+#drivers-list {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    /* Rows have a min-content floor (below), so a short screen or a very long
+       entry list overflows rather than crushing every card. Scrolling here
+       instead of on the body keeps the header and camera bar fixed. */
+    overflow-y: auto;
+    /* A default OS scrollbar is a bright grey slab on an amber panel. */
+    scrollbar-width: thin;
+    scrollbar-color: var(--amber-70) var(--screen-well);
+}
+
+#drivers-list::-webkit-scrollbar {
+    width: 10px;
+}
+
+#drivers-list::-webkit-scrollbar-track {
+    background: var(--screen-well);
+}
+
+#drivers-list::-webkit-scrollbar-thumb {
+    background: var(--amber-70);
+    border: 2px solid var(--screen-well);
+}
+
+.drivers-grid {
+    --type-body: 17px;
+    --type-small: 14px;
+    --type-micro: 8px;
+    --leading: 1.05;
+
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    /* Rows share the leftover height, but never shrink below their own content
+       — a squeezed row silently clips the gap line, which is the one number the
+       operator is reading. */
+    grid-auto-rows: minmax(min-content, 1fr);
+    gap: var(--space-1);
+    height: 100%;
+    font-size: var(--type-body);
+}
+
+.driver-item {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+    /* The 40px right inset is the strip the badge stack overlays — see
+       .driver-info .right below. */
+    padding: 5px 40px 5px 14px;
+    background: var(--screen-raised);
+    border: var(--border-w) solid var(--stroke-dim);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    cursor: pointer;
+    min-height: 0;
+}
+
+.driver-item:hover {
+    border-color: var(--stroke);
+}
+
+.driver-item.disabled {
+    cursor: default;
+}
+
+.class-stripe {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 4px;
+    background: var(--rm-class-shade);
+}
+
+/* Focused car — the shot that is on air. Bright stroke, glow, a widened
+   full-brightness stripe and the name at the top of the ramp. Deliberately NOT
+   full inverse video: that is reserved for the collision alarm below, so the
+   two loudest states on the grid can never be mistaken for each other. */
+.driver-item.selected {
+    border-color: var(--amber-100);
+    box-shadow: var(--glow-box);
+}
+
+.driver-item.selected:hover {
+    border-color: var(--amber-100);
+}
+
+/* :not(.colliding) throughout — a car can be both on air and in a crash, and
+   the alarm has to win the whole card. */
+.driver-item.selected:not(.colliding) .class-stripe {
+    width: 8px;
+    background: var(--amber-100);
+}
+
+.driver-item.selected:not(.colliding) .name {
+    color: var(--ink-bright);
+    text-shadow: var(--glow-text);
+}
+
+/* Not in the session: recede, do not disappear. */
+.driver-item.offline {
+    opacity: 0.45;
+}
+
+.driver-item.offline.selected {
+    opacity: 0.7;
+}
+
+/* Rolled over — bright stroke, blinking FLIP badge, body NOT inverted. */
+.driver-item.rolled-over {
+    border-color: var(--amber-100);
+}
+
+/* Collision: the loudest state the system allows. The whole card snaps to
+   inverse video and blinks. Per the framework, the inverse fill is what keeps
+   this readable as an alarm when prefers-reduced-motion kills the blink — no
+   extra rule needed. Redefining the ink/stroke/fill tokens on the card inverts
+   its entire subtree, badges included, in one place. */
+.driver-item.colliding {
+    background: var(--rm-fill);
+    border-color: var(--rm-fill);
+    color: var(--rm-on-fill);
+
+    --ink: var(--rm-on-fill);
+    --ink-bright: var(--rm-on-fill);
+    --ink-dim: var(--rm-on-fill);
+    --ink-faint: var(--rm-on-fill);
+    --ink-trace: var(--rm-on-fill);
+    --stroke: var(--rm-on-fill);
+    --stroke-dim: var(--rm-on-fill);
+    --fill: var(--rm-on-fill);
+    --on-fill: var(--rm-fill);
+    --rm-class-shade: var(--rm-on-fill);
+    --glow-text: none;
+    --glow-box: none;
+
+    z-index: 1;
+}
+
+.driver-item.colliding:hover {
+    border-color: var(--rm-fill);
+}
+
+/* --- Card row 1: position, number, name, badges ---
+
+   Every row starts hard against the same left edge — position, team and Gap all
+   line up, and nothing is indented under anything else. The position column is
+   the one fixed-width element: two digits, right-aligned, so P1 and P24 put the
+   car number in the same place on every card in the grid. */
+.driver-info {
+    display: flex;
+    align-items: baseline;
+    gap: 5px;
+    min-width: 0;
+}
+
+.driver-info .pos {
+    font-size: var(--type-body);
+    line-height: 1;
+    color: var(--ink-bright);
+    font-variant-numeric: tabular-nums;
+    min-width: 2ch;
+    text-align: right;
+    flex: 0 0 auto;
+    text-shadow: var(--glow-text);
+}
+
+.driver-info .num {
+    font-size: var(--type-small);
+    color: var(--ink-dim);
+    font-variant-numeric: tabular-nums;
+    flex: 0 0 auto;
+}
+
+.driver-info .name {
+    font-size: var(--type-body);
+    line-height: 1.05;
+    color: var(--ink);
+    text-transform: uppercase;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+/* Own row, full card width. The class and race number that used to prefix this
+   string are stripped server-side (_parse_team_name) — they are already the
+   badge on the right and the number on the left. */
+.team-name {
+    font-family: var(--font-micro);
+    font-size: var(--type-micro);
+    letter-spacing: var(--tracking-micro);
+    color: var(--ink-faint);
+    text-transform: uppercase;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Badge stack: class on top, status pills under it, at every card size.
+
+   Taken OUT OF FLOW so it cannot set the card's height. A car that picks up a
+   HIT or PIT badge must not become taller than the car beside it, or every row
+   in the grid jumps as the race changes. The card pads its right edge by the
+   pill width instead and the column overlays that reserved strip, leaving card
+   height a function of the three text rows only.
+
+   Consequence: a stack taller than the card clips (.driver-item is
+   overflow: hidden). The 3px inset and 1px gap are what make the realistic
+   worst case — class + HIT + FLP — fit: 55.5px of stack against 57.2px of card
+   in compact mode, which is the tighter of the two. At a 4px inset and 2px gap
+   it overflowed by 1.3px. A fourth pill would still clip, and a fourth pill
+   means a car is pitted, crashed and flipped at the same time. */
+.driver-info .right {
+    position: absolute;
+    top: 3px;
+    right: 5px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 1px;
+}
+
+.class-badge {
+    order: -1;
+}
+
+/* Badges inside a card are tighter than the framework default — a card can
+   carry three of them. */
+.driver-item .ac-badge {
+    padding: 2px 5px;
+}
+
+/* Class names are 2 or 3 characters (AM, HY vs PRO, GT4) and a pill that changes
+   width with its label makes the right-hand column ragged all the way down the
+   grid. Floor every pill at the width of the widest three-character label, so
+   they line up; anything longer than three characters still grows.
+
+   The floor is in px, not ch: Silkscreen's "0" advance is about 5px at
+   --type-micro, well under the padded content box, so a 3ch min-width never
+   binds. 32px is the measured border-box width of "PRO" at 8px with the 2px
+   padding and 1px badge border. Retune it if --type-micro changes. */
+.class-badge,
+.status-badge {
+    min-width: 32px;
+    text-align: center;
+}
+
+/* --- Card row 2: gap / interval / class position --- */
+.driver-gaps {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-3);
+    font-size: var(--type-small);
+    font-variant-numeric: tabular-nums;
+}
+
+.driver-gaps .cell {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+}
+
+.driver-gaps .label {
+    font-family: var(--font-micro);
+    font-size: var(--type-micro);
+    letter-spacing: var(--tracking-micro);
+    color: var(--ink-faint);
+}
+
+/* Urgency by ramp position, not hue. Tight is the brightest thing in the row.
+   Deliberately not blinking: two dozen blinking cells is noise, not a signal. */
+.driver-gaps .value {
+    color: var(--ink-dim);
+}
+
+.driver-gaps .value.warn {
+    color: var(--ink);
+}
+
+.driver-gaps .value.tight {
+    color: var(--ink-bright);
+    text-shadow: var(--glow-text);
+}
+
+/* --- Empty states --- */
+#drivers-list .ac-banner {
+    margin: auto;
+    font-size: var(--type-title);
+}
+
+/* ---------------------------------------------------------------------------
+   Narrow screens — the pit-wall phone
+   --------------------------------------------------------------------------- */
+@media (max-width: 600px) {
+    body {
+        overflow: auto;
+    }
+
+    .ac-screen {
+        height: auto;
+        min-height: 100svh;
+    }
+
+    .ac-screen__body {
+        --ac-screen-pad: 6px 8px;
+        gap: var(--space-1);
+    }
+
+    #ac-status {
+        font-size: var(--type-micro);
+        font-family: var(--font-micro);
+        gap: var(--space-2);
+    }
+
+    #ac-status .ac-readout__value {
+        font-size: var(--type-micro);
+        font-family: var(--font-micro);
+    }
+
+    /* Seven soft keys do not fit a phone in one row without crushing the labels
+       below legibility. Wrap instead — a control panel shows every key it has. */
+    .control-bar {
+        flex-wrap: wrap;
+    }
+
+    .camera-buttons {
+        flex-wrap: wrap;
+    }
+
+    .control-bar .ac-tab,
+    .dir-group .ac-btn {
+        font-size: var(--type-small);
+        flex: 1 0 auto;
+        padding: 4px 10px 5px;
+    }
+
+    .cam-cap {
+        display: none;
+    }
+
+    .dir-group {
+        padding-left: var(--space-1);
+    }
+
+    .dir-group .ac-btn {
+        min-width: 44px;
+    }
+
+    .subcam-bar .ac-btn,
+    .class-filter-bar .ac-btn {
+        font-size: var(--type-micro);
+        font-family: var(--font-micro);
+        padding: 4px 6px;
+    }
+
+    #drivers-list {
+        overflow-y: visible;
+    }
+
+    .drivers-grid {
+        --type-body: 15px;
+        --type-small: 13px;
+        grid-template-columns: repeat(2, 1fr);
+        grid-auto-rows: auto;
+        height: auto;
+    }
+
+    /* Right inset stays 40px — the badge stack overlays it at every size. */
+    .driver-item {
+        padding: 4px 40px 4px 10px;
+    }
+
+    .class-stripe {
+        width: 3px;
+    }
+
+    /* Two columns cannot carry three gap cells. The class interval goes; the
+       class filter bar directly above is the way to see class order on a phone.
+       The team line stays — it has its own full-width row now, so it fits. */
+    .driver-gaps .cell-cls {
+        display: none;
+    }
+
+    /* The badge stack itself needs no override here — it is absolute and
+       column-stacked at every card size. See .driver-info .right above. */
+
+    #drivers-list .ac-banner {
+        font-size: var(--type-small);
+    }
+}

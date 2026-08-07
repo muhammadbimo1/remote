@@ -33,6 +33,22 @@ Shell commands launch visible CLI windows which breaks the user experience.
 - **Lua side**: Loads automatically when the "Broadcaster Remote" app is enabled in AC's app sidebar (CSP required).
 - **Web server**: `python remote_web.py` — serves on `0.0.0.0:5000`. Requires `flask` and `flask-socketio`.
 
+## Web UI
+
+The browser panel is themed with [Amber Console](https://github.com/DutchDiederik/AmberConsole), a
+monochrome amber-terminal CSS framework. Two rules govern any change to it:
+
+- **Everything under `static/` is vendored, on purpose.** The panel runs on a race rig that may have
+  no internet, so there are no CDN links — not for the framework, not for the fonts, not for
+  socket.io. `amber-console.min.css` resolves its webfonts as `../fonts/`, so `dist/` and `fonts/`
+  must stay siblings. Never reintroduce an external `<link>` or `<script src>`.
+- **One hue, no exceptions.** Amber Console forbids a second colour: no red, no green, no gradients.
+  State is encoded by ramp position (`--ink-bright` → `--ink-faint`), inverse video, `.ac-blink`, and
+  text labels. `CLASS_COLORS` in `remote_web.py` still ships a `class_color` hex in the telemetry
+  payload, but the UI ignores it — car classes are told apart by their badge text and a four-step
+  amber ramp (`.cls-1` … `.cls-4`). App-specific styling lives in `static/remote.css`; the template
+  is still an inline string in `index()`.
+
 ## Resources
 
 - **CSP Lua Skill**: Use the [CSP Lua skill](./.claude/skills/csp-lua/SKILL.md) for API reference. Update it when it points you into the wrong place.

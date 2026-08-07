@@ -72,18 +72,31 @@ def get_car_class(team_name):
     return class_name, CLASS_COLORS.get(class_name.upper(), '#999')
 
 
-def _parse_driver_name(raw_name, car_id):
+def _parse_team_name(team_name):
+    """Strip the "CLASS 42 | " prefix, leaving just the team.
+
+    The class and the race number are already rendered as their own badge and
+    number on the card, so repeating them in the team line only eats width.
+    Names without a pipe are passed through unchanged.
+    """
+    if not team_name or '|' not in team_name:
+        return team_name
+    return team_name.split('|', 1)[1].strip()
+
+
+def _parse_driver_name(raw_name):
     """Parse the "NN | Driver Name" mmap format. Returns (car_number, display_name).
-    Falls back to (car_id+1, raw_name) when the prefix is missing or non-numeric."""
+    The name prefix is the only source of truth for the race number: car_number is
+    None when the prefix is missing or non-numeric, never the car slot index."""
     parts = raw_name.split('|', 1)
     if len(parts) == 2:
         try:
             car_number = int(parts[0].strip())
         except ValueError:
-            car_number = car_id + 1
+            car_number = None
         display_name = parts[1].strip()
     else:
-        car_number = car_id + 1
+        car_number = None
         display_name = raw_name
     return car_number, display_name
 
@@ -142,7 +155,7 @@ def compute_gaps(telem):
 
         raw_name = c.driver_name
         team_name = c.team_name
-        car_number, display_name = _parse_driver_name(raw_name, c.car_id)
+        car_number, display_name = _parse_driver_name(raw_name)
 
         cls_name, cls_color = get_car_class(team_name)
 
@@ -150,7 +163,7 @@ def compute_gaps(telem):
             'car_id': c.car_id,
             'car_number': car_number,
             'display_name': display_name,
-            'team_name': team_name,
+            'team_name': _parse_team_name(team_name),
             'car_class': cls_name,
             'class_color': cls_color,
             'position': c.position,
@@ -420,7 +433,7 @@ def build_update_data(telem, cars_with_gaps=None):
             'name': c.get('display_name', c['name']),
             'team_name': c.get('team_name', ''),
             'num': c['car_id'] + 1,
-            'car_number': c.get('car_number', c['car_id'] + 1),
+            'car_number': c.get('car_number'),
             'car_class': c.get('car_class', 'Unclassed'),
             'class_color': c.get('class_color', '#999'),
             'class_position': c.get('class_position', c['position']),
@@ -601,602 +614,35 @@ def index():
     # HTML template for the interface
     html = '''
     <!DOCTYPE html>
-    <html>
+    <html data-ac-gas="amber">
     <head>
         <title>Broadcaster Remote</title>
         <meta name=viewport content="width=device-width, initial-scale=1">
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-        <style>
-            :root {
-                --bg-base: #0a0d11;
-                --bg-panel: #131820;
-                --bg-elev: #1b2230;
-                --bg-elev-hi: #232b38;
-                --border-subtle: #232b38;
-                --border-strong: #354154;
-                --text-primary: #e6ecf3;
-                --text-muted: #8d99aa;
-                --text-dim: #5a6678;
-                --accent-amber: #ffb71f;
-                --accent-amber-deep: #b88500;
-                --accent-amber-glow: rgba(255,183,31,0.25);
-                --live-green: #2fd17a;
-                --live-green-glow: rgba(47,209,122,0.28);
-                --live-red: #ff3838;
-                --live-red-glow: rgba(255,56,56,0.32);
-                --warn-orange: #ff8a1f;
-            }
-            * { box-sizing: border-box; }
-            body {
-                font-family: 'Oswald', system-ui, sans-serif;
-                margin: 0;
-                padding: 10px 12px;
-                height: 100dvh;
-                height: 100vh;
-                display: flex;
-                flex-direction: column;
-                overflow: hidden;
-                background-color: var(--bg-base);
-                background-image:
-                    linear-gradient(transparent 31px, rgba(255,255,255,0.022) 32px),
-                    linear-gradient(90deg, transparent 31px, rgba(255,255,255,0.022) 32px);
-                background-size: 32px 32px;
-                color: var(--text-primary);
-                -webkit-font-smoothing: antialiased;
-            }
-            @supports (height: 100dvh) {
-                body { height: 100dvh; }
-            }
-
-            #ac-status {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                padding: 8px 14px;
-                margin-bottom: 8px;
-                background: linear-gradient(180deg, var(--bg-panel) 0%, #0d1218 100%);
-                border: 1px solid var(--border-subtle);
-                box-shadow: 0 1px 0 0 rgba(255,183,31,0.14) inset, 0 2px 6px rgba(0,0,0,0.5);
-                font-family: 'Oswald', sans-serif;
-                font-weight: 500;
-                text-transform: uppercase;
-                letter-spacing: 0.14em;
-                font-size: 0.78em;
-                color: var(--text-muted);
-            }
-            #ac-status .status-left, #ac-status .status-right {
-                display: flex;
-                align-items: center;
-                gap: 10px;
-            }
-            #ac-status .indicator {
-                width: 9px;
-                height: 9px;
-                border-radius: 50%;
-                background: var(--live-red);
-                box-shadow: 0 0 10px var(--live-red);
-                animation: pulse-dot 1.4s ease-in-out infinite;
-            }
-            #ac-status.ac-connected .indicator {
-                background: var(--live-green);
-                box-shadow: 0 0 10px var(--live-green);
-                animation: none;
-            }
-            #ac-status .label-link {
-                color: var(--live-red);
-                font-weight: 600;
-                letter-spacing: 0.18em;
-            }
-            #ac-status.ac-connected .label-link { color: var(--live-green); }
-            #ac-status .focus-chip {
-                font-family: 'JetBrains Mono', monospace;
-                font-feature-settings: "tnum";
-                color: var(--text-primary);
-                padding: 2px 8px;
-                background: var(--bg-base);
-                border: 1px solid var(--border-strong);
-                letter-spacing: 0.08em;
-            }
-            @keyframes pulse-dot {
-                0%, 100% { opacity: 0.45; }
-                50% { opacity: 1; }
-            }
-
-            .camera-buttons {
-                display: flex;
-                gap: 6px;
-                margin-bottom: 8px;
-            }
-            .camera-buttons button {
-                flex: 1;
-                position: relative;
-                padding: 12px 4px 8px;
-                background: var(--bg-elev);
-                color: var(--text-primary);
-                border: 1px solid var(--border-strong);
-                font-family: 'Oswald', sans-serif;
-                font-weight: 500;
-                font-size: 0.95em;
-                text-transform: uppercase;
-                letter-spacing: 0.14em;
-                cursor: pointer;
-                transition: background-color 0.12s, border-color 0.12s, transform 0.06s, box-shadow 0.18s;
-                overflow: hidden;
-            }
-            .camera-buttons button::before {
-                content: '';
-                position: absolute;
-                top: 0; left: 0; right: 0;
-                height: 2px;
-                background: var(--border-strong);
-                transition: background 0.15s, box-shadow 0.15s;
-            }
-            .camera-buttons button .cam-cap {
-                display: block;
-                margin-top: 4px;
-                font-family: 'JetBrains Mono', monospace;
-                font-feature-settings: "tnum";
-                font-size: 0.62em;
-                color: var(--text-dim);
-                letter-spacing: 0.22em;
-                font-weight: 500;
-            }
-            .camera-buttons button:hover { background: var(--bg-elev-hi); }
-            .camera-buttons button:active { transform: translateY(1px); }
-            .camera-buttons button.active {
-                background: var(--accent-amber);
-                color: #0a0d11;
-                border-color: var(--accent-amber-deep);
-                box-shadow: 0 0 0 1px var(--accent-amber), 0 0 22px var(--accent-amber-glow);
-            }
-            .camera-buttons button.active::before {
-                background: #ffe58a;
-                box-shadow: 0 0 10px rgba(255,229,138,0.95);
-            }
-            .camera-buttons button.active .cam-cap { color: rgba(10,13,17,0.6); }
-
-            #auto-dir-btn {
-                background: var(--bg-elev);
-                color: var(--live-green);
-                border-color: rgba(47,209,122,0.4);
-            }
-            #auto-dir-btn::before { background: rgba(47,209,122,0.35); }
-            #auto-dir-btn .cam-cap { color: rgba(47,209,122,0.7); }
-            #auto-dir-btn.active {
-                background: var(--live-green);
-                color: #0a0d11;
-                border-color: #1c9a55;
-                box-shadow: 0 0 0 1px var(--live-green), 0 0 22px var(--live-green-glow);
-            }
-            #auto-dir-btn.active::before {
-                background: #b8f0d0;
-                box-shadow: 0 0 10px rgba(184,240,208,0.95);
-                animation: tally-pulse 1.6s ease-in-out infinite;
-            }
-            #auto-dir-btn.active .cam-cap { color: rgba(10,13,17,0.6); }
-            @keyframes tally-pulse {
-                0%, 100% { opacity: 1; }
-                50% { opacity: 0.55; }
-            }
-
-            .timetable-bar {
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                width: 22px;
-                margin-bottom: 8px;
-                padding: 6px 0;
-                background: var(--bg-panel);
-                border: 1px solid var(--border-subtle);
-            }
-            .timetable-bar .tt-dot {
-                width: 9px;
-                height: 9px;
-                border-radius: 50%;
-                background: var(--text-dim);
-                box-shadow: 0 0 0 1px rgba(0,0,0,0.4);
-                flex: 0 0 auto;
-            }
-            .timetable-bar .tt-dot.ok { background: var(--live-green); box-shadow: 0 0 8px var(--live-green-glow); }
-            .timetable-bar .tt-dot.err { background: var(--live-red); box-shadow: 0 0 8px var(--live-red-glow); }
-            .timetable-bar .tt-dot.idle { background: var(--text-dim); }
-            .timetable-bar .tt-dot.warn { background: var(--accent-amber); box-shadow: 0 0 8px var(--accent-amber-glow); }
-            .subcam-bar {
-                display: flex;
-                gap: 6px;
-                margin-bottom: 8px;
-            }
-            .subcam-bar button {
-                flex: 1;
-                padding: 6px 4px;
-                background: var(--bg-panel);
-                color: var(--text-muted);
-                border: 1px solid var(--border-subtle);
-                font-family: 'JetBrains Mono', monospace;
-                font-feature-settings: "tnum";
-                font-size: 0.7em;
-                letter-spacing: 0.2em;
-                text-transform: uppercase;
-                cursor: pointer;
-                transition: background-color 0.12s, color 0.12s, border-color 0.12s;
-            }
-            .subcam-bar button:hover {
-                background: var(--bg-elev);
-                color: var(--text-primary);
-                border-color: var(--border-strong);
-            }
-            .subcam-bar button.active {
-                background: var(--accent-amber);
-                color: #0a0d11;
-                border-color: var(--accent-amber-deep);
-                box-shadow: 0 0 14px var(--accent-amber-glow);
-            }
-
-            .class-filter-bar {
-                display: flex;
-                align-items: center;
-                gap: 6px;
-                margin-bottom: 8px;
-                min-height: 30px;
-                overflow-x: auto;
-            }
-            .class-filter-bar button {
-                display: inline-flex;
-                align-items: center;
-                gap: 6px;
-                flex: 0 0 auto;
-                padding: 6px 10px;
-                background: var(--bg-panel);
-                color: var(--text-muted);
-                border: 1px solid var(--border-subtle);
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 0.68em;
-                letter-spacing: 0.16em;
-                text-transform: uppercase;
-                cursor: pointer;
-                transition: background-color 0.12s, color 0.12s, border-color 0.12s;
-            }
-            .class-filter-bar button:hover {
-                background: var(--bg-elev);
-                color: var(--text-primary);
-                border-color: var(--border-strong);
-            }
-            .class-filter-bar button.active {
-                background: var(--bg-elev-hi);
-                color: var(--text-primary);
-                border-color: var(--accent-amber);
-                box-shadow: inset 0 0 0 1px rgba(255,196,35,0.22);
-            }
-            .class-filter-bar .class-dot {
-                width: 8px;
-                height: 8px;
-                border-radius: 50%;
-                background: var(--border-strong);
-                box-shadow: 0 0 0 1px rgba(0,0,0,0.3);
-            }
-
-            #drivers-list {
-                flex: 1;
-                min-height: 0;
-            }
-            .drivers-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-                grid-auto-rows: 1fr;
-                gap: 6px;
-                height: 100%;
-            }
-            .driver-item {
-                position: relative;
-                display: flex;
-                flex-direction: column;
-                justify-content: center;
-                padding: 8px 10px 8px 16px;
-                background: var(--bg-panel);
-                border: 1px solid var(--border-subtle);
-                overflow: hidden;
-                cursor: pointer;
-                transition: background-color 0.18s, border-color 0.18s;
-                min-height: 0;
-            }
-            .driver-item .class-stripe {
-                position: absolute;
-                top: 0; bottom: 0; left: 0;
-                width: 4px;
-                background: var(--border-strong);
-            }
-            .driver-item:hover {
-                background: var(--bg-elev);
-                border-color: var(--border-strong);
-            }
-            .driver-item.disabled { cursor: default; }
-            .driver-item.disabled:hover {
-                background: var(--bg-panel);
-                border-color: var(--border-subtle);
-            }
-            .driver-item.selected {
-                background: linear-gradient(180deg, rgba(255,56,56,0.08) 0%, rgba(255,56,56,0) 90%), var(--bg-panel);
-                border-color: var(--live-red);
-                box-shadow: inset 0 0 0 1px rgba(255,56,56,0.22), 0 0 18px rgba(255,56,56,0.12);
-            }
-            .driver-item.selected:hover {
-                background: linear-gradient(180deg, rgba(255,56,56,0.08) 0%, rgba(255,56,56,0) 90%), var(--bg-panel);
-                border-color: var(--live-red);
-            }
-            .driver-item.offline { opacity: 0.32; }
-            .driver-item.offline.selected { opacity: 0.55; }
-
-            .driver-item.colliding {
-                border-color: var(--live-red) !important;
-                z-index: 1;
-            }
-            .driver-item.colliding .class-stripe {
-                background: var(--live-red) !important;
-                box-shadow: 0 0 10px rgba(255,56,56,0.8);
-                animation: stripe-flash 0.72s ease-in-out infinite;
-            }
-            .driver-item.colliding .name {
-                color: #ffe6e6;
-                text-shadow: 0 0 8px rgba(255,56,56,0.5);
-            }
-            @keyframes stripe-flash {
-                0%, 100% { opacity: 0.55; }
-                50% { opacity: 1; }
-            }
-
-            .driver-item.rolled-over {
-                border-color: #ff8a1f !important;
-                z-index: 1;
-            }
-            .driver-item.rolled-over .class-stripe {
-                background: #ff8a1f !important;
-                box-shadow: 0 0 10px rgba(255,138,31,0.85);
-                animation: stripe-flash 0.6s ease-in-out infinite;
-            }
-            .driver-item.rolled-over .name {
-                color: #fff1dc;
-                text-shadow: 0 0 8px rgba(255,138,31,0.55);
-            }
-            .status-chip.rollover-chip {
-                background: #ff3030;
-                color: #fff;
-                font-weight: 700;
-                letter-spacing: 0.04em;
-                text-transform: uppercase;
-            }
-
-            .driver-info {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                min-width: 0;
-            }
-            .driver-info .pos {
-                font-family: 'Oswald', sans-serif;
-                font-weight: 600;
-                font-size: 1.3em;
-                line-height: 1;
-                color: var(--text-primary);
-                font-feature-settings: "tnum";
-                min-width: 1.5em;
-                text-align: right;
-                flex: 0 0 auto;
-            }
-            .driver-info .num {
-                font-family: 'JetBrains Mono', monospace;
-                font-feature-settings: "tnum";
-                font-size: 0.78em;
-                color: var(--accent-amber);
-                letter-spacing: 0.04em;
-                flex: 0 0 auto;
-            }
-            .driver-info .name {
-                font-family: 'Oswald', sans-serif;
-                font-weight: 500;
-                font-size: 0.95em;
-                text-transform: uppercase;
-                letter-spacing: 0.05em;
-                color: var(--text-primary);
-                overflow: hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
-                min-width: 0;
-                flex: 1 1 auto;
-            }
-            .driver-info .name-stack {
-                display: flex;
-                flex-direction: column;
-                min-width: 0;
-                flex: 1 1 auto;
-                line-height: 1.05;
-            }
-            .driver-info .name-stack .name {
-                flex: 0 1 auto;
-            }
-            .driver-info .team-name {
-                margin-top: 2px;
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 0.62em;
-                color: var(--text-dim);
-                letter-spacing: 0.04em;
-                text-transform: uppercase;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
-            }
-            .driver-info .right {
-                margin-left: auto;
-                display: flex;
-                align-items: center;
-                gap: 4px;
-                flex: 0 0 auto;
-            }
-            .class-badge {
-                display: inline-block;
-                padding: 1px 5px;
-                font-family: 'Oswald', sans-serif;
-                font-size: 0.65em;
-                font-weight: 600;
-                color: #fff;
-                text-transform: uppercase;
-                letter-spacing: 0.12em;
-                line-height: 1.5;
-            }
-            .status-chip {
-                display: inline-block;
-                padding: 1px 5px;
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 0.62em;
-                font-weight: 500;
-                letter-spacing: 0.16em;
-                text-transform: uppercase;
-                line-height: 1.6;
-            }
-            .status-chip.pit {
-                background: var(--accent-amber);
-                color: #0a0d11;
-            }
-            .status-chip.offline {
-                border: 1px solid var(--border-strong);
-                color: var(--text-dim);
-            }
-            .on-air-chip {
-                display: inline-flex;
-                align-items: center;
-                gap: 4px;
-                padding: 2px 6px;
-                background: var(--live-red);
-                color: #fff;
-                font-family: 'Oswald', sans-serif;
-                font-size: 0.65em;
-                font-weight: 600;
-                letter-spacing: 0.16em;
-                text-transform: uppercase;
-                line-height: 1.4;
-                box-shadow: 0 0 12px var(--live-red-glow);
-            }
-            .on-air-chip::before {
-                content: '';
-                width: 5px;
-                height: 5px;
-                border-radius: 50%;
-                background: #fff;
-                animation: pulse-dot 1s ease-in-out infinite;
-            }
-
-            .driver-gaps {
-                display: flex;
-                align-items: baseline;
-                gap: 12px;
-                margin-top: 5px;
-                font-family: 'JetBrains Mono', monospace;
-                font-feature-settings: "tnum";
-                font-size: 0.78em;
-            }
-            .driver-gaps .cell {
-                display: inline-flex;
-                align-items: baseline;
-                gap: 5px;
-            }
-            .driver-gaps .cell .label {
-                font-size: 0.78em;
-                color: var(--text-dim);
-                letter-spacing: 0.18em;
-                text-transform: uppercase;
-            }
-            .driver-gaps .cell .value { color: var(--text-primary); }
-            .driver-gaps .cell .value.warn { color: var(--warn-orange); }
-            .driver-gaps .cell .value.tight { color: var(--live-red); }
-            .driver-gaps .class-pos {
-                color: var(--text-dim);
-                font-size: 0.75em;
-                margin-left: auto;
-                letter-spacing: 0.16em;
-                text-transform: uppercase;
-                white-space: nowrap;
-            }
-
-            #drivers-list .empty {
-                padding: 24px 4px;
-                color: var(--text-dim);
-                font-family: 'Oswald', sans-serif;
-                letter-spacing: 0.14em;
-                text-transform: uppercase;
-                font-size: 0.85em;
-            }
-
-            @media (max-width: 600px) {
-                body { padding: 6px 8px; overflow: auto; background-size: 24px 24px; }
-                #ac-status { padding: 5px 8px; font-size: 0.66em; margin-bottom: 5px; letter-spacing: 0.1em; }
-                .camera-buttons { gap: 4px; margin-bottom: 5px; }
-                .camera-buttons button { padding: 7px 2px 5px; font-size: 0.78em; letter-spacing: 0.08em; }
-                .camera-buttons button .cam-cap { display: none; }
-                .subcam-bar { gap: 4px; margin-bottom: 5px; }
-                .subcam-bar button { padding: 4px 2px; font-size: 0.62em; }
-                .class-filter-bar { gap: 4px; margin-bottom: 5px; min-height: 26px; }
-                .class-filter-bar button { padding: 4px 7px; font-size: 0.58em; letter-spacing: 0.1em; }
-                .timetable-bar { width: 20px; padding: 4px 0; margin-bottom: 5px; }
-                .drivers-grid {
-                    grid-template-columns: repeat(2, 1fr);
-                    grid-auto-rows: auto;
-                    height: auto;
-                    gap: 4px;
-                }
-                .driver-item { padding: 5px 6px 5px 11px; }
-                .driver-item .class-stripe { width: 3px; }
-                .driver-info { gap: 5px; }
-                .driver-info .pos { font-size: 1.05em; min-width: 1.3em; }
-                .driver-info .num { font-size: 0.65em; }
-                .driver-info .name { font-size: 0.78em; letter-spacing: 0.02em; }
-                .driver-info .team-name { font-size: 0.55em; letter-spacing: 0.02em; }
-                .driver-gaps { font-size: 0.65em; gap: 8px; margin-top: 2px; }
-                .driver-gaps .class-pos { display: none; }
-                .class-badge, .status-chip, .on-air-chip { font-size: 0.55em; padding: 1px 3px; letter-spacing: 0.1em; }
-            }
-        </style>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.js"></script>
+        <!-- All assets are vendored under static/ so the panel works on a rig
+             with no internet. amber-console resolves its webfonts as ../fonts/,
+             which is why dist/ and fonts/ must stay siblings. -->
+        <link rel="stylesheet" href="/static/amber-console/dist/amber-console.min.css">
+        <link rel="stylesheet" href="/static/remote.css">
+        <script src="/static/socket.io.min.js"></script>
         <script>
             const socket = io();
             var collisionTimers = {};
             var activeClassFilter = 'ALL';
+            var ttStatus = 'idle';
 
-            var rafTickCount = 0;
-            var rafCollidingCount = 0;
-            function animateCollisions() {
-                rafTickCount++;
-                var pulse = (Math.sin(Date.now() / 360 * Math.PI) + 1) / 2;
-                var ring = 0.7 + pulse * 0.3;       // 0.70 - 1.00 inner ring
-                var halo = 0.45 + pulse * 0.45;     // 0.45 - 0.90 outer glow
-                var tint = 0.10 + pulse * 0.18;     // 0.10 - 0.28 bg tint
-                var els = document.querySelectorAll('.driver-item.colliding');
-                rafCollidingCount = els.length;
-                els.forEach(function(el) {
-                    el.style.boxShadow = 'inset 0 0 0 2px rgba(255,56,56,' + ring + '), 0 0 38px rgba(255,56,56,' + halo + ')';
-                    el.style.backgroundColor = 'rgba(255,56,56,' + tint + ')';
-                });
+            // Class name -> ramp step 1-4 (a .cls-N class, see remote.css).
+            // Amber Console is single-hue, so a class is told apart by its badge
+            // text; the ramp step is only a scanning aid and wraps past four.
+            var classRank = {};
 
-                // Rollover throb — orange/red, slightly slower than collision.
-                var rPulse = (Math.sin(Date.now() / 420 * Math.PI) + 1) / 2;
-                var rRing = 0.7 + rPulse * 0.3;
-                var rHalo = 0.4 + rPulse * 0.45;
-                var rTint = 0.08 + rPulse * 0.18;
-                var rolledEls = document.querySelectorAll('.driver-item.rolled-over:not(.colliding)');
-                rolledEls.forEach(function(el) {
-                    el.style.boxShadow = 'inset 0 0 0 2px rgba(255,138,31,' + rRing + '), 0 0 38px rgba(255,138,31,' + rHalo + ')';
-                    el.style.backgroundColor = 'rgba(255,138,31,' + rTint + ')';
-                });
-
-                requestAnimationFrame(animateCollisions);
+            function classRankClass(cls) {
+                var r = classRank[cls];
+                return r ? ' cls-' + r : '';
             }
-            requestAnimationFrame(animateCollisions);
 
             // Debug helpers — call from DevTools console
             window.debugCollision = function() {
                 console.log('[collision debug]');
-                console.log('  rAF ticks:', rafTickCount, '(should grow ~60/sec)');
-                console.log('  currently animated elements:', rafCollidingCount);
                 console.log('  collisionTimers:', collisionTimers);
                 console.log('  .driver-item count:', document.querySelectorAll('.driver-item').length);
                 console.log('  .driver-item.colliding count:', document.querySelectorAll('.driver-item.colliding').length);
@@ -1221,32 +667,65 @@ def index():
                 });
             }
 
+            function setPressed(el, on) {
+                if (el) el.setAttribute('aria-pressed', on ? 'true' : 'false');
+            }
+
+            // Race number comes only from the "NN | Name" prefix; there is no
+            // slot-index fallback, so an unnumbered entry renders as '--'.
+            function formatCarNumber(carNumber) {
+                return (carNumber === null || carNumber === undefined) ? '--' : '#' + carNumber;
+            }
+
+            // Timetable sync had a colour-coded dot. With one hue available the
+            // state has to be spelled out, so it becomes a badge; an error is the
+            // only alarm here and gets inverse video + blink.
+            function ttBadgeHtml() {
+                var label, cls = 'ac-badge';
+                switch (ttStatus) {
+                    case 'ok': label = 'TT:OK'; break;
+                    case 'disabled_not_race': label = 'TT:IDLE'; cls += ' ac-badge--dim'; break;
+                    case 'not_configured': label = 'TT:OFF'; cls += ' ac-badge--dim'; break;
+                    case 'unreachable':
+                    case 'http_error':
+                    case 'bad_response': label = 'TT:ERR'; cls += ' ac-badge--filled ac-blink'; break;
+                    default: label = 'TT:' + String(ttStatus || 'IDLE').toUpperCase(); cls += ' ac-badge--dim';
+                }
+                return '<span id="timetable-badge" class="' + cls + '" title="Timetable sync: '
+                    + escapeHtml(ttStatus) + '">' + escapeHtml(label) + '</span>';
+            }
+
+            function setTimetableStatus(status) {
+                ttStatus = status || 'idle';
+                var el = document.getElementById('timetable-badge');
+                if (el) el.outerHTML = ttBadgeHtml();
+            }
+
             function buildStatusBar(connected, focusLabel) {
-                var linkLabel = connected ? 'AC Link' : 'No Link';
+                var linkLabel = connected ? 'Link:OK' : 'Link:None';
                 var subLabel = connected ? 'Live' : 'Waiting';
+                // Link down is an alarm: the .ac-disconnected rule in remote.css
+                // pairs inverse video with this blink, so the state survives
+                // prefers-reduced-motion.
                 return '<div class="status-left">'
-                    + '<span class="indicator"></span>'
-                    + '<span class="label-link">' + linkLabel + '</span>'
-                    + '<span>' + subLabel + '</span>'
+                    + '<span class="label-link' + (connected ? '' : ' ac-blink') + '">' + linkLabel + '</span>'
+                    + '<span class="status-sub">' + subLabel + '</span>'
                     + '</div>'
                     + '<div class="status-right">'
-                    + '<span>Focus</span>'
-                    + '<span class="focus-chip">' + focusLabel + '</span>'
+                    + '<span class="ac-readout ac-readout--inline">'
+                    + '<span class="ac-readout__label">Focus</span>'
+                    + '<span class="ac-readout__value">' + focusLabel + '</span>'
+                    + '</span>'
+                    + ttBadgeHtml()
                     + '</div>';
             }
 
-            function renderClassFilters(drivers) {
-                var bar = document.getElementById('class-filter-bar');
-                if (!bar) return;
-
-                var classMap = {};
+            function sortedClasses(drivers) {
+                var seen = {};
                 drivers.forEach(function(d) {
-                    if (d.car_class && d.car_class !== 'Unclassed') {
-                        classMap[d.car_class] = d.class_color || '#999';
-                    }
+                    if (d.car_class && d.car_class !== 'Unclassed') seen[d.car_class] = true;
                 });
-
-                var classes = Object.keys(classMap);
+                var classes = Object.keys(seen);
                 var order = { PRO: 0, HY: 1, AM: 2 };
                 classes.sort(function(a, b) {
                     var au = a.toUpperCase();
@@ -1256,17 +735,28 @@ def index():
                     if (ao !== bo) return ao - bo;
                     return a.localeCompare(b);
                 });
+                return classes;
+            }
 
-                if (activeClassFilter !== 'ALL' && !classMap[activeClassFilter]) {
+            function renderClassFilters(drivers) {
+                var bar = document.getElementById('class-filter-bar');
+                if (!bar) return;
+
+                var classes = sortedClasses(drivers);
+                classRank = {};
+                classes.forEach(function(cls, i) { classRank[cls] = (i % 4) + 1; });
+
+                if (activeClassFilter !== 'ALL' && classes.indexOf(activeClassFilter) === -1) {
                     activeClassFilter = 'ALL';
                 }
 
-                var html = '<button type="button" data-class="ALL" class="' + (activeClassFilter === 'ALL' ? 'active' : '') + '">'
-                    + '<span class="class-dot"></span><span>All</span></button>';
+                var html = '<button type="button" class="ac-btn ac-btn--sm" data-class="ALL" aria-pressed="'
+                    + (activeClassFilter === 'ALL') + '">'
+                    + '<span class="class-swatch"></span><span>All</span></button>';
                 classes.forEach(function(cls) {
-                    var active = activeClassFilter === cls ? 'active' : '';
-                    html += '<button type="button" data-class="' + escapeHtml(cls) + '" class="' + active + '">'
-                        + '<span class="class-dot" style="background:' + escapeHtml(classMap[cls]) + '"></span>'
+                    html += '<button type="button" class="ac-btn ac-btn--sm' + classRankClass(cls)
+                        + '" data-class="' + escapeHtml(cls) + '" aria-pressed="' + (activeClassFilter === cls) + '">'
+                        + '<span class="class-swatch"></span>'
                         + '<span>' + escapeHtml(cls) + '</span></button>';
                 });
                 bar.innerHTML = html;
@@ -1306,7 +796,7 @@ def index():
                         e.preventDefault();
                         activeClassFilter = btn.dataset.class || 'ALL';
                         document.querySelectorAll('#class-filter-bar button').forEach(function(b) {
-                            b.classList.toggle('active', b.dataset.class === activeClassFilter);
+                            setPressed(b, b.dataset.class === activeClassFilter);
                         });
                         document.querySelectorAll('.driver-item').forEach(function(card) {
                             card.style.display = activeClassFilter === 'ALL' || card.dataset.class === activeClassFilter ? '' : 'none';
@@ -1318,44 +808,31 @@ def index():
             });
 
             socket.on('director_status', function(data) {
-                var btn = document.getElementById('auto-dir-btn');
-                if (btn) btn.classList.toggle('active', data.enabled);
+                setPressed(document.getElementById('auto-dir-btn'), data.enabled);
             });
 
             socket.on('director_debug_status', function(data) {
-                var btn = document.getElementById('auto-dir-dbg-btn');
-                if (btn) btn.classList.toggle('active', data.enabled);
+                setPressed(document.getElementById('auto-dir-dbg-btn'), data.enabled);
             });
 
-            function setTimetableDot(status) {
-                var dot = document.getElementById('timetable-dot');
-                if (!dot) return;
-                dot.classList.remove('ok', 'err', 'idle', 'warn');
-                var label = '';
-                switch (status) {
-                    case 'ok': dot.classList.add('ok'); label = 'OK'; break;
-                    case 'disabled_not_race': dot.classList.add('idle'); label = 'Not Race'; break;
-                    case 'not_configured': dot.classList.add('idle'); label = 'Idle'; break;
-                    case 'unreachable':
-                    case 'http_error':
-                    case 'bad_response': dot.classList.add('err'); label = 'Error'; break;
-                    default: dot.classList.add('idle'); label = status || '';
-                }
-                dot.title = 'Timetable sync: ' + (label || status || 'unknown');
-            }
-
             socket.on('timetable_url', function(data) {
-                if (data.status) setTimetableDot(data.status);
+                if (data.status) setTimetableStatus(data.status);
                 if (data.error) console.log('[timetable] ' + data.error);
             });
 
             socket.on('update', function(data) {
                 var statusEl = document.getElementById('ac-status');
+
+                // Timetable state is rendered inside the status bar, so it has to
+                // be current before the bar is rebuilt.
+                if (data.timetable_status) ttStatus = data.timetable_status;
+
                 if (!data.ac_connected) {
-                    statusEl.className = 'ac-status ac-disconnected';
+                    statusEl.className = 'ac-statusbar ac-statusbar--line ac-disconnected';
                     statusEl.innerHTML = buildStatusBar(false, '--');
                     renderClassFilters([]);
-                    document.getElementById('drivers-list').innerHTML = '<p class="empty">No telemetry. Start Assetto Corsa with Broadcaster Remote enabled.</p>';
+                    document.getElementById('drivers-list').innerHTML =
+                        '<div class="ac-banner" role="alert">No Telemetry</div>';
                     return;
                 }
 
@@ -1363,27 +840,21 @@ def index():
                 var focusLabel = '--';
                 for (var i = 0; i < data.drivers.length; i++) {
                     if (data.drivers[i].num - 1 === data.current_driver) {
-                        focusLabel = '#' + data.drivers[i].car_number;
+                        focusLabel = formatCarNumber(data.drivers[i].car_number);
                         break;
                     }
                 }
-                statusEl.className = 'ac-status ac-connected';
+                statusEl.className = 'ac-statusbar ac-statusbar--line ac-connected';
                 statusEl.innerHTML = buildStatusBar(true, focusLabel);
 
-                // Auto-director button state
-                var autoBtn = document.getElementById('auto-dir-btn');
-                if (autoBtn) autoBtn.classList.toggle('active', !!data.auto_director);
+                setPressed(document.getElementById('auto-dir-btn'), !!data.auto_director);
+                setPressed(document.getElementById('auto-dir-dbg-btn'), !!data.auto_director_debug);
 
-                // Director-debug button state
-                var dbgBtn = document.getElementById('auto-dir-dbg-btn');
-                if (dbgBtn) dbgBtn.classList.toggle('active', !!data.auto_director_debug);
-
-                // Timetable status dot reflects last poll outcome
-                if (data.timetable_status) setTimetableDot(data.timetable_status);
-
-                // Highlight active camera button
+                // Highlight active camera
                 document.querySelectorAll('.camera-buttons button[data-cam]').forEach(function(btn) {
-                    btn.classList.toggle('active', parseInt(btn.dataset.cam) === data.current_camera);
+                    var on = parseInt(btn.dataset.cam) === data.current_camera;
+                    btn.classList.toggle('ac-tab--active', on);
+                    btn.setAttribute('aria-selected', on ? 'true' : 'false');
                 });
 
                 // Build subcamera bar for F6 cameras
@@ -1391,8 +862,8 @@ def index():
                 if (data.car_cameras_count > 0) {
                     var html = '';
                     for (var i = 0; i < data.car_cameras_count; i++) {
-                        var cls = (data.current_camera === 4 && data.current_car_camera === i) ? ' active' : '';
-                        html += '<button class="' + cls + '" data-carcam="' + i + '">Cam ' + (i + 1) + '</button>';
+                        var on = data.current_camera === 4 && data.current_car_camera === i;
+                        html += '<button class="ac-btn ac-btn--sm" data-carcam="' + i + '" aria-pressed="' + on + '">Cam ' + (i + 1) + '</button>';
                     }
                     subcamEl.innerHTML = html;
                     subcamEl.style.display = 'flex';
@@ -1422,44 +893,58 @@ def index():
                         var hasClass = d.car_class && d.car_class !== 'Unclassed';
 
                         var cls = 'driver-item';
-                        if (isColliding) cls += ' colliding';
+                        if (hasClass) cls += classRankClass(d.car_class);
+                        // Collision is the loudest state the palette allows: the
+                        // card snaps to inverse video (see remote.css) and blinks.
+                        // The inverse fill is what carries it when blink is off.
+                        if (isColliding) cls += ' colliding ac-blink';
                         if (isRolledOver) cls += ' rolled-over';
                         if (isSelected) cls += ' selected';
                         if (isDisabled) cls += ' disabled';
                         if (isOffline) cls += ' offline';
 
                         grid += '<div class="' + cls + '" data-num="' + d.num + '" data-class="' + escapeHtml(d.car_class || '') + '">';
-                        var stripeStyle = hasClass ? ' style="background:' + escapeHtml(d.class_color) + '"' : '';
-                        grid += '<span class="class-stripe"' + stripeStyle + '></span>';
+                        grid += '<span class="class-stripe"></span>';
 
                         grid += '<div class="driver-info">';
                         grid += '<span class="pos">' + d.position + '</span>';
-                        grid += '<span class="num">#' + escapeHtml(d.car_number) + '</span>';
-                        grid += '<span class="name-stack">';
+                        grid += '<span class="num">' + escapeHtml(formatCarNumber(d.car_number)) + '</span>';
                         grid += '<span class="name">' + escapeHtml(d.name) + '</span>';
-                        if (d.team_name) {
-                            grid += '<span class="team-name">' + escapeHtml(d.team_name) + '</span>';
-                        }
-                        grid += '</span>';
                         grid += '<span class="right">';
-                        if (isSelected) {
-                            grid += '<span class="on-air-chip">On Air</span>';
-                        } else if (isOffline) {
-                            grid += '<span class="status-chip offline">Off</span>';
+                        // No ON AIR badge: the focused car already carries the
+                        // widened stripe and the brightened name, and the badge
+                        // was only crowding the row.
+                        if (isOffline) {
+                            grid += '<span class="ac-badge status-badge ac-badge--dim">Off</span>';
                         } else if (isPit) {
-                            grid += '<span class="status-chip pit">Pit</span>';
+                            grid += '<span class="ac-badge status-badge">Pit</span>';
                         }
+                        if (isColliding) {
+                            grid += '<span class="ac-badge status-badge ac-badge--filled">Hit</span>';
+                        }
+                        // FLP blinks but leaves the card body alone, which is how
+                        // it stays distinguishable from a collision.
                         if (isRolledOver) {
-                            grid += '<span class="status-chip rollover-chip">Flip</span>';
+                            grid += '<span class="ac-badge status-badge ac-badge--filled ac-blink">Flp</span>';
                         }
                         if (hasClass) {
-                            grid += '<span class="class-badge" style="background-color:' + escapeHtml(d.class_color) + '">' + escapeHtml(d.car_class) + '</span>';
+                            grid += '<span class="ac-badge class-badge">' + escapeHtml(d.car_class) + '</span>';
                         }
                         grid += '</span>';
                         grid += '</div>';
 
+                        // Team gets its own full-width row rather than sitting
+                        // indented under the name — the card is 240px wide and
+                        // an indented line loses most of it to the pos/number
+                        // column on the left and the badges on the right.
+                        if (d.team_name) {
+                            grid += '<div class="team-name">' + escapeHtml(d.team_name) + '</div>';
+                        }
+
                         grid += '<div class="driver-gaps">';
                         grid += '<span class="cell"><span class="label">Gap</span><span class="value">' + escapeHtml(d.gap) + '</span></span>';
+                        // Urgency is ramp position, not hue: tight is the brightest
+                        // value in the row, normal is the dimmest.
                         var intCls = '';
                         var m = d.interval.match(/^\\+(\\d+\\.?\\d*)s$/);
                         if (m) { var v = parseFloat(m[1]); if (v < 0.4) intCls = ' tight'; else if (v < 1.0) intCls = ' warn'; }
@@ -1468,10 +953,7 @@ def index():
                             var clsIntCls = '';
                             var mc = d.class_interval.match(/^\\+(\\d+\\.?\\d*)s$/);
                             if (mc) { var vc = parseFloat(mc[1]); if (vc < 0.4) clsIntCls = ' tight'; else if (vc < 1.0) clsIntCls = ' warn'; }
-                            grid += '<span class="cell"><span class="label">Cls</span><span class="value' + clsIntCls + '">' + escapeHtml(d.class_interval) + '</span></span>';
-                        }
-                        if (hasClass) {
-                            grid += '<span class="class-pos">P' + d.class_position + ' &middot; ' + escapeHtml(d.car_class) + '</span>';
+                            grid += '<span class="cell cell-cls"><span class="label">Cls</span><span class="value' + clsIntCls + '">' + escapeHtml(d.class_interval) + '</span></span>';
                         }
                         grid += '</div>';
                         grid += '</div>';
@@ -1479,43 +961,54 @@ def index():
                     grid += '</div>';
                     driversList.innerHTML = grid;
                 } else {
-                    driversList.innerHTML = '<p class="empty">No drivers in selected class.</p>';
+                    driversList.innerHTML = '<div class="ac-banner ac-banner--dim">No Drivers In Class</div>';
                 }
             });
         </script>
     </head>
     <body>
-        <div id="ac-status" class="ac-status ac-disconnected">
+        <!-- The simulation overlays (.ac-mesh / .ac-retrace / .ac-persist) are
+             intentionally absent, and .ac-bloom is off — see remote.css. -->
+        <div class="ac-screen" data-ac-screen>
+        <div class="ac-screen__body">
+
+        <div id="ac-status" class="ac-statusbar ac-statusbar--line ac-disconnected">
             <div class="status-left">
-                <span class="indicator"></span>
-                <span class="label-link">No Link</span>
-                <span>Connecting</span>
+                <span class="label-link ac-blink">Link:None</span>
+                <span class="status-sub">Connecting</span>
             </div>
             <div class="status-right">
-                <span>Focus</span>
-                <span class="focus-chip">--</span>
+                <span class="ac-readout ac-readout--inline">
+                    <span class="ac-readout__label">Focus</span>
+                    <span class="ac-readout__value">--</span>
+                </span>
+                <span id="timetable-badge" class="ac-badge ac-badge--dim" title="Timetable sync: idle">TT:IDLE</span>
             </div>
         </div>
 
-        <div class="camera-buttons">
-            <button data-cam="1">Track<span class="cam-cap">01</span></button>
-            <button data-cam="2">Cockpit<span class="cam-cap">02</span></button>
-            <button data-cam="3">Heli<span class="cam-cap">03</span></button>
-            <button data-cam="4">F6<span class="cam-cap">04</span></button>
-            <button data-cam="5">Orbit<span class="cam-cap">05</span></button>
-            <button id="auto-dir-btn" onclick="socket.emit('toggle_director')">Auto<span class="cam-cap">AI</span></button>
-            <button id="auto-dir-dbg-btn" onclick="socket.emit('toggle_director_debug')" title="Verbose director scoring logs to server stdout">Dbg<span class="cam-cap">DG</span></button>
+        <div class="control-bar">
+            <div class="camera-buttons ac-tabs" role="tablist">
+                <button class="ac-tab" role="tab" aria-selected="false" data-cam="1">Track<span class="cam-cap">01</span></button>
+                <button class="ac-tab" role="tab" aria-selected="false" data-cam="2">Cockpit<span class="cam-cap">02</span></button>
+                <button class="ac-tab" role="tab" aria-selected="false" data-cam="3">Heli<span class="cam-cap">03</span></button>
+                <button class="ac-tab" role="tab" aria-selected="false" data-cam="4">F6<span class="cam-cap">04</span></button>
+                <button class="ac-tab" role="tab" aria-selected="false" data-cam="5">Orbit<span class="cam-cap">05</span></button>
+            </div>
+            <div class="dir-group">
+                <button id="auto-dir-btn" class="ac-btn" aria-pressed="false" onclick="socket.emit('toggle_director')">Auto<span class="cam-cap">AI</span></button>
+                <button id="auto-dir-dbg-btn" class="ac-btn" aria-pressed="false" onclick="socket.emit('toggle_director_debug')" title="Verbose director scoring logs to server stdout">Dbg<span class="cam-cap">DG</span></button>
+            </div>
         </div>
-        <div id="timetable-bar" class="timetable-bar">
-            <span id="timetable-dot" class="tt-dot idle" title="Timetable sync: idle"></span>
-        </div>
+
         <div id="subcam-bar" class="subcam-bar" style="display:none"></div>
         <div id="class-filter-bar" class="class-filter-bar"></div>
 
         <div id="drivers-list">
-            <p class="empty">Connecting</p>
+            <div class="ac-banner ac-banner--dim">Connecting</div>
         </div>
 
+        </div>
+        </div>
     </body>
     </html>
     '''

@@ -182,7 +182,7 @@ Recommended feedback states on the button:
 All changes are in `remote_web.py`. Key entry points:
 
 - Module state: `LIVE_TIMING_URL`, `progress_offsets`, `_resync_lock`, `last_resync_*`.
-- `_parse_driver_name(raw_name, car_id)` — shared "NN | Name" parser.
+- `_parse_driver_name(raw_name)` — shared "NN | Name" parser. Returns `car_number = None` when the prefix is absent or non-numeric; the car slot index is never used as a race number.
 - `fetch_live_timing_drivers()` — single GET with timeout.
 - `_match_local(api_record, by_number, by_name)` — race-number-first matching.
 - `resync_progress_offsets()` — the work behind the button.

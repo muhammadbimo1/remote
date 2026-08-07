@@ -47,6 +47,35 @@ class TeamNamePayloadTest(unittest.TestCase):
         self.assertEqual(remote_web.get_car_class("AM 51 | Team C"), ("AM", "#e69138"))
 
 
+class CarNumberTest(unittest.TestCase):
+    def test_car_number_comes_from_name_prefix(self):
+        self.assertEqual(remote_web._parse_driver_name("23 | Alex Driver"),
+                         (23, "Alex Driver"))
+
+    def test_car_number_is_none_without_a_numeric_prefix(self):
+        cases = ["Alex Driver", "Alex | Driver", " | Alex Driver"]
+        for raw_name in cases:
+            with self.subTest(raw_name=raw_name):
+                car_number, _ = remote_web._parse_driver_name(raw_name)
+                self.assertIsNone(car_number)
+
+    def test_payload_car_number_is_null_and_not_the_slot_index(self):
+        telem = TelemetryPage()
+        telem.car_count = 1
+        telem.track_length = 5000.0
+
+        car = telem.cars[0]
+        car.car_id = 4
+        car.position = 1
+        car.is_connected = 1
+        car.driver_name = "Unnumbered Driver"
+
+        driver = build_update_data(telem)["drivers"][0]
+
+        self.assertIsNone(driver["car_number"])
+        self.assertEqual(driver["num"], 5)
+
+
 class TimetableOffsetTest(unittest.TestCase):
     def tearDown(self):
         with remote_web._resync_lock:
