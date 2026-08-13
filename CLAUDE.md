@@ -18,6 +18,66 @@ The FFI structs in `remote.lua` (lines 7-39) and the ctypes structs in `ipc_shar
 
 Camera IDs use a custom 1-5 numbering (Track, Cockpit, Helicopter, Car/F6, Free) mapped to/from `ac.CameraMode` enums in Lua.
 
+### Action Replay
+
+The command mmap carries a **second sequence counter**, `replay_seq`, alongside `command_seq`.
+Replay commands (`REPLAY_ENTER` / `REPLAY_LIVE` / `REPLAY_SEEK_FRAME` in `ipc_shared.py`) bump
+only `replay_seq`, deliberately leaving `command_seq` alone: entering instant replay resets the
+camera, so Lua parks the requested driver/camera in `shotHold` and applies it once
+`sim.isReplayActive` matches. Bumping `command_seq` too would make Lua apply the shot
+immediately, where the replay toggle eats it.
+
+**Both** replay transitions reset the shot — entering resets the camera, leaving snaps focus back
+to the player car — and AC does it a frame or two *after* the toggle returns, so one apply is not
+enough. `shotHold` in `remote.lua` re-asserts the wanted driver/camera every frame for
+`SHOT_HOLD_S`, only touching what actually drifted (a blind re-apply would cycle the F6 sub-camera,
+since `changeCamera(4, …, -1)` advances it). Any command on `command_seq` clears the hold, so an
+operator pick always wins. Leaving replay — commanded or AC's own exit at the live edge — captures
+the on-screen shot first and holds it on the live side.
+
+Jumps are expressed as **seconds to rewind**, never frame indices — `ac.tryToToggleReplay(active,
+rewindS)` takes seconds, so `event_log.py` only has to timestamp incidents in wall clock.
+`replay_frame` / `replay_frames` in the telemetry page feed the readout and nothing else.
+
+**Replay toggles must never overlap.** Two crashes on 2026-08-08 (`logs/dmp-687-42914`,
+`dmp-687-42a55`) died in AC's own `OverlayLeaderboard::renderHUD` (overlayleaderboard.cpp:246,
+called through CSP) right after a burst of `onReplayStatusChanged` transitions — one of them from
+a jump issued while replay was already active. `remote.lua` now serialises every toggle behind a
+`REPLAY_SETTLE_S` window, re-arms that window on each `ac.onReplay` event, and turns "jump while
+in replay" into exit → settle → enter. Do not add a code path that calls `ac.tryToToggleReplay`
+without going through `enterReplay` / `exitReplay`.
+
+### Event log vs event journal
+
+Two separate stores, on purpose. `event_log.py` is the **live window** feeding the panel: it
+prunes to AC's actual recorded replay length (`replay_frames * replay_frame_ms`, fed in from the
+telemetry loop via `set_window()`), because an event that can no longer be rewound into is a dead
+button. `event_journal.py` is the **permanent record**, one JSONL file per AC session under
+`event_logs/`, never pruned, meant for annotating the `.acreplay` saved at the end of the session.
+
+AC records one `.acreplay` per session under `replay/temp`, created at session start (its
+`CreationTime` equals the timestamp in the name) and grown live, named
+`AC_DDMMYY-HHMMSS_<S>_<car>_<track>.acreplay` with `S` being `O` (practice/other), `Q` or `R`.
+`find_session_replay()` matches on **that filename timestamp**, never on file mtime — the file is
+still being written, so its mtime tracks now, not the session. The journal then takes the replay's
+stem as its own filename, and each record repeats `replay_file` in case the replay is renamed on
+its way out of `temp`. Hand-saved replays have arbitrary names, don't parse, and are never matched.
+
+Session start is estimated as `now - replay_frames * replay_frame_ms`, so the pairing still works
+when the server is started mid-session. No match within `REPLAY_MATCH_TOLERANCE_S` leaves the
+journal unpaired on purpose — an unmatched journal beats one pointing at the wrong session.
+
+Journal records carry wall clock (`iso`/`t`), `session_s` (recorded replay seconds at that
+instant) and `replay_frame`. The latter two are only trustworthy while the instant-replay buffer
+has not wrapped — after a wrap the saved replay no longer starts at frame 0 and both offsets
+shift. Wall clock is the anchor that never moves. Context keys are omitted rather than written as
+`null` when AC reports nothing.
+
+While `is_replay` is set, car data comes from the replay frame on screen, not the race: the
+server freezes the driver list at the last live payload, suspends the auto-director, skips event
+detection, and stops the timetable poll. Anything reading car state per tick needs the same
+guard.
+
 ## Critical Rules
 
 **NEVER use shell commands or external tools** (`io.popen`, `os.execute`, etc.) in Lua code. CSP provides comprehensive APIs for all file/directory operations:

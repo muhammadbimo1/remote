@@ -18,6 +18,16 @@ local telemPage = ac.writeMemoryMappedFile(TELEM_TAG, [[
   int current_car_camera;
   float track_length;
   int session_type;
+  int session_index;
+  int session_type_raw;
+  int session_gen;
+  wchar_t session_name[64];
+  int is_replay;
+  int replay_frame;
+  int replay_frames;
+  float replay_frame_ms;
+  int replay_last_result;
+  wchar_t replay_temp_dir[256];
   wchar_t timetable_url[128];
   struct {
     int car_id;
@@ -44,14 +54,68 @@ local cmdPage = ac.writeMemoryMappedFile(CMD_TAG, [[
   int target_camera;
   int target_car_camera;
   int command_seq;
+  int replay_seq;
+  int replay_action;
+  float replay_rewind_s;
+  int replay_frame;
 //<__EXPAL:0:4>]])
+
+-- Replay actions — must match the REPLAY_* constants in ipc_shared.py
+local REPLAY_ENTER = 1
+local REPLAY_LIVE = 2
+local REPLAY_SEEK_FRAME = 3
+
+-- replay_last_result values published back to the web panel
+local REPLAY_RESULT_UNTRIED = 0
+local REPLAY_RESULT_OK = 1
+local REPLAY_RESULT_REFUSED = 2
 
 ---------------------------------------------------------------------
 -- State
 ---------------------------------------------------------------------
 local lastCommandSeq = 0
+local lastReplaySeq = 0
 local updateAccum = 0
 local UPDATE_INTERVAL = 0.1 -- 100 ms
+
+-- Replay state. Both replay transitions reset the shot: entering resets the
+-- camera, and leaving snaps focus back to the player car. AC does it a frame
+-- or two *after* the toggle, so a single focusCar + setCurrentCamera gets
+-- clobbered. The wanted shot is held here and re-asserted for as long as AC
+-- keeps fighting it, then released.
+local replayLastResult = REPLAY_RESULT_UNTRIED
+local shotHold = nil            -- { driver, camera, subCam, wantReplay, deadline }
+-- Long enough to cover AC's fade in and out of replay, where the reset lands.
+local SHOT_HOLD_S = 2.5
+
+-- Replay toggles are serialised. Overlapping them crashed AC inside its own
+-- OverlayLeaderboard::renderHUD (see logs/dmp-687-*): a jump issued while
+-- replay was already active stacked two status transitions and the native
+-- leaderboard overlay rendered across them. Never toggle while a previous
+-- transition is settling, and turn "jump while already in replay" into
+-- exit -> settle -> enter instead of a second enter.
+local REPLAY_SETTLE_S = 0.75
+local QUEUED_ENTER_TIMEOUT = 5.0
+local replayBusyUntil = 0
+local queuedEnter = nil         -- { rewindS, driver, camera, subCam, deadline }
+
+-- Session identity. AC saves a separate replay per session and wipes the
+-- instant-replay buffer when one starts, so markers from the previous session
+-- point into a recording that no longer exists. `sessionGen` is what the web
+-- server watches to rotate its journal; the index/type drift check covers the
+-- session already running when this script loads, which onSessionStart (by
+-- documented design) never fires for.
+local sessionGen = 0
+local lastSessionIndex = -1
+local lastSessionTypeRaw = -1
+
+ac.onSessionStart(function(sessionIndex, restarted)
+  sessionGen = sessionGen + 1
+  lastSessionIndex = sessionIndex
+  lastSessionTypeRaw = sim.raceSessionType
+  ac.log(string.format('Session start: index=%d restarted=%s gen=%d',
+    sessionIndex, tostring(restarted), sessionGen))
+end)
 
 -- Collision flags: consumed (and reset) by telemetry writer.
 -- Callback fires reliably only for the local car; damage-array deltas
@@ -76,6 +140,10 @@ local rolloverTickCount = {}
 ac.onCarCollision(-1, function(carIndex)
   collisionFlags[carIndex] = true
 end)
+
+-- A replay start/stop/jump teleports every car, which produces speed and damage
+-- deltas large enough to trip the collision and rollover heuristics above. Drop
+-- the previous-tick baselines so the next tick starts clean.
 
 
 -- Cached driver data for the UI (rebuilt each telemetry tick)
@@ -160,20 +228,188 @@ end
 ---------------------------------------------------------------------
 -- Command processing
 ---------------------------------------------------------------------
+local function applyFocus(driver, camera, subCam)
+  -- Only refocus when the driver actually changes. Calling ac.focusCar on
+  -- the already-focused car queues an internal camera reset that clobbers
+  -- the setCurrentCamera below on the following frame.
+  if driver >= 0 and driver ~= sim.focusedCar then
+    ac.focusCar(driver)
+  end
+  changeCamera(camera, driver, subCam)
+end
+
+local function holdShot(driver, camera, subCam, wantReplay)
+  shotHold = {
+    driver = driver,
+    camera = camera,
+    subCam = subCam,
+    wantReplay = wantReplay,
+    deadline = os.preciseClock() + SHOT_HOLD_S,
+  }
+end
+
+-- Snapshot of what is on screen right now, to be re-asserted on the other side
+-- of a replay transition.
+local function holdCurrentShot(wantReplay)
+  holdShot(sim.focusedCar, cspCameraToCustom(sim.cameraMode), sim.carCameraIndex, wantReplay)
+end
+
+local function enterReplay(rewindS, driver, camera, subCam)
+  local ok = ac.tryToToggleReplay(true, rewindS)
+  replayLastResult = ok and REPLAY_RESULT_OK or REPLAY_RESULT_REFUSED
+  replayBusyUntil = os.preciseClock() + REPLAY_SETTLE_S
+  ac.log(string.format('Replay enter: rewind=%.1fs accepted=%s', rewindS, tostring(ok)))
+  if ok then
+    holdShot(driver, camera, subCam, true)
+  else
+    shotHold = nil
+  end
+end
+
+-- `keepShot` is false only for the exit half of a re-enter, where the queued
+-- enter is about to install its own shot and briefly restoring the old one on
+-- live would just flash the wrong car.
+local function exitReplay(reason, keepShot)
+  if keepShot then
+    holdCurrentShot(false)
+  else
+    shotHold = nil
+  end
+  local ok = ac.tryToToggleReplay(false)
+  replayLastResult = ok and REPLAY_RESULT_OK or REPLAY_RESULT_REFUSED
+  replayBusyUntil = os.preciseClock() + REPLAY_SETTLE_S
+  ac.log(string.format('Replay live (%s): accepted=%s keepShot=%s',
+    reason, tostring(ok), tostring(keepShot == true)))
+  if not ok then shotHold = nil end
+  return ok
+end
+
+local function processReplayCommands()
+  local seq = cmdPage.replay_seq
+  if seq == lastReplaySeq then return end
+  lastReplaySeq = seq
+
+  local action = cmdPage.replay_action
+  local active = sim.isReplayActive
+  local now = os.preciseClock()
+
+  -- A toggle landing inside another toggle's transition is what crashed AC.
+  if now < replayBusyUntil then
+    ac.log(string.format('Replay command %d ignored: transition in progress (active=%s)',
+      action, tostring(active)))
+    return
+  end
+
+  if action == REPLAY_ENTER then
+    local rewindS = cmdPage.replay_rewind_s
+    local driver = cmdPage.target_driver
+    local camera = cmdPage.target_camera
+    local subCam = cmdPage.target_car_camera
+    if active then
+      -- Jump while already in replay: leave replay first and enter again once
+      -- AC has settled, rather than toggling on top of an active replay.
+      ac.log(string.format('Replay re-enter queued: rewind=%.1fs (leaving replay first)', rewindS))
+      queuedEnter = {
+        rewindS = rewindS,
+        driver = driver,
+        camera = camera,
+        subCam = subCam,
+        deadline = now + QUEUED_ENTER_TIMEOUT,
+      }
+      exitReplay('re-enter', false)
+    else
+      queuedEnter = nil
+      enterReplay(rewindS, driver, camera, subCam)
+    end
+  elseif action == REPLAY_LIVE then
+    queuedEnter = nil
+    if active then
+      -- Keep the car that was on screen in the replay: leaving replay makes AC
+      -- snap focus back to the player car, which is never what a director wants.
+      exitReplay('command', true)
+    else
+      ac.log('Replay live ignored: not in replay')
+    end
+  elseif action == REPLAY_SEEK_FRAME then
+    if active then
+      ac.setReplayPosition(cmdPage.replay_frame, 0)
+    else
+      ac.log('Replay seek ignored: not in replay')
+    end
+  end
+end
+
+-- Second half of a queued re-enter: fires once AC is out of replay and the
+-- transition has settled.
+local function processQueuedReplay()
+  if not queuedEnter then return end
+  local now = os.preciseClock()
+  if now > queuedEnter.deadline then
+    ac.log('Replay re-enter dropped: timed out waiting to leave replay')
+    queuedEnter = nil
+    return
+  end
+  if sim.isReplayActive or now < replayBusyUntil then return end
+  local q = queuedEnter
+  queuedEnter = nil
+  enterReplay(q.rewindS, q.driver, q.camera, q.subCam)
+end
+
+-- Re-assert the wanted shot until AC stops resetting it (or the operator picks
+-- something else, which clears the hold). Only touches what actually drifted,
+-- so an F6 sub-camera is never cycled by a redundant re-apply.
+local function processShotHold()
+  if not shotHold then return end
+  if os.preciseClock() > shotHold.deadline then
+    shotHold = nil
+    return
+  end
+  -- Wait for the side of the transition this shot was meant for.
+  if sim.isReplayActive ~= shotHold.wantReplay then return end
+
+  local needFocus = shotHold.driver >= 0 and sim.focusedCar ~= shotHold.driver
+  local needCamera = shotHold.camera > 0 and cspCameraToCustom(sim.cameraMode) ~= shotHold.camera
+  local needSubCam = shotHold.camera == 4 and shotHold.subCam >= 0
+    and sim.carCameraIndex ~= shotHold.subCam
+
+  if needFocus or needCamera or needSubCam then
+    applyFocus(shotHold.driver, shotHold.camera, shotHold.subCam)
+  end
+end
+
+ac.onReplay(function(event)
+  ac.log('Replay event: ' .. tostring(event))
+  -- Every AC-side transition re-arms the settle window, so a command arriving
+  -- mid-transition is ignored rather than stacked on top of it.
+  replayBusyUntil = math.max(replayBusyUntil, os.preciseClock() + REPLAY_SETTLE_S)
+
+  -- A replay start/stop/jump teleports every car, which produces speed and
+  -- damage deltas large enough to trip the collision and rollover heuristics.
+  collisionFlags = {}
+  prevDamageSum = {}
+  prevSpeedKmh = {}
+  rolloverState = {}
+  rolloverTickCount = {}
+
+  -- AC ends instant replay on its own when playback reaches the live edge, and
+  -- that exit snaps focus to the player car exactly like the commanded one. No
+  -- hold is pending in that case, so take one now, while the replay shot is
+  -- still on screen. Skipped mid re-enter: that shot is already queued.
+  if event == 'stop' and not queuedEnter
+      and (shotHold == nil or shotHold.wantReplay) then
+    holdCurrentShot(false)
+  end
+end)
+
+
 local function processCommands()
   local seq = cmdPage.command_seq
   if seq ~= lastCommandSeq then
     lastCommandSeq = seq
-    local driver = cmdPage.target_driver
-    local camera = cmdPage.target_camera
-    local subCam = cmdPage.target_car_camera
-    -- Only refocus when the driver actually changes. Calling ac.focusCar on
-    -- the already-focused car queues an internal camera reset that clobbers
-    -- the setCurrentCamera below on the following frame.
-    if driver >= 0 and driver ~= sim.focusedCar then
-      ac.focusCar(driver)
-    end
-    changeCamera(camera, driver, subCam)
+    -- An explicit pick from the panel wins over any shot being held, otherwise
+    -- the hold would drag the operator back to the replay's car.
+    shotHold = nil
+    applyFocus(cmdPage.target_driver, cmdPage.target_camera, cmdPage.target_car_camera)
   end
 end
 
@@ -250,6 +486,33 @@ local function updateTelemetry()
   telemPage.current_car_camera = sim.carCameraIndex
   telemPage.track_length = sim.trackLengthM
   telemPage.session_type = (sim.raceSessionType == ac.SessionType.Race) and 1 or 0
+
+  local sessionIndex = sim.currentSessionIndex
+  local sessionTypeRaw = sim.raceSessionType
+  if sessionIndex ~= lastSessionIndex or sessionTypeRaw ~= lastSessionTypeRaw then
+    -- Covers the session running at script load and anything onSessionStart
+    -- misses. A duplicate bump costs an empty rotation, which is free.
+    if lastSessionIndex ~= -1 then
+      sessionGen = sessionGen + 1
+      ac.log(string.format('Session change detected: index=%d type=%d gen=%d',
+        sessionIndex, sessionTypeRaw, sessionGen))
+    end
+    lastSessionIndex = sessionIndex
+    lastSessionTypeRaw = sessionTypeRaw
+  end
+  telemPage.session_index = sessionIndex
+  telemPage.session_type_raw = sessionTypeRaw
+  telemPage.session_gen = sessionGen
+  writeWchar(telemPage.session_name, ac.getSessionName(sessionIndex) or '', 64)
+
+  telemPage.is_replay = sim.isReplayActive and 1 or 0
+  telemPage.replay_frame = sim.replayCurrentFrame
+  telemPage.replay_frames = sim.replayFrames
+  telemPage.replay_frame_ms = sim.replayFrameMs
+  telemPage.replay_last_result = replayLastResult
+  -- Where AC keeps the per-session .acreplay it is recording right now. The
+  -- web server pairs its event journal to that file by name.
+  writeWchar(telemPage.replay_temp_dir, ac.getFolder(ac.FolderID.ReplaysTemp) or '', 256)
   local serverIP = ac.getServerIP()
   local httpPort = ac.getServerPortHTTP()
   local timetableURL = ''
@@ -306,12 +569,19 @@ end
 -- Main update loop
 ---------------------------------------------------------------------
 function script.update(dt)
+  -- Commands run every frame: they are a sequence compare when idle, and the
+  -- deferred replay shot needs to land the frame replay comes up, not up to
+  -- 100 ms later.
+  processReplayCommands()
+  processQueuedReplay()
+  processShotHold()
+  processCommands()
+
   updateAccum = updateAccum + dt
   if updateAccum < UPDATE_INTERVAL then return end
   updateAccum = 0
 
   updateTelemetry()
-  processCommands()
   driverRows = buildDriverRows()
 end
 

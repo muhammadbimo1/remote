@@ -14,7 +14,10 @@ import requests
 
 from ipc_shared import TelemetryPage, CommandPage, MAX_CARS
 from ipc_shared import TELEMETRY_TAG, COMMAND_TAG
+from ipc_shared import REPLAY_ENTER, REPLAY_LIVE, REPLAY_SEEK_FRAME
 from auto_director import AutoDirector
+from event_log import EventLog
+from event_journal import EventJournal
 
 app = Flask(__name__)
 socketio = SocketIO(app)
@@ -26,11 +29,108 @@ command_mmap = None
 command_page = None
 command_lock = threading.Lock()
 command_seq_counter = 0
+replay_seq_counter = 0
 
 ac_connected = False
 
 director = AutoDirector()
 director_lock = threading.Lock()
+
+event_log = EventLog()
+
+# Permanent record, kept next to the server. Unlike event_log this is never
+# pruned — it exists to annotate the replay saved at the end of the session,
+# by which time the live buffer has long rolled over.
+EVENT_JOURNAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'event_logs')
+event_journal = EventJournal(EVENT_JOURNAL_DIR)
+
+# Telemetry context for the journal, refreshed on every live tick so the MARK
+# handler can stamp a record without reading the mmap itself.
+_latest_replay_context = {}
+_latest_cars_by_id = {}
+
+# Identity of the AC session currently being journalled. None until the first
+# telemetry read; every change rotates the journal and empties the live log.
+_current_session = None
+
+SESSION_TYPE_NAMES = {
+    1: 'Practice', 2: 'Qualify', 3: 'Race',
+    4: 'Hotlap', 5: 'Time Attack', 6: 'Drift', 7: 'Drag',
+}
+
+# Letter AC puts in the replay filename. Everything that is not a race or a
+# qualifying session lands in the same "other" bucket.
+SESSION_TYPE_LETTERS = {2: 'Q', 3: 'R'}
+
+
+def session_identity(telem):
+    """Tuple that changes whenever AC starts or restarts a session."""
+    return (telem.session_gen, telem.session_index, telem.session_type_raw)
+
+
+def session_label(telem):
+    """Human name for the session, for filenames and journal records."""
+    name = (getattr(telem, 'session_name', '') or '').strip()
+    if not name:
+        name = SESSION_TYPE_NAMES.get(telem.session_type_raw, 'Session')
+    if telem.session_index > 0:
+        name = '{} {}'.format(name, telem.session_index + 1)
+    return name
+
+
+def maybe_rotate_session(telem):
+    """Start a new journal (and empty the live log) when the session changes.
+
+    AC wipes the instant-replay buffer on a session start, so markers from the
+    previous session point into a recording that no longer exists — they must
+    not be jumpable, and they must not share a file with the new session's.
+    Returns the label if a rotation happened, else None.
+    """
+    global _current_session, _last_live_payload, _latest_cars_by_id
+
+    identity = session_identity(telem)
+    if identity == _current_session:
+        return None
+
+    first = _current_session is None
+    _current_session = identity
+    label = session_label(telem)
+
+    # AC's recorded length is how long this session has been running, which is
+    # what pairs the journal with the right .acreplay even when the server was
+    # started mid-session.
+    recorded_s = telem.replay_frames * telem.replay_frame_ms / 1000.0
+    started_at = time.time() - (recorded_s if recorded_s > 0 else 0.0)
+
+    event_log.clear()
+    event_log.window_s = EventLog.BUFFER_S
+    event_journal.start_session(
+        label,
+        replay_dir=(getattr(telem, 'replay_temp_dir', '') or '').strip(),
+        started_at=started_at,
+        letter=SESSION_TYPE_LETTERS.get(telem.session_type_raw, 'O'))
+    _last_live_payload = None
+    _latest_cars_by_id = {}
+    # Lap-count corrections belong to the session that produced them.
+    with _resync_lock:
+        progress_offsets.clear()
+
+    print('[remote_web] session {}: {} (index={} type={} gen={})'.format(
+        'opened' if first else 'changed', label, telem.session_index,
+        telem.session_type_raw, telem.session_gen))
+    return label
+
+# Seconds of lead-in ahead of an event when jumping back to it: contact is
+# only readable with the approach in front of it.
+REPLAY_PREROLL_S = 3.0
+# AC clamps very short rewinds oddly; keep a floor.
+REPLAY_MIN_REWIND_S = 5.0
+
+# Last payload built from live telemetry. While replay is active the driver
+# list is served from here instead of from replay-time car data — positions and
+# gaps read out of a replay frame are not the race state the operator needs.
+_last_live_payload = None
 
 # Latest telemetry snapshot captured by the monitor thread. The request
 # handlers read this instead of calling read_telemetry() themselves —
@@ -372,6 +472,13 @@ def poll_timetable_once(url, telem):
         last_poll_status = 'disabled_not_race'
         last_poll_error = ''
         return False
+    if telem.is_replay:
+        # lap_count here comes from the replay frame on screen, so the
+        # server-vs-local diff would be nonsense and would stick in
+        # progress_offsets long after the operator returns to live.
+        last_poll_status = 'disabled_replay'
+        last_poll_error = ''
+        return False
 
     data = fetch_timetable(url)
     if data is None:
@@ -466,7 +573,69 @@ def build_update_data(telem, cars_with_gaps=None):
         'timetable_last_error': last_poll_error,
         'timetable_matched': last_poll_matched,
         'session_type': telem.session_type,
+        'replay': {
+            'active': bool(telem.is_replay),
+            'frame': telem.replay_frame,
+            'frames': telem.replay_frames,
+            'frame_ms': telem.replay_frame_ms,
+            'last_result': telem.replay_last_result,
+        },
+        'events': event_log.snapshot(),
     }
+
+
+def journal_context(car_id):
+    """Telemetry + standings context for one journalled event."""
+    context = dict(_latest_replay_context)
+    car = _latest_cars_by_id.get(car_id)
+    if car:
+        context['team'] = car.get('team_name')
+        context['position'] = car.get('position')
+        context['class_position'] = car.get('class_position')
+        context['car_class'] = car.get('car_class')
+        context['lap'] = car.get('lap_count')
+    return context
+
+
+def record_event(event):
+    """Append one event to the on-disk journal."""
+    if event is None:
+        return
+    first = event_journal.path is None
+    event_journal.append(event, journal_context(event.get('car_id')))
+    if first and event_journal.path:
+        print('[remote_web] event journal: {} (replay: {})'.format(
+            event_journal.path, event_journal.replay_file or 'unmatched'))
+
+
+def build_replay_update_data(telem):
+    """Payload for a tick where replay is active.
+
+    The driver list is frozen at the last live snapshot; everything the
+    operator can still act on (camera state, focus, replay position, the event
+    log) is current.
+    """
+    if _last_live_payload is None:
+        data = {'ac_connected': True, 'drivers': []}
+    else:
+        data = dict(_last_live_payload)
+
+    data['current_driver'] = telem.focused_car
+    data['current_camera'] = telem.current_camera
+    data['car_cameras_count'] = telem.car_cameras_count
+    data['current_car_camera'] = telem.current_car_camera
+    data['auto_director'] = director.enabled
+    data['auto_director_debug'] = director.debug
+    data['timetable_status'] = last_poll_status
+    data['replay'] = {
+        'active': True,
+        'frame': telem.replay_frame,
+        'frames': telem.replay_frames,
+        'frame_ms': telem.replay_frame_ms,
+        'last_result': telem.replay_last_result,
+    }
+    data['events'] = event_log.snapshot()
+    return data
 
 
 def send_command(target_driver, target_camera, target_car_camera=-1):
@@ -485,10 +654,39 @@ def send_command(target_driver, target_camera, target_car_camera=-1):
         return True
 
 
+def send_replay_command(action, rewind_s=0.0, frame=0, driver=None, camera=None):
+    """Write a replay command to shared memory.
+
+    `driver`/`camera` are written but command_seq is deliberately NOT bumped:
+    entering instant replay resets the camera, so Lua parks the shot and applies
+    it once replay is live. Bumping command_seq here would make Lua apply it
+    immediately, where the replay toggle clobbers it.
+    """
+    global command_mmap, command_page, replay_seq_counter
+    with command_lock:
+        if command_mmap is None:
+            command_mmap, command_page = open_command_mmap()
+        if command_page is None:
+            return False
+        if driver is not None:
+            command_page.target_driver = driver
+        if camera is not None:
+            command_page.target_camera = camera
+            command_page.target_car_camera = -1
+        replay_seq_counter += 1
+        command_page.replay_action = action
+        command_page.replay_rewind_s = float(rewind_s)
+        command_page.replay_frame = int(frame)
+        command_page.replay_seq = replay_seq_counter
+        return True
+
+
 def monitor_telemetry():
     """Background thread: poll telemetry mmap and push updates via SocketIO."""
     global telemetry_mmap, telemetry_page, ac_connected
     global latest_focused_car, latest_current_camera, latest_current_car_camera
+    global _last_live_payload, _latest_replay_context, _latest_cars_by_id
+    global _current_session
 
     last_packet_id = -1
 
@@ -506,6 +704,15 @@ def monitor_telemetry():
             # Stale offsets must not survive an AC restart — car_ids are reused.
             with _resync_lock:
                 progress_offsets.clear()
+            # Same reasoning for the event log, and its timestamps point into a
+            # replay buffer that no longer exists. Logged because from the
+            # panel this looks identical to events ageing out of the window.
+            dropped = len(event_log.snapshot())
+            # Forget the session so the next tick rotates the journal with a
+            # fresh label rather than appending a new AC run to the old file.
+            _current_session = None
+            print('[remote_web] telemetry mmap (re)opened '
+                  '({} events pending drop)'.format(dropped))
 
         telem = read_telemetry()
         if telem is None:
@@ -523,17 +730,54 @@ def monitor_telemetry():
 
         if telem.packet_id != last_packet_id:
             last_packet_id = telem.packet_id
+            maybe_rotate_session(telem)
             latest_focused_car = telem.focused_car
             latest_current_camera = telem.current_camera
             latest_current_car_camera = telem.current_car_camera
-            cars_with_gaps = compute_gaps(telem)
-            data = build_update_data(telem, cars_with_gaps)
 
-            with director_lock:
-                if director.enabled:
-                    cmd = director.tick(cars_with_gaps, telem.track_length)
-                    if cmd:
-                        send_command(cmd['driver'], 1)  # always Track cam
+            if telem.is_replay:
+                # Car data now comes from the replay frame being shown, so it
+                # is not race state: no event detection, no director cuts, and
+                # the driver list is served from the last live payload.
+                data = build_replay_update_data(telem)
+            else:
+                # Retention follows AC's actual recorded replay length rather
+                # than a guessed constant: an event is only worth keeping while
+                # it is still inside the buffer we could rewind into.
+                recorded_s = telem.replay_frames * telem.replay_frame_ms / 1000.0
+                if recorded_s > 0:
+                    before = event_log.window_s
+                    after = event_log.set_window(recorded_s)
+                    # Only worth a line when it moves materially — this is the
+                    # readout that tells you whether AC reports its buffer at
+                    # all while live, or whether the fallback is in charge.
+                    if abs(after - before) > 30:
+                        print('[remote_web] event window now {:.0f}s '
+                              '(AC reports {:.0f}s recorded)'.format(after, recorded_s))
+
+                cars_with_gaps = compute_gaps(telem)
+                _latest_replay_context = {
+                    'session': session_label(telem),
+                    'session_index': telem.session_index,
+                    'session_s': round(recorded_s, 2) if recorded_s > 0 else None,
+                    'replay_frame': telem.replay_frames or None,
+                    'replay_frame_ms': telem.replay_frame_ms or None,
+                }
+                _latest_cars_by_id = {c['car_id']: c for c in cars_with_gaps}
+
+                # Detect before building: build_update_data snapshots the event
+                # log, so observing afterwards would hold every event back a
+                # tick — and strand the last one if telemetry stops.
+                for event in event_log.observe(cars_with_gaps):
+                    record_event(event)
+                data = build_update_data(telem, cars_with_gaps)
+                _last_live_payload = data
+
+                with director_lock:
+                    if director.enabled:
+                        cmd = director.tick(cars_with_gaps, telem.track_length)
+                        if cmd:
+                            send_command(cmd['driver'], 1)  # always Track cam
 
             socketio.emit('update', data)
 
@@ -556,6 +800,60 @@ def handle_toggle_director_debug():
     emit('director_debug_status', {'enabled': state}, broadcast=True)
 
 
+@socketio.on('jump_to_event')
+def handle_jump_to_event(data):
+    """Rewind instant replay to just before a logged event, focused on its car."""
+    try:
+        event_id = int((data or {}).get('id'))
+    except (TypeError, ValueError):
+        emit('replay_status', {'ok': False, 'error': 'bad event id'})
+        return
+
+    event = event_log.get(event_id)
+    if event is None:
+        emit('replay_status', {'ok': False, 'error': 'event expired'})
+        return
+
+    rewind = time.time() - event['t'] + REPLAY_PREROLL_S
+    rewind = max(REPLAY_MIN_REWIND_S, min(rewind, event_log.window_s))
+
+    # A jump is a manual cut: the director must not fight it on the way back.
+    with director_lock:
+        director.enabled = False
+        ok = send_replay_command(REPLAY_ENTER, rewind_s=rewind,
+                                 driver=event['car_id'], camera=1)
+
+    print('[remote_web] replay jump: event={} kind={} car={} rewind={:.1f}s'.format(
+        event_id, event['kind'], event['car_id'], rewind))
+    emit('replay_status', {'ok': ok, 'rewind': rewind, 'event_id': event_id},
+         broadcast=True)
+
+
+@socketio.on('go_live')
+def handle_go_live():
+    ok = send_replay_command(REPLAY_LIVE)
+    print('[remote_web] replay live requested (written={})'.format(ok))
+    emit('replay_status', {'ok': ok, 'live': True}, broadcast=True)
+
+
+@socketio.on('mark_event')
+def handle_mark_event():
+    """Drop a marker on the focused car with no detection involved."""
+    name = ''
+    number = None
+    if _last_live_payload:
+        for d in _last_live_payload.get('drivers', []):
+            if d['num'] - 1 == latest_focused_car:
+                name = d.get('name', '')
+                number = d.get('car_number')
+                break
+    event = event_log.mark(latest_focused_car, name=name, car_number=number)
+    record_event(event)
+    emit('events', {'events': event_log.snapshot()}, broadcast=True)
+    if event:
+        print('[remote_web] mark on car {} ({})'.format(latest_focused_car, name))
+
+
 @socketio.on('get_timetable_url')
 def handle_get_timetable_url():
     emit('timetable_url', {
@@ -574,8 +872,12 @@ def handle_connect():
 
     telem = read_telemetry()
     if telem:
-        data = build_update_data(telem)
-        emit('update', data)
+        # A client joining mid-replay gets the frozen list, same as everyone
+        # else — gaps built from a replay frame are not race state.
+        if telem.is_replay:
+            emit('update', build_replay_update_data(telem))
+        else:
+            emit('update', build_update_data(telem))
     else:
         emit('update', {'ac_connected': False, 'drivers': []})
 
@@ -701,9 +1003,25 @@ def index():
                 if (el) el.outerHTML = ttBadgeHtml();
             }
 
+            // Replay state. The panel never scrubs frames itself — a jump is
+            // "rewind N seconds", computed server-side from the event's age.
+            var replayActive = false;
+            var replayUnavailable = false;
+            var eventsCollapsed = false;
+
+            function replayBadgeHtml() {
+                // A refused ac.tryToToggleReplay is otherwise invisible: the
+                // button would look like it did nothing.
+                if (replayUnavailable) {
+                    return '<span id="replay-badge" class="ac-badge ac-badge--filled" '
+                        + 'title="AC refused the replay toggle">RPL:N/A</span>';
+                }
+                return '';
+            }
+
             function buildStatusBar(connected, focusLabel) {
                 var linkLabel = connected ? 'Link:OK' : 'Link:None';
-                var subLabel = connected ? 'Live' : 'Waiting';
+                var subLabel = connected ? (replayActive ? 'Replay' : 'Live') : 'Waiting';
                 // Link down is an alarm: the .ac-disconnected rule in remote.css
                 // pairs inverse video with this blink, so the state survives
                 // prefers-reduced-motion.
@@ -716,8 +1034,55 @@ def index():
                     + '<span class="ac-readout__label">Focus</span>'
                     + '<span class="ac-readout__value">' + focusLabel + '</span>'
                     + '</span>'
+                    + replayBadgeHtml()
                     + ttBadgeHtml()
                     + '</div>';
+            }
+
+            // Events are ranked by recency using ramp position only — the
+            // palette is single-hue, so freshness is brightness, and the kind
+            // is spelled out in the badge.
+            function eventAgeClass(age) {
+                if (age < 15) return ' ev-fresh';
+                if (age < 60) return ' ev-mid';
+                return ' ev-old';
+            }
+
+            function formatAge(age) {
+                var s = Math.max(0, Math.round(age));
+                if (s < 60) return s + 's';
+                return Math.floor(s / 60) + 'm' + ('0' + (s % 60)).slice(-2);
+            }
+
+            function renderEvents(events) {
+                var list = document.getElementById('event-list');
+                var toggle = document.getElementById('events-toggle');
+                events = events || [];
+                if (toggle) toggle.textContent = 'Events ' + events.length;
+
+                if (eventsCollapsed) {
+                    list.style.display = 'none';
+                    return;
+                }
+                list.style.display = '';
+
+                if (!events.length) {
+                    list.innerHTML = '<div class="ac-banner ac-banner--dim">No Events Yet</div>';
+                    return;
+                }
+
+                var html = '';
+                events.forEach(function(ev) {
+                    var who = escapeHtml(formatCarNumber(ev.car_number));
+                    if (ev.name) who += ' ' + escapeHtml(ev.name);
+                    html += '<div class="event-item' + eventAgeClass(ev.age)
+                        + '" data-event="' + ev.id + '">'
+                        + '<span class="ev-age">-' + formatAge(ev.age) + '</span>'
+                        + '<span class="ac-badge ev-kind">' + escapeHtml(ev.label) + '</span>'
+                        + '<span class="ev-car">' + who + '</span>'
+                        + '</div>';
+                });
+                list.innerHTML = html;
             }
 
             function sortedClasses(drivers) {
@@ -804,7 +1169,41 @@ def index():
                     }
                 });
 
+                // Same delegated pointerdown pattern: the row is rebuilt on
+                // every telemetry tick, so the listener lives on the container.
+                document.getElementById('event-list').addEventListener('pointerdown', function(e) {
+                    var row = e.target.closest('.event-item');
+                    if (row) {
+                        e.preventDefault();
+                        socket.emit('jump_to_event', { id: parseInt(row.dataset.event) });
+                    }
+                });
+                document.getElementById('live-btn').addEventListener('pointerdown', function(e) {
+                    e.preventDefault();
+                    socket.emit('go_live');
+                });
+                document.getElementById('mark-btn').addEventListener('pointerdown', function(e) {
+                    e.preventDefault();
+                    socket.emit('mark_event');
+                });
+                document.getElementById('events-toggle').addEventListener('pointerdown', function(e) {
+                    e.preventDefault();
+                    eventsCollapsed = !eventsCollapsed;
+                    setPressed(e.currentTarget, !eventsCollapsed);
+                    document.getElementById('event-list').style.display = eventsCollapsed ? 'none' : '';
+                });
+
                 socket.emit('get_timetable_url');
+            });
+
+            socket.on('events', function(data) {
+                renderEvents(data.events);
+            });
+
+            socket.on('replay_status', function(data) {
+                if (data.ok === false && data.error) {
+                    console.log('[replay] ' + data.error);
+                }
             });
 
             socket.on('director_status', function(data) {
@@ -827,10 +1226,18 @@ def index():
                 // be current before the bar is rebuilt.
                 if (data.timetable_status) ttStatus = data.timetable_status;
 
+                // Replay state gates the status bar label and the frozen grid,
+                // so it also has to be current before anything is rebuilt.
+                var replay = data.replay || {};
+                replayActive = !!replay.active;
+                replayUnavailable = replay.last_result === 2;
+
                 if (!data.ac_connected) {
+                    replayActive = false;
                     statusEl.className = 'ac-statusbar ac-statusbar--line ac-disconnected';
                     statusEl.innerHTML = buildStatusBar(false, '--');
                     renderClassFilters([]);
+                    renderEvents([]);
                     document.getElementById('drivers-list').innerHTML =
                         '<div class="ac-banner" role="alert">No Telemetry</div>';
                     return;
@@ -849,6 +1256,21 @@ def index():
 
                 setPressed(document.getElementById('auto-dir-btn'), !!data.auto_director);
                 setPressed(document.getElementById('auto-dir-dbg-btn'), !!data.auto_director_debug);
+
+                // LIVE is the way out of replay, so it is the alarm state here:
+                // inverse video + blink while replay holds the output.
+                var liveBtn = document.getElementById('live-btn');
+                setPressed(liveBtn, replayActive);
+                liveBtn.classList.toggle('ac-blink', replayActive);
+                var readout = document.getElementById('replay-readout');
+                if (replayActive && replay.frames) {
+                    readout.style.display = '';
+                    document.getElementById('replay-frame').textContent =
+                        replay.frame + '/' + replay.frames;
+                } else {
+                    readout.style.display = 'none';
+                }
+                renderEvents(data.events);
 
                 // Highlight active camera
                 document.querySelectorAll('.camera-buttons button[data-cam]').forEach(function(btn) {
@@ -873,6 +1295,9 @@ def index():
                 }
 
                 var driversList = document.getElementById('drivers-list');
+                // Frozen at the last live snapshot while replay runs — dimmed
+                // so nobody reads a stale gap as current.
+                driversList.classList.toggle('replay-frozen', replayActive);
                 renderClassFilters(data.drivers);
                 var visibleDrivers = data.drivers.filter(function(d) {
                     return activeClassFilter === 'ALL' || d.car_class === activeClassFilter;
@@ -999,6 +1424,18 @@ def index():
                 <button id="auto-dir-dbg-btn" class="ac-btn" aria-pressed="false" onclick="socket.emit('toggle_director_debug')" title="Verbose director scoring logs to server stdout">Dbg<span class="cam-cap">DG</span></button>
             </div>
         </div>
+
+        <div id="replay-bar" class="replay-bar">
+            <button id="live-btn" class="ac-btn" aria-pressed="false">Live<span class="cam-cap">LV</span></button>
+            <button id="mark-btn" class="ac-btn" title="Drop a marker on the focused car">Mark<span class="cam-cap">MK</span></button>
+            <span id="replay-readout" class="ac-readout ac-readout--inline" style="display:none">
+                <span class="ac-readout__label">Frame</span>
+                <span class="ac-readout__value" id="replay-frame">--</span>
+            </span>
+            <button id="events-toggle" class="ac-btn ac-btn--sm" aria-pressed="true">Events 0</button>
+        </div>
+
+        <div id="event-list" class="event-list"></div>
 
         <div id="subcam-bar" class="subcam-bar" style="display:none"></div>
         <div id="class-filter-bar" class="class-filter-bar"></div>

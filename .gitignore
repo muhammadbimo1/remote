@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+# Per-session incident journals written by remote_web.py — race data, not code.
+event_logs/

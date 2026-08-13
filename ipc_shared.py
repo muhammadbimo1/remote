@@ -42,6 +42,16 @@ class TelemetryPage(ctypes.Structure):
         ('current_car_camera', c_int32),
         ('track_length', c_float),
         ('session_type', c_int32),          # 1 = race, 0 = other (practice/qualify/hotlap)
+        ('session_index', c_int32),         # sim.currentSessionIndex (0-based)
+        ('session_type_raw', c_int32),      # ac.SessionType: 1 P, 2 Q, 3 R, ...
+        ('session_gen', c_int32),           # bumped on every session start/restart
+        ('session_name', c_wchar * 64),     # ac.getSessionName(), e.g. "Race"
+        ('is_replay', c_int32),             # sim.isReplayActive
+        ('replay_frame', c_int32),          # sim.replayCurrentFrame
+        ('replay_frames', c_int32),         # sim.replayFrames
+        ('replay_frame_ms', c_float),       # sim.replayFrameMs
+        ('replay_last_result', c_int32),    # 0 = untried, 1 = accepted, 2 = refused
+        ('replay_temp_dir', c_wchar * 256),  # ac.getFolder(ac.FolderID.ReplaysTemp)
         ('timetable_url', c_wchar * 128),
         ('cars', CarData * MAX_CARS),
     ]
@@ -54,5 +64,16 @@ class CommandPage(ctypes.Structure):
         ('target_driver', c_int32),
         ('target_camera', c_int32),
         ('target_car_camera', c_int32),
-        ('command_seq', c_int32),           # increment = new command
+        ('command_seq', c_int32),           # increment = new camera/focus command
+        ('replay_seq', c_int32),            # increment = new replay command
+        ('replay_action', c_int32),         # see REPLAY_* below
+        ('replay_rewind_s', c_float),       # seconds to rewind for REPLAY_ENTER
+        ('replay_frame', c_int32),          # target frame for REPLAY_SEEK_FRAME
     ]
+
+
+# Replay command actions (CommandPage.replay_action)
+REPLAY_NONE = 0
+REPLAY_ENTER = 1        # start instant replay, rewound replay_rewind_s seconds
+REPLAY_LIVE = 2         # stop replay, return to live
+REPLAY_SEEK_FRAME = 3   # jump to replay_frame (wired, no UI yet)

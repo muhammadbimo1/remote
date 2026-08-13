@@ -216,6 +216,113 @@ body {
 }
 
 /* ---------------------------------------------------------------------------
+   Replay bar / event log
+
+   The whole feature is one hue too. Replay holding the output is an alarm
+   state, so LIVE inverts and blinks (inverse video is what carries it when
+   prefers-reduced-motion kills the blink). Event freshness is ramp position
+   only — newest brightest — and the incident kind is a text badge, never a
+   colour: HIT / FLP / OVT / MRK.
+   --------------------------------------------------------------------------- */
+.replay-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-shrink: 0;
+}
+
+.replay-bar .ac-btn {
+    flex: 0 0 auto;
+    min-width: 68px;
+    padding: 5px 8px 7px;
+    border-radius: var(--radius-sm);
+    text-align: center;
+}
+
+#live-btn[aria-pressed="true"] {
+    background: var(--fill);
+    color: var(--on-fill);
+    text-shadow: none;
+}
+
+#live-btn[aria-pressed="true"] .cam-cap {
+    color: var(--on-fill);
+    opacity: 0.75;
+}
+
+#replay-readout {
+    margin-left: auto;
+    gap: var(--space-2);
+    font-size: var(--type-small);
+}
+
+#events-toggle {
+    flex: 0 0 auto;
+    min-width: 0;
+    margin-left: var(--space-2);
+    padding: 3px 10px;
+}
+
+/* Capped and independently scrollable: the driver grid still owns the screen,
+   and .ac-screen is a fixed 100vh frame that must never scroll as a whole. */
+.event-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex-shrink: 0;
+    max-height: 22vh;
+    overflow-y: auto;
+}
+
+.event-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: 3px var(--space-3);
+    border: var(--border-w) solid var(--stroke-dim);
+    border-radius: var(--radius-sm);
+    font-size: var(--type-small);
+    cursor: pointer;
+}
+
+.event-item:hover {
+    border-color: currentColor;
+}
+
+.event-item .ev-age {
+    flex: 0 0 auto;
+    min-width: 44px;
+    font-family: var(--font-micro);
+    font-size: var(--type-micro);
+    letter-spacing: var(--tracking-micro);
+    color: var(--ink-faint);
+}
+
+.event-item .ev-kind {
+    flex: 0 0 auto;
+}
+
+.event-item .ev-car {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Recency ramp — the only ranking signal available. */
+.event-item.ev-fresh .ev-car { color: var(--ink-bright); }
+.event-item.ev-mid .ev-car   { color: var(--ink-dim); }
+.event-item.ev-old .ev-car   { color: var(--ink-faint); }
+.event-item.ev-old           { border-color: var(--stroke-dim); opacity: 0.8; }
+
+/* Frozen at the last live snapshot while replay runs. Dimmed, not recoloured,
+   so a stale gap cannot be misread as the current one. */
+#drivers-list.replay-frozen {
+    opacity: 0.55;
+}
+
+/* ---------------------------------------------------------------------------
    Driver grid
 
    Density override: the framework's 22/18px floor is a full-screen instrument
