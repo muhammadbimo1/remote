@@ -27,6 +27,8 @@ local telemPage = ac.writeMemoryMappedFile(TELEM_TAG, [[
   int replay_frames;
   float replay_frame_ms;
   int replay_last_result;
+  int is_replay_only;
+  wchar_t replay_file[256];
   wchar_t replay_temp_dir[256];
   wchar_t timetable_url[128];
   struct {
@@ -84,6 +86,11 @@ local UPDATE_INTERVAL = 0.1 -- 100 ms
 -- clobbered. The wanted shot is held here and re-asserted for as long as AC
 -- keeps fighting it, then released.
 local replayLastResult = REPLAY_RESULT_UNTRIED
+-- How long the last toggle result stays visible before reverting to UNTRIED.
+-- Decoupled from the settle window: a refused toggle is otherwise invisible
+-- except through replay_last_result, but it must not stick forever.
+local REPLAY_RESULT_VISIBLE_S = 3.0
+local replayResultUntil = 0
 local shotHold = nil            -- { driver, camera, subCam, wantReplay, deadline }
 -- Long enough to cover AC's fade in and out of replay, where the reset lands.
 local SHOT_HOLD_S = 2.5
@@ -95,9 +102,19 @@ local SHOT_HOLD_S = 2.5
 -- transition is settling, and turn "jump while already in replay" into
 -- exit -> settle -> enter instead of a second enter.
 local REPLAY_SETTLE_S = 0.75
-local QUEUED_ENTER_TIMEOUT = 5.0
 local replayBusyUntil = 0
-local queuedEnter = nil         -- { rewindS, driver, camera, subCam, deadline }
+-- AC's OverlayLeaderboard::renderHUD crashes (acs.exe access violation) during
+-- the replay->live transition. The leaderboard HUD element is hidden while
+-- replay is active (and for the settle window after) so that render is skipped
+-- while AC resets the grid.
+local leaderboardSuppressed = false
+
+-- ac.tryToToggleReplay's rewindS overshoots on this rig (it converts seconds at
+-- a fixed 60 fps while the recording is ~16.7 fps). So entry uses only a nominal
+-- rewind, and the real position is applied by a precise seek to
+-- `sim.replayFrames - rewind_s/replayFrameMs` once replay is active.
+local REPLAY_ENTER_NOMINAL_REWIND_S = 0.5
+local pendingSeek = nil        -- absolute frame to seek to once replay is active
 
 -- Session identity. AC saves a separate replay per session and wipes the
 -- instant-replay buffer when one starts, so markers from the previous session
@@ -254,32 +271,52 @@ local function holdCurrentShot(wantReplay)
   holdShot(sim.focusedCar, cspCameraToCustom(sim.cameraMode), sim.carCameraIndex, wantReplay)
 end
 
+-- Convert "seconds to rewind from the live edge" into an absolute replay frame.
+-- sim.replayFrames keeps counting to the live edge during playback, so this is
+-- the "now" the rewind is relative to.
+local function seekTargetFromRewind(rewindS)
+  local frameMs = sim.replayFrameMs
+  if frameMs and frameMs > 0 then
+    local target = sim.replayFrames - math.floor(rewindS * 1000.0 / frameMs)
+    if target < 0 then target = 0 end
+    return target
+  end
+  return 0
+end
+
 local function enterReplay(rewindS, driver, camera, subCam)
-  local ok = ac.tryToToggleReplay(true, rewindS)
+  -- Enter with only a nominal rewind: tryToToggleReplay's own rewindS overshoots,
+  -- and a large rewind can overshoot past the buffer and be refused. The precise
+  -- position is applied by processPendingSeek once replay is active.
+  local ok = ac.tryToToggleReplay(true, REPLAY_ENTER_NOMINAL_REWIND_S)
   replayLastResult = ok and REPLAY_RESULT_OK or REPLAY_RESULT_REFUSED
+  replayResultUntil = os.preciseClock() + REPLAY_RESULT_VISIBLE_S
+  -- Serialise the next toggle even when this one was refused: a refusal can
+  -- mean AC is mid-transition, and poking it again inside the settle window is
+  -- exactly what crashes the leaderboard overlay.
   replayBusyUntil = os.preciseClock() + REPLAY_SETTLE_S
   ac.log(string.format('Replay enter: rewind=%.1fs accepted=%s', rewindS, tostring(ok)))
   if ok then
+    pendingSeek = seekTargetFromRewind(rewindS)
     holdShot(driver, camera, subCam, true)
   else
+    pendingSeek = nil
     shotHold = nil
   end
 end
 
--- `keepShot` is false only for the exit half of a re-enter, where the queued
--- enter is about to install its own shot and briefly restoring the old one on
--- live would just flash the wrong car.
-local function exitReplay(reason, keepShot)
-  if keepShot then
-    holdCurrentShot(false)
-  else
-    shotHold = nil
-  end
+-- Leaving replay snaps focus back to the player car, which is never what a
+-- director wants, so capture the on-screen shot first and re-assert it live.
+local function exitReplay(reason)
+  holdCurrentShot(false)
   local ok = ac.tryToToggleReplay(false)
   replayLastResult = ok and REPLAY_RESULT_OK or REPLAY_RESULT_REFUSED
+  replayResultUntil = os.preciseClock() + REPLAY_RESULT_VISIBLE_S
+  -- Always arm the settle window: a second go_live (or any toggle) landing
+  -- while AC is still exiting is what crashes the leaderboard overlay, and a
+  -- refusal can mask an in-flight transition.
   replayBusyUntil = os.preciseClock() + REPLAY_SETTLE_S
-  ac.log(string.format('Replay live (%s): accepted=%s keepShot=%s',
-    reason, tostring(ok), tostring(keepShot == true)))
+  ac.log(string.format('Replay live (%s): accepted=%s', reason, tostring(ok)))
   if not ok then shotHold = nil end
   return ok
 end
@@ -306,32 +343,28 @@ local function processReplayCommands()
     local camera = cmdPage.target_camera
     local subCam = cmdPage.target_car_camera
     if active then
-      -- Jump while already in replay: leave replay first and enter again once
-      -- AC has settled, rather than toggling on top of an active replay.
-      ac.log(string.format('Replay re-enter queued: rewind=%.1fs (leaving replay first)', rewindS))
-      queuedEnter = {
-        rewindS = rewindS,
-        driver = driver,
-        camera = camera,
-        subCam = subCam,
-        deadline = now + QUEUED_ENTER_TIMEOUT,
-      }
-      exitReplay('re-enter', false)
+      -- Already in replay: seek straight to the target frame instead of
+      -- exit -> settle -> enter. That exit toggle is what crashes AC
+      -- (OverlayLeaderboard::renderHUD, dmp-6816-*), and a seek does the same
+      -- job without a replay transition.
+      local target = seekTargetFromRewind(rewindS)
+      ac.setReplayPosition(target, 0)
+      holdShot(driver, camera, subCam, true)
+      ac.log(string.format('Replay seek (already active): rewind=%.1fs frame=%d',
+        rewindS, target))
     else
-      queuedEnter = nil
       enterReplay(rewindS, driver, camera, subCam)
     end
   elseif action == REPLAY_LIVE then
-    queuedEnter = nil
     if active then
       -- Keep the car that was on screen in the replay: leaving replay makes AC
       -- snap focus back to the player car, which is never what a director wants.
-      exitReplay('command', true)
+      exitReplay('command')
     else
       ac.log('Replay live ignored: not in replay')
     end
   elseif action == REPLAY_SEEK_FRAME then
-    if active then
+    if active or sim.isReplayOnlyMode then
       ac.setReplayPosition(cmdPage.replay_frame, 0)
     else
       ac.log('Replay seek ignored: not in replay')
@@ -339,20 +372,13 @@ local function processReplayCommands()
   end
 end
 
--- Second half of a queued re-enter: fires once AC is out of replay and the
--- transition has settled.
-local function processQueuedReplay()
-  if not queuedEnter then return end
-  local now = os.preciseClock()
-  if now > queuedEnter.deadline then
-    ac.log('Replay re-enter dropped: timed out waiting to leave replay')
-    queuedEnter = nil
-    return
-  end
-  if sim.isReplayActive or now < replayBusyUntil then return end
-  local q = queuedEnter
-  queuedEnter = nil
-  enterReplay(q.rewindS, q.driver, q.camera, q.subCam)
+-- Apply the precise seek parked by enterReplay once replay is actually active.
+-- Fires the frame replay comes up, before the shot hold re-asserts the camera.
+local function processPendingSeek()
+  if pendingSeek == nil then return end
+  if not sim.isReplayActive then return end
+  ac.setReplayPosition(pendingSeek, 0)
+  pendingSeek = nil
 end
 
 -- Re-assert the wanted shot until AC stops resetting it (or the operator picks
@@ -377,6 +403,27 @@ local function processShotHold()
   end
 end
 
+-- Clear the last toggle result once it has been visible long enough. A refusal
+-- must not stick as "RPL:N/A" forever, but must outlast the immediate ack.
+local function processReplayResultExpiry()
+  if replayLastResult ~= REPLAY_RESULT_UNTRIED
+      and os.preciseClock() >= replayResultUntil then
+    replayLastResult = REPLAY_RESULT_UNTRIED
+  end
+end
+
+-- Keep AC's leaderboard HUD hidden across replay (and the settle window after),
+-- otherwise its renderHUD dereferences a car during the replay->live transition
+-- and takes the whole game down.
+local function syncLeaderboard()
+  local hide = sim.isReplayActive or sim.isReplayOnlyMode
+      or os.preciseClock() < replayBusyUntil
+  if hide ~= leaderboardSuppressed then
+    ac.disableExtraHUDElements('leaderboard', hide)
+    leaderboardSuppressed = hide
+  end
+end
+
 ac.onReplay(function(event)
   ac.log('Replay event: ' .. tostring(event))
   -- Every AC-side transition re-arms the settle window, so a command arriving
@@ -394,9 +441,8 @@ ac.onReplay(function(event)
   -- AC ends instant replay on its own when playback reaches the live edge, and
   -- that exit snaps focus to the player car exactly like the commanded one. No
   -- hold is pending in that case, so take one now, while the replay shot is
-  -- still on screen. Skipped mid re-enter: that shot is already queued.
-  if event == 'stop' and not queuedEnter
-      and (shotHold == nil or shotHold.wantReplay) then
+  -- still on screen.
+  if event == 'stop' and (shotHold == nil or shotHold.wantReplay) then
     holdCurrentShot(false)
   end
 end)
@@ -510,6 +556,8 @@ local function updateTelemetry()
   telemPage.replay_frames = sim.replayFrames
   telemPage.replay_frame_ms = sim.replayFrameMs
   telemPage.replay_last_result = replayLastResult
+  telemPage.is_replay_only = sim.isReplayOnlyMode and 1 or 0
+  writeWchar(telemPage.replay_file, ac.getReplayFilename() or '', 256)
   -- Where AC keeps the per-session .acreplay it is recording right now. The
   -- web server pairs its event journal to that file by name.
   writeWchar(telemPage.replay_temp_dir, ac.getFolder(ac.FolderID.ReplaysTemp) or '', 256)
@@ -573,9 +621,11 @@ function script.update(dt)
   -- deferred replay shot needs to land the frame replay comes up, not up to
   -- 100 ms later.
   processReplayCommands()
-  processQueuedReplay()
+  processPendingSeek()
   processShotHold()
+  processReplayResultExpiry()
   processCommands()
+  syncLeaderboard()
 
   updateAccum = updateAccum + dt
   if updateAccum < UPDATE_INTERVAL then return end
@@ -691,4 +741,32 @@ function script.windowMain(dt)
   end
 
   ui.endChild()
+end
+
+local indicatorSettings = ac.INIConfig.scriptSettings()
+local indicatorFontSize = indicatorSettings:get('INDICATOR', 'FONT_SIZE', 32)
+
+function script.windowLiveReplay(dt)
+  local label = 'LIVE'
+  local color = rgbm(0.2, 1.0, 0.4, 1.0)
+  if sim.isReplayActive or sim.isReplayOnlyMode then
+    label = 'REPLAY'
+    color = rgbm(1.0, 0.6, 0.2, 1.0)
+  end
+
+  ui.pushDWriteFont('static/Michroma-Regular.ttf')
+  local textSize = ui.measureDWriteText(label, indicatorFontSize)
+  ui.image('static/logo.png', vec2(textSize.y, textSize.y))
+  ui.sameLine(0, 8)
+  ui.dwriteText(label, indicatorFontSize, color)
+  ui.popDWriteFont()
+end
+
+function script.windowLiveReplaySettings(dt)
+  local value, changed = ui.slider('Font size', indicatorFontSize, 12, 96, '%.0f', true)
+  if changed then
+    indicatorFontSize = value
+    indicatorSettings:set('INDICATOR', 'FONT_SIZE', value)
+    indicatorSettings:save()
+  end
 end

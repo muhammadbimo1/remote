@@ -43,6 +43,11 @@ REPLAY_NAME_RE = re.compile(
 # estimate the start from AC's recorded frame count.
 REPLAY_MATCH_TOLERANCE_S = 300.0
 
+# How far a loaded replay's duration may sit from a journal's recorded length
+# before the fingerprint match is refused. Used when a replay file was renamed
+# after being saved, so its stem no longer matches the journal's.
+REPLAY_FINGERPRINT_TOLERANCE_S = 5.0
+
 
 def parse_replay_name(name):
     """Return (start_datetime, session_letter) for an AC replay filename.
@@ -96,6 +101,46 @@ def find_session_replay(directory, started_at, letter=None,
     return best
 
 
+def match_replay(replay_file, replay_frames, replay_frame_ms, sessions):
+    """Pick the journal that annotates a loaded replay file.
+
+    `replay_file` is ac.getReplayFilename() (a full path, empty when no saved
+    replay is loaded). Primary match is exact, on the filename stem: a journal
+    names itself after the .acreplay it annotates, and each record repeats the
+    original replay name in case the file was renamed on its way out of temp.
+
+    Falls back to a duration fingerprint for renamed files. Returns a
+    (session, confidence) tuple, or (None, None) — confidence is 'exact' or
+    'fingerprint'.
+    """
+    if not replay_file or not sessions:
+        return None, None
+    stem = os.path.splitext(os.path.basename(replay_file))[0]
+    if not stem:
+        return None, None
+
+    for session in sessions:
+        if os.path.splitext(session['file'])[0] == stem:
+            return session, 'exact'
+        if session.get('replay_file') and \
+                os.path.splitext(session['replay_file'])[0] == stem:
+            return session, 'exact'
+
+    if not replay_frames or not replay_frame_ms:
+        return None, None
+    duration = replay_frames * replay_frame_ms / 1000.0
+    best, best_err = None, None
+    for session in sessions:
+        if session.get('duration_s') is None:
+            continue
+        err = abs(session['duration_s'] - duration)
+        if best_err is None or err < best_err:
+            best, best_err = session, err
+    if best is not None and best_err <= REPLAY_FINGERPRINT_TOLERANCE_S:
+        return best, 'fingerprint'
+    return None, None
+
+
 class EventJournal:
     def __init__(self, directory, clock=time.time):
         self.directory = directory
@@ -122,6 +167,90 @@ class EventJournal:
     def replay_file(self):
         """Basename of the .acreplay this journal annotates, if it was found."""
         return self._replay_file
+
+    def list_sessions(self):
+        """Summary of every journalled session, newest file first.
+
+        Used to offer a manual override when a loaded replay can't be matched
+        automatically. Never raises — the panel must survive a corrupt or
+        half-written file.
+        """
+        sessions = []
+        if not os.path.isdir(self.directory):
+            return sessions
+        try:
+            names = os.listdir(self.directory)
+        except OSError:
+            return sessions
+
+        for name in sorted(names, reverse=True):
+            if not name.endswith('.jsonl'):
+                continue
+            path = os.path.join(self.directory, name)
+            records = self._read(path)
+            if not records:
+                continue
+            session = {
+                'file': name,
+                'path': path,
+                'replay_file': None,
+                'count': len(records),
+                'first_t': None,
+                'last_t': None,
+                'duration_s': None,
+                'max_replay_frame': None,
+                'replay_frame_ms': None,
+            }
+            for record in records:
+                if session['replay_file'] is None and record.get('replay_file'):
+                    session['replay_file'] = record['replay_file']
+                t = record.get('t')
+                if t is not None:
+                    if session['first_t'] is None or t < session['first_t']:
+                        session['first_t'] = t
+                    if session['last_t'] is None or t > session['last_t']:
+                        session['last_t'] = t
+                # Records are appended in time order, so the last value wins.
+                if record.get('session_s') is not None:
+                    session['duration_s'] = record['session_s']
+                if record.get('replay_frame') is not None:
+                    session['max_replay_frame'] = record['replay_frame']
+                if record.get('replay_frame_ms') is not None:
+                    session['replay_frame_ms'] = record['replay_frame_ms']
+            sessions.append(session)
+        return sessions
+
+    def load(self, filename):
+        """Read one journal file back as a list of records, or None.
+
+        `filename` is a basename from list_sessions(); anything that isn't a
+        plain .jsonl name is refused so a client can't read arbitrary paths.
+        """
+        if os.path.basename(filename) != filename or \
+                not filename.endswith('.jsonl'):
+            return None
+        path = os.path.join(self.directory, filename)
+        if not os.path.isfile(path):
+            return None
+        return self._read(path)
+
+    def _read(self, path):
+        records = []
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(record, dict):
+                        records.append(record)
+        except OSError:
+            return []
+        return records
 
     def start_session(self, label=None, replay_dir=None, started_at=None,
                       letter=None):

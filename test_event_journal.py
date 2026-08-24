@@ -5,7 +5,8 @@ import tempfile
 import unittest
 from datetime import datetime
 
-from event_journal import EventJournal, find_session_replay, parse_replay_name
+from event_journal import (EventJournal, find_session_replay, parse_replay_name,
+                           match_replay)
 
 
 def event(**kw):
@@ -218,6 +219,132 @@ class ReplayPairingTest(unittest.TestCase):
 
         self.assertTrue(os.path.basename(self.journal.path).endswith('-race.jsonl'))
         self.assertIsNone(self.journal.replay_file)
+
+
+class JournalReadbackTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.journal = EventJournal(os.path.join(self.dir, 'event_logs'))
+
+    def _write_file(self, name, records):
+        os.makedirs(self.journal.directory, exist_ok=True)
+        path = os.path.join(self.journal.directory, name)
+        with open(path, 'w', encoding='utf-8') as fh:
+            for record in records:
+                fh.write(json.dumps(record) + '\n')
+        return path
+
+    def test_list_and_load_round_trip(self):
+        self._write_file('AC_080826-212044_R_car_track.jsonl', [
+            {'t': 100.0, 'kind': 'collision', 'label': 'HIT', 'driver': 'A',
+             'session_s': 10.0, 'replay_frame': 400, 'replay_frame_ms': 25.0},
+            {'t': 200.0, 'kind': 'overtake', 'label': 'OVT', 'driver': 'B',
+             'session_s': 60.0, 'replay_frame': 2400, 'replay_frame_ms': 25.0},
+        ])
+
+        sessions = self.journal.list_sessions()
+        self.assertEqual(len(sessions), 1)
+        s = sessions[0]
+        self.assertEqual(s['file'], 'AC_080826-212044_R_car_track.jsonl')
+        self.assertEqual(s['count'], 2)
+        self.assertEqual(s['first_t'], 100.0)
+        self.assertEqual(s['last_t'], 200.0)
+        self.assertEqual(s['duration_s'], 60.0)
+        self.assertEqual(s['max_replay_frame'], 2400)
+        self.assertEqual(s['replay_frame_ms'], 25.0)
+
+        loaded = self.journal.load('AC_080826-212044_R_car_track.jsonl')
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(loaded[0]['kind'], 'collision')
+
+    def test_list_ignores_non_jsonl_files_and_corrupt_records(self):
+        self._write_file('notes.txt', [{'t': 1.0}])
+        os.makedirs(self.journal.directory, exist_ok=True)
+        with open(os.path.join(self.journal.directory, 'broken.jsonl'),
+                  'w', encoding='utf-8') as fh:
+            fh.write('not json\n')
+            fh.write('{"t": 1.0, "kind": "mark"}\n')
+
+        sessions = self.journal.list_sessions()
+        self.assertEqual([s['file'] for s in sessions], ['broken.jsonl'])
+        self.assertEqual(sessions[0]['count'], 1)
+
+    def test_list_of_missing_directory_is_empty(self):
+        self.assertEqual(self.journal.list_sessions(), [])
+
+    def test_load_rejects_paths_outside_the_directory(self):
+        self.assertIsNone(self.journal.load('../secret.jsonl'))
+        self.assertIsNone(self.journal.load('C:\\evil.jsonl'))
+        self.assertIsNone(self.journal.load('missing.jsonl'))
+        self.assertIsNone(self.journal.load('not-jsonl.txt'))
+
+
+class MatchReplayTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.journal = EventJournal(os.path.join(self.dir, 'event_logs'))
+
+    def _write_file(self, name, records):
+        os.makedirs(self.journal.directory, exist_ok=True)
+        path = os.path.join(self.journal.directory, name)
+        with open(path, 'w', encoding='utf-8') as fh:
+            for record in records:
+                fh.write(json.dumps(record) + '\n')
+        return path
+
+    def test_exact_match_on_the_filename_stem(self):
+        self._write_file('AC_080826-212044_R_car_track.jsonl',
+                         [{'t': 1.0, 'session_s': 60.0}])
+        sessions = self.journal.list_sessions()
+
+        session, confidence = match_replay(
+            '/some/dir/AC_080826-212044_R_car_track.acreplay', 0, 0, sessions)
+
+        self.assertEqual(confidence, 'exact')
+        self.assertEqual(session['file'], 'AC_080826-212044_R_car_track.jsonl')
+
+    def test_exact_match_via_embedded_replay_name_when_renamed(self):
+        self._write_file('events-20260816-120000-race.jsonl', [{
+            't': 1.0, 'session_s': 60.0,
+            'replay_file': 'AC_080826-212044_R_car_track.acreplay',
+        }])
+        sessions = self.journal.list_sessions()
+
+        session, confidence = match_replay(
+            '/some/dir/AC_080826-212044_R_car_track.acreplay', 0, 0, sessions)
+
+        self.assertEqual(confidence, 'exact')
+        self.assertEqual(session['file'], 'events-20260816-120000-race.jsonl')
+
+    def test_fingerprint_fallback_when_renamed(self):
+        self._write_file('events-1.jsonl', [{'t': 1.0, 'session_s': 100.0}])
+        self._write_file('events-2.jsonl', [{'t': 1.0, 'session_s': 3600.0}])
+        sessions = self.journal.list_sessions()
+
+        session, confidence = match_replay('C:/renamed.acreplay', 4000, 25.0,
+                                           sessions)
+
+        self.assertEqual(confidence, 'fingerprint')
+        self.assertEqual(session['file'], 'events-1.jsonl')
+
+    def test_nothing_close_enough_matches_nothing(self):
+        self._write_file('events-1.jsonl', [{'t': 1.0, 'session_s': 3600.0}])
+        sessions = self.journal.list_sessions()
+
+        session, confidence = match_replay('C:/renamed.acreplay', 4000, 25.0,
+                                           sessions)
+
+        self.assertIsNone(session)
+        self.assertIsNone(confidence)
+
+    def test_empty_replay_file_matches_nothing(self):
+        self._write_file('AC_080826-212044_R_car_track.jsonl',
+                         [{'t': 1.0, 'session_s': 60.0}])
+        sessions = self.journal.list_sessions()
+
+        self.assertEqual(match_replay('', 4000, 25.0, sessions), (None, None))
 
 
 if __name__ == '__main__':

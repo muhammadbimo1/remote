@@ -216,13 +216,18 @@ body {
 }
 
 /* ---------------------------------------------------------------------------
-   Replay bar / event log
+   Replay bar / view tabs / event log
+   row: [Live][Mark] …… [Frame readout][Grid|Events]
 
    The whole feature is one hue too. Replay holding the output is an alarm
    state, so LIVE inverts and blinks (inverse video is what carries it when
    prefers-reduced-motion kills the blink). Event freshness is ramp position
    only — newest brightest — and the incident kind is a text badge, never a
    colour: HIT / FLP / OVT / MRK.
+
+   The event log is a view tab now, not an inline strip: Live/Mark act on the
+   broadcast regardless of which view is up, so they stay put while the tabs
+   swap only the content below.
    --------------------------------------------------------------------------- */
 .replay-bar {
     display: flex;
@@ -256,29 +261,135 @@ body {
     font-size: var(--type-small);
 }
 
-#events-toggle {
-    flex: 0 0 auto;
-    min-width: 0;
+/* View tabs — compact tabs, not the framework's soft-key scale (the base
+   .ac-tab pads 20px of dead space below the label; this bar is dense). */
+.view-tabs {
+    display: flex;
+    gap: var(--space-2);
     margin-left: var(--space-2);
+    flex: 0 0 auto;
+}
+
+.replay-bar .ac-tab {
+    padding: 5px 12px 7px;
+    border-radius: var(--radius-sm);
+    font-size: var(--type-body);
+    text-align: center;
+    min-width: 72px;
+}
+
+/* Count beside the Events label — the visible-event count, micro scale so the
+   label still leads. Inherits the inverse fill when the tab is selected. */
+.ev-count {
+    font-family: var(--font-micro);
+    font-size: var(--type-micro);
+    letter-spacing: var(--tracking-micro);
+    color: var(--ink-dim);
+    margin-left: 4px;
+}
+
+.ac-tab[aria-selected="true"] .ev-count {
+    color: var(--on-fill);
+    opacity: 0.75;
+}
+
+/* ---------------------------------------------------------------------------
+   View panes — exactly one is up; [hidden] must win over the display:flex the
+   pane itself carries (the attribute alone loses to an author display rule).
+   --------------------------------------------------------------------------- */
+.view-pane {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.view-pane[hidden] {
+    display: none;
+}
+
+/* ---------------------------------------------------------------------------
+   Events view
+
+   Owns the whole tab, so the list scrolls the pane rather than a capped 22vh
+   strip. Same thin scrollbar as the driver grid — a default OS scrollbar is a
+   bright grey slab on an amber panel.
+   --------------------------------------------------------------------------- */
+.event-filter-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-shrink: 0;
+}
+
+.event-filter-bar .ac-btn {
     padding: 3px 10px;
 }
 
-/* Capped and independently scrollable: the driver grid still owns the screen,
-   and .ac-screen is a fixed 100vh frame that must never scroll as a whole. */
+.review-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    flex-shrink: 0;
+    padding-bottom: var(--space-2);
+    border-bottom: var(--border-w) solid var(--stroke-dim);
+}
+
+.review-status {
+    font-family: var(--font-micro);
+    font-size: var(--type-micro);
+    letter-spacing: var(--tracking-micro);
+    color: var(--ink-faint);
+}
+
+.review-picker {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+}
+
+.review-picker .ac-btn {
+    padding: 3px 10px;
+}
+
 .event-list {
     display: flex;
     flex-direction: column;
     gap: 2px;
-    flex-shrink: 0;
-    max-height: 22vh;
+    flex: 1 1 auto;
+    min-height: 0;
     overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--amber-70) var(--screen-well);
 }
 
+.event-list::-webkit-scrollbar {
+    width: 10px;
+}
+
+.event-list::-webkit-scrollbar-track {
+    background: var(--screen-well);
+}
+
+.event-list::-webkit-scrollbar-thumb {
+    background: var(--amber-70);
+    border: 2px solid var(--screen-well);
+}
+
+.event-list .ac-banner {
+    margin: auto;
+    font-size: var(--type-title);
+}
+
+/* Full-width rows with room to spare — taller touch targets than the old
+   inline strip could afford. */
 .event-item {
     display: flex;
     align-items: center;
     gap: var(--space-3);
-    padding: 3px var(--space-3);
+    padding: 6px var(--space-3);
     border: var(--border-w) solid var(--stroke-dim);
     border-radius: var(--radius-sm);
     font-size: var(--type-small);
@@ -684,8 +795,21 @@ body {
         min-width: 44px;
     }
 
+    /* The replay bar carries the view tabs now — wrap rather than crush. The
+       frame readout keeps its right anchor on whichever line it lands. */
+    .replay-bar {
+        flex-wrap: wrap;
+    }
+
+    .replay-bar .ac-tab {
+        flex: 1 0 auto;
+        font-size: var(--type-small);
+        padding: 4px 10px 5px;
+    }
+
     .subcam-bar .ac-btn,
-    .class-filter-bar .ac-btn {
+    .class-filter-bar .ac-btn,
+    .event-filter-bar .ac-btn {
         font-size: var(--type-micro);
         font-family: var(--font-micro);
         padding: 4px 6px;

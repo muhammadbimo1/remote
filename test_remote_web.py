@@ -333,5 +333,117 @@ class ReplayCommandTest(unittest.TestCase):
         self.assertNotEqual(page.replay_seq, 0)
 
 
+class ReviewModeTest(unittest.TestCase):
+    def tearDown(self):
+        remote_web.exit_review()
+        remote_web._last_live_payload = None
+
+    def test_review_event_frame_falls_back_to_session_seconds(self):
+        ev = remote_web._review_event_from_record(
+            {'session_s': 100.0, 'kind': 'collision', 'label': 'HIT'},
+            3, 25.0)
+
+        self.assertEqual(ev['frame'], 4000)
+        self.assertEqual(ev['seek_s'], 100.0)
+        self.assertEqual(ev['id'], 3)
+
+    def test_review_event_seek_falls_back_to_frame(self):
+        ev = remote_web._review_event_from_record(
+            {'replay_frame': 4000, 'kind': 'collision', 'label': 'HIT'},
+            1, 25.0)
+
+        self.assertEqual(ev['frame'], 4000)
+        self.assertEqual(ev['seek_s'], 100.0)
+
+    def test_enter_review_loads_the_matched_journal(self):
+        telem = TelemetryPage()
+        telem.replay_frames = 4000
+        telem.replay_frame_ms = 25.0
+        session = {'file': 'AC_1.jsonl', 'replay_frame_ms': 25.0}
+        records = [{'kind': 'collision', 'label': 'HIT', 'driver': 'A',
+                    'replay_frame': 400, 'session_s': 10.0}]
+
+        with patch.object(remote_web.event_journal, 'list_sessions',
+                          return_value=[session]), \
+                patch.object(remote_web.event_journal, 'load',
+                             return_value=records), \
+                patch.object(remote_web, 'match_replay',
+                             return_value=(session, 'exact')):
+            remote_web.enter_review('C:/AC_1.acreplay', telem)
+
+        self.assertEqual(remote_web.review_journal['session'], session)
+        self.assertEqual(remote_web.review_journal['replay_file'],
+                         'C:/AC_1.acreplay')
+        self.assertFalse(remote_web.review_journal['manual'])
+        self.assertEqual(len(remote_web.review_journal['events']), 1)
+        self.assertEqual(remote_web.review_journal['events'][0]['frame'], 400)
+
+    def test_enter_review_without_a_match_has_empty_events(self):
+        telem = TelemetryPage()
+        telem.replay_frames = 0
+        telem.replay_frame_ms = 0.0
+
+        with patch.object(remote_web.event_journal, 'list_sessions',
+                          return_value=[]), \
+                patch.object(remote_web, 'match_replay',
+                             return_value=(None, None)):
+            remote_web.enter_review('C:/AC_1.acreplay', telem)
+
+        self.assertIsNone(remote_web.review_journal['session'])
+        self.assertEqual(remote_web.review_journal['events'], [])
+
+    def test_review_payload_serves_journal_events(self):
+        remote_web.review_journal = {
+            'replay_file': 'x', 'session': {'file': 'AC_1.jsonl'},
+            'manual': False,
+            'events': [{'id': 1, 'kind': 'collision', 'label': 'HIT',
+                        'car_id': 0, 'car_number': 23, 'name': 'A', 't': 1.0,
+                        'age': 0, 'frame': 400, 'seek_s': 10.0}],
+        }
+        telem = TelemetryPage()
+        telem.is_replay = 1
+        telem.replay_frame = 1
+
+        data = remote_web.build_replay_update_data(telem)
+
+        self.assertEqual(len(data['events']), 1)
+        self.assertTrue(data['review']['active'])
+        self.assertTrue(data['review']['matched'])
+
+    def test_live_replay_payload_carries_an_inactive_review_block(self):
+        telem = TelemetryPage()
+        telem.is_replay = 1
+
+        data = remote_web.build_replay_update_data(telem)
+
+        self.assertFalse(data['review']['active'])
+        self.assertFalse(data['review']['matched'])
+
+    def test_jump_in_review_seeks_by_frame(self):
+        remote_web.review_journal = {
+            'replay_file': 'x', 'session': {'file': 'AC_1.jsonl'},
+            'manual': False,
+            'events': [{'id': 1, 'kind': 'collision', 'label': 'HIT',
+                        'car_id': 0, 'frame': 400}],
+        }
+        with patch.object(remote_web, 'send_replay_command',
+                          return_value=True) as send, \
+                patch.object(remote_web, 'emit'):
+            remote_web.handle_jump_to_event({'id': 1})
+
+        send.assert_called_once_with(remote_web.REPLAY_SEEK_FRAME, frame=400)
+
+    def test_jump_in_review_missing_event_does_not_seek(self):
+        remote_web.review_journal = {
+            'replay_file': 'x', 'session': {'file': 'AC_1.jsonl'},
+            'manual': False, 'events': [],
+        }
+        with patch.object(remote_web, 'send_replay_command') as send, \
+                patch.object(remote_web, 'emit'):
+            remote_web.handle_jump_to_event({'id': 99})
+
+        send.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

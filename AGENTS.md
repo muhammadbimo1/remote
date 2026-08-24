@@ -35,17 +35,49 @@ since `changeCamera(4, …, -1)` advances it). Any command on `command_seq` clea
 operator pick always wins. Leaving replay — commanded or AC's own exit at the live edge — captures
 the on-screen shot first and holds it on the live side.
 
-Jumps are expressed as **seconds to rewind**, never frame indices — `ac.tryToToggleReplay(active,
-rewindS)` takes seconds, so `event_log.py` only has to timestamp incidents in wall clock.
-`replay_frame` / `replay_frames` in the telemetry page feed the readout and nothing else.
+Jumps are expressed as **seconds to rewind**, never frame indices — `event_log.py` only has to
+timestamp incidents in wall clock. `replay_frame` / `replay_frames` in the telemetry page feed the
+readout and nothing else.
 
-**Replay toggles must never overlap.** Two crashes on 2026-08-08 (`logs/dmp-687-42914`,
-`dmp-687-42a55`) died in AC's own `OverlayLeaderboard::renderHUD` (overlayleaderboard.cpp:246,
-called through CSP) right after a burst of `onReplayStatusChanged` transitions — one of them from
-a jump issued while replay was already active. `remote.lua` now serialises every toggle behind a
-`REPLAY_SETTLE_S` window, re-arms that window on each `ac.onReplay` event, and turns "jump while
-in replay" into exit → settle → enter. Do not add a code path that calls `ac.tryToToggleReplay`
-without going through `enterReplay` / `exitReplay`.
+`ac.tryToToggleReplay(active, rewindS)`'s `rewindS` **overshoots** on this rig: it converts seconds
+at a fixed 60 fps while the recording is ~16.7 fps (`sim.replayFrameMs` = 60), so a requested 11.9 s
+rewind actually lands ~43 s back, and a large rewind can overshoot the buffer and be refused. So
+`enterReplay` enters with only a nominal `REPLAY_ENTER_NOMINAL_REWIND_S` (0.5 s) and parks the real
+target in `pendingSeek` (`sim.replayFrames - rewind_s/replayFrameMs`), which `processPendingSeek`
+applies with `ac.setReplayPosition` the frame replay comes up. A `REPLAY_ENTER` landing while replay
+is already active seeks to that same target directly. Both paths are precise; never trust
+`tryToToggleReplay`'s own rewind.
+
+**Exiting instant replay crashes AC's leaderboard overlay.** Four dumps (2026-08-08
+`dmp-687-42914`/`dmp-687-42a55`, and 2026-08-16 `dmp-6816-3c002`/`dmp-6816-3d701`) are all an
+access violation in `acs.exe` at `OverlayLeaderboard::renderHUD` (overlayleaderboard.cpp:246), a
+few ms after `ac.tryToToggleReplay(false)` returns — on the replay→live transition, when the
+leaderboard redraws while AC resets the grid. The mitigation is two-fold: (1) `remote.lua`
+serialises every toggle behind a `REPLAY_SETTLE_S` window (re-armed on each `ac.onReplay` event),
+and a `REPLAY_ENTER` landing while replay is already active is answered with `ac.setReplayPosition()`
+— a seek to `sim.replayFrames - rewind_s/replayFrameMs` — **not** an exit → enter; and (2) the
+leaderboard HUD is hidden via `ac.disableExtraHUDElements('leaderboard', true)` for the whole time
+replay is active (plus the settle window after), so `renderHUD` is skipped during the transition,
+then restored. Do not add a code path that calls `ac.tryToToggleReplay` without going through
+`enterReplay` / `exitReplay`, do not reintroduce an exit-while-in-replay, and do not let the
+leaderboard suppression lapse while a replay transition can still be in flight.
+
+A **refused** toggle (`ac.tryToToggleReplay` returns `false`) still arms `replayBusyUntil`: a
+refusal can mean AC is mid-transition, and poking it again inside the settle window is exactly what
+crashes the leaderboard overlay — so a refused toggle serialises the next command too, at the cost
+of a 0.75 s wait after a genuinely-refused rewind. The result of the last attempt is published as
+`replay_last_result` and reverts to `UNTRIED` after `REPLAY_RESULT_VISIBLE_S` (3 s), so the panel's
+"RPL:N/A" badge clears instead of sticking after one transient refusal.
+
+`REPLAY_SEEK_FRAME` is gated on `sim.isReplayActive or sim.isReplayOnlyMode`: in saved-replay
+review (`isReplayOnlyMode`) the replay may not be "active" yet (paused at load), but a frame seek
+still has to land.
+
+`sim.replayFrames` is the live count of recorded frames since session start (confirmed on
+the rig: it counts up ~17/s while live, `sim.replayFrameMs` holds a constant 60 ms, and it keeps
+counting while instant replay plays back). So `replay_frames * replay_frame_ms` — which drives the
+event-log retention window, the journal's `session_s`/`replay_frame`, and the session-start
+estimate — equals the recorded session length until the instant-replay buffer wraps.
 
 ### Event log vs event journal
 
@@ -111,5 +143,11 @@ monochrome amber-terminal CSS framework. Two rules govern any change to it:
 
 ## Resources
 
-- **CSP Lua Skill**: Use the [CSP Lua skill](./.claude/skills/csp-lua/SKILL.md) for API reference. Update it when it points you into the wrong place.
-- **Full API Reference**: See [.claude/skills/csp-lua/reference/lib.lua](./.claude/skills/csp-lua/reference/lib.lua) for complete CSP type definitions (17k+ lines).
+Full CSP Lua API stubs ship with the game. No internet needed.
+
+```
+C:\Program Files (x86)\Steam\steamapps\common\assettocorsa\extension\internal\lua-sdk\
+```
+
+- **`ac_apps/lib.lua`** — the one that matters here. ~18k lines, 1 MB. Every `ac.*`, `ui.*`, `physics.*`, `render.*` entry with LDoc annotations: param types, return types, doc comments. **Grep this for any signature instead of recalling from memory** — the API drifts between CSP versions.
+- `ac_apps/README.md` — app-script notes

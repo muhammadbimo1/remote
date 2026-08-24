@@ -106,6 +106,23 @@ class OvertakeTest(unittest.TestCase):
         events = self.log.observe([car(1, 1, is_in_pit=1), car(0, 2)])
         self.assertEqual(events, [])
 
+    def test_overtakes_can_be_switched_off(self):
+        # Practice/qualifying: a position gain is timing-screen shuffling,
+        # not a pass — but contact still matters.
+        self.log.observe([car(0, 1), car(1, 2)], detect_overtakes=False)
+        self.clock.advance(1.0)
+        events = self.log.observe(
+            [car(1, 1, is_colliding=1), car(0, 2)], detect_overtakes=False)
+        self.assertEqual([e['kind'] for e in events], ['collision'])
+
+    def test_position_state_is_tracked_even_while_gated(self):
+        # The gate is per-call, so a race running after the server saw only
+        # gated ticks must detect on its second tick, not rebuild history.
+        self.log.observe([car(0, 1), car(1, 2)], detect_overtakes=False)
+        self.clock.advance(1.0)
+        events = self.log.observe([car(1, 1), car(0, 2)])
+        self.assertEqual([e['kind'] for e in events], ['overtake'])
+
 
 class MarkTest(unittest.TestCase):
     def setUp(self):

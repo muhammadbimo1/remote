@@ -51,6 +51,8 @@ class TelemetryPage(ctypes.Structure):
         ('replay_frames', c_int32),         # sim.replayFrames
         ('replay_frame_ms', c_float),       # sim.replayFrameMs
         ('replay_last_result', c_int32),    # 0 = untried, 1 = accepted, 2 = refused
+        ('is_replay_only', c_int32),        # sim.isReplayOnlyMode (saved replay, no racing)
+        ('replay_file', c_wchar * 256),     # ac.getReplayFilename() (loaded replay, else empty)
         ('replay_temp_dir', c_wchar * 256),  # ac.getFolder(ac.FolderID.ReplaysTemp)
         ('timetable_url', c_wchar * 128),
         ('cars', CarData * MAX_CARS),
@@ -76,4 +78,4 @@ class CommandPage(ctypes.Structure):
 REPLAY_NONE = 0
 REPLAY_ENTER = 1        # start instant replay, rewound replay_rewind_s seconds
 REPLAY_LIVE = 2         # stop replay, return to live
-REPLAY_SEEK_FRAME = 3   # jump to replay_frame (wired, no UI yet)
+REPLAY_SEEK_FRAME = 3   # jump to replay_frame (saved-replay review seek)

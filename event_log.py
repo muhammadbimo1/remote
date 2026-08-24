@@ -59,10 +59,14 @@ class EventLog:
     # Detection
     # ------------------------------------------------------------------
 
-    def observe(self, cars):
+    def observe(self, cars, detect_overtakes=True):
         """Compare this telemetry tick to the previous one. Returns new events.
 
         `cars` is the list of dicts produced by remote_web.compute_gaps().
+        `detect_overtakes` is False for practice/qualifying: positions there
+        reshuffle with every lap improvement, so a "position gained" is not a
+        pass on track — just timing-screen noise. Collisions, rollovers and
+        marks still land.
         """
         now = self._clock()
         new_events = []
@@ -97,7 +101,7 @@ class EventLog:
             cur_pos = car.get('position')
             gained = (prev_pos is not None and cur_pos is not None
                       and cur_pos < prev_pos)
-            if gained and not car.get('is_in_pit'):
+            if detect_overtakes and gained and not car.get('is_in_pit'):
                 # The car that used to hold this position pitted: not a pass.
                 displaced = prev_holder.get(cur_pos)
                 if displaced is None or not in_pit_now.get(displaced, False):

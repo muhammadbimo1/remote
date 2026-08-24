@@ -17,7 +17,7 @@ from ipc_shared import TELEMETRY_TAG, COMMAND_TAG
 from ipc_shared import REPLAY_ENTER, REPLAY_LIVE, REPLAY_SEEK_FRAME
 from auto_director import AutoDirector
 from event_log import EventLog
-from event_journal import EventJournal
+from event_journal import EventJournal, match_replay
 
 app = Flask(__name__)
 socketio = SocketIO(app)
@@ -53,6 +53,12 @@ _latest_cars_by_id = {}
 # Identity of the AC session currently being journalled. None until the first
 # telemetry read; every change rotates the journal and empties the live log.
 _current_session = None
+
+# Saved-replay review state. When a loaded .acreplay is opened (AC launched in
+# replay mode), the matching journal is read back and its events served in
+# place of the live log, so the operator can seek to each incident by frame.
+# None when not reviewing; a dict {'session': {...}, 'events': [...]} otherwise.
+review_journal = None
 
 SESSION_TYPE_NAMES = {
     1: 'Practice', 2: 'Qualify', 3: 'Race',
@@ -139,6 +145,7 @@ _last_live_payload = None
 latest_focused_car = 0
 latest_current_camera = 0
 latest_current_car_camera = 0
+latest_replay_file = ''
 
 # --- Class colors ---
 CLASS_COLORS = {
@@ -634,8 +641,76 @@ def build_replay_update_data(telem):
         'frame_ms': telem.replay_frame_ms,
         'last_result': telem.replay_last_result,
     }
-    data['events'] = event_log.snapshot()
+    if review_journal is not None:
+        data['events'] = review_journal['events']
+        data['review'] = {
+            'active': True,
+            'matched': review_journal['session'] is not None,
+        }
+    else:
+        data['events'] = event_log.snapshot()
+        data['review'] = {'active': False, 'matched': False}
     return data
+
+
+def _review_event_from_record(record, index, default_frame_ms):
+    """Map one journal record to the panel's event shape, with a seek target.
+
+    A record's `replay_frame`/`session_s` are the event's position in the
+    recording; the frame is what REPLAY_SEEK_FRAME jumps to, the seconds feed
+    the readout. Missing offsets are derived from whichever is present.
+    """
+    frame_ms = record.get('replay_frame_ms') or default_frame_ms
+    frame = record.get('replay_frame')
+    session_s = record.get('session_s')
+    if frame is None and session_s is not None and frame_ms:
+        frame = int(round(session_s * 1000.0 / frame_ms))
+    if session_s is None and frame is not None and frame_ms:
+        session_s = round(frame * frame_ms / 1000.0, 2)
+    return {
+        'id': index,
+        'kind': record.get('kind'),
+        'label': record.get('label'),
+        'car_id': record.get('car_id'),
+        'car_number': record.get('car_number'),
+        'name': record.get('driver') or '',
+        't': record.get('t'),
+        'age': 0,
+        'frame': frame,
+        'seek_s': session_s,
+    }
+
+
+def enter_review(replay_file, telem):
+    """Enter saved-replay review, loading the journal that annotates the replay.
+
+    Idempotent per replay file; called from the monitor loop while
+    sim.isReplayOnlyMode is set. A `None` session means no journal matched —
+    the events list is empty and the operator can pick one manually.
+    """
+    global review_journal
+    sessions = event_journal.list_sessions()
+    session, confidence = match_replay(replay_file, telem.replay_frames,
+                                       telem.replay_frame_ms, sessions)
+    events = []
+    if session is not None:
+        records = event_journal.load(session['file']) or []
+        frame_ms = session.get('replay_frame_ms')
+        events = [_review_event_from_record(r, i + 1, frame_ms)
+                  for i, r in enumerate(records)]
+        print('[remote_web] replay review: {} ({}) - {} events'.format(
+            session['file'], confidence, len(events)))
+    else:
+        print('[remote_web] replay review: no journal matches {}'.format(
+            replay_file))
+    review_journal = {'replay_file': replay_file, 'session': session,
+                      'events': events, 'manual': False}
+
+
+def exit_review():
+    """Leave saved-replay review, back to live/instant-replay behaviour."""
+    global review_journal
+    review_journal = None
 
 
 def send_command(target_driver, target_camera, target_car_camera=-1):
@@ -685,8 +760,10 @@ def monitor_telemetry():
     """Background thread: poll telemetry mmap and push updates via SocketIO."""
     global telemetry_mmap, telemetry_page, ac_connected
     global latest_focused_car, latest_current_camera, latest_current_car_camera
+    global latest_replay_file
     global _last_live_payload, _latest_replay_context, _latest_cars_by_id
     global _current_session
+    global review_journal
 
     last_packet_id = -1
 
@@ -730,12 +807,29 @@ def monitor_telemetry():
 
         if telem.packet_id != last_packet_id:
             last_packet_id = telem.packet_id
-            maybe_rotate_session(telem)
+
+            is_replay_only = bool(getattr(telem, 'is_replay_only', 0))
+            replay_file = (getattr(telem, 'replay_file', '') or '').strip()
+            latest_replay_file = replay_file
+
+            if is_replay_only:
+                # A saved .acreplay is open (AC launched in replay mode). Serve
+                # the matching journal instead of the live log, and don't let
+                # the replay's embedded session identity rotate the journal.
+                if review_journal is None or (
+                        not review_journal.get('manual') and
+                        review_journal.get('replay_file') != replay_file):
+                    enter_review(replay_file, telem)
+            else:
+                if review_journal is not None:
+                    exit_review()
+                maybe_rotate_session(telem)
+
             latest_focused_car = telem.focused_car
             latest_current_camera = telem.current_camera
             latest_current_car_camera = telem.current_car_camera
 
-            if telem.is_replay:
+            if is_replay_only or telem.is_replay:
                 # Car data now comes from the replay frame being shown, so it
                 # is not race state: no event detection, no director cuts, and
                 # the driver list is served from the last live payload.
@@ -768,7 +862,12 @@ def monitor_telemetry():
                 # Detect before building: build_update_data snapshots the event
                 # log, so observing afterwards would hold every event back a
                 # tick — and strand the last one if telemetry stops.
-                for event in event_log.observe(cars_with_gaps):
+                # Overtakes are a race-only signal: practice/qualifying
+                # positions reshuffle with every lap improvement, which would
+                # flood the log with passes nobody made.
+                race = telem.session_type == 1
+                for event in event_log.observe(cars_with_gaps,
+                                               detect_overtakes=race):
                     record_event(event)
                 data = build_update_data(telem, cars_with_gaps)
                 _last_live_payload = data
@@ -809,6 +908,26 @@ def handle_jump_to_event(data):
         emit('replay_status', {'ok': False, 'error': 'bad event id'})
         return
 
+    # Saved-replay review: jump by frame, not by rewind seconds. There is no
+    # live buffer to rewind into; the event's recorded frame is the target.
+    if review_journal is not None:
+        event = next((ev for ev in review_journal['events']
+                      if ev['id'] == event_id), None)
+        if event is None:
+            emit('replay_status', {'ok': False, 'error': 'event not found'})
+            return
+        if event.get('frame') is None:
+            emit('replay_status', {'ok': False, 'error': 'no seek target'})
+            return
+        with director_lock:
+            director.enabled = False
+        ok = send_replay_command(REPLAY_SEEK_FRAME, frame=event['frame'])
+        print('[remote_web] replay seek: event={} kind={} frame={}'.format(
+            event_id, event['kind'], event['frame']))
+        emit('replay_status', {'ok': ok, 'frame': event['frame'],
+                               'event_id': event_id}, broadcast=True)
+        return
+
     event = event_log.get(event_id)
     if event is None:
         emit('replay_status', {'ok': False, 'error': 'event expired'})
@@ -827,6 +946,37 @@ def handle_jump_to_event(data):
         event_id, event['kind'], event['car_id'], rewind))
     emit('replay_status', {'ok': ok, 'rewind': rewind, 'event_id': event_id},
          broadcast=True)
+
+
+@socketio.on('list_replay_sessions')
+def handle_list_replay_sessions():
+    """Offer every journalled session, for when auto-matching misses."""
+    emit('replay_sessions', {'sessions': event_journal.list_sessions()})
+
+
+@socketio.on('load_replay_events')
+def handle_load_replay_events(data):
+    """Manually load a journal into review, overriding the auto-match."""
+    global review_journal
+    filename = (data or {}).get('file')
+    if not filename:
+        emit('replay_status', {'ok': False, 'error': 'bad session file'})
+        return
+    records = event_journal.load(filename)
+    if records is None:
+        emit('replay_status', {'ok': False, 'error': 'no such session'})
+        return
+    session = next((s for s in event_journal.list_sessions()
+                    if s['file'] == filename), None)
+    frame_ms = session.get('replay_frame_ms') if session else None
+    events = [_review_event_from_record(r, i + 1, frame_ms)
+              for i, r in enumerate(records)]
+    review_journal = {'replay_file': latest_replay_file, 'session': session,
+                      'events': events, 'manual': True}
+    emit('replay_status', {'ok': True, 'review': True}, broadcast=True)
+    emit('events', {'events': events}, broadcast=True)
+    print('[remote_web] replay review: manual load {} ({} events)'.format(
+        filename, len(events)))
 
 
 @socketio.on('go_live')
@@ -874,7 +1024,7 @@ def handle_connect():
     if telem:
         # A client joining mid-replay gets the frozen list, same as everyone
         # else — gaps built from a replay frame are not race state.
-        if telem.is_replay:
+        if getattr(telem, 'is_replay_only', 0) or telem.is_replay:
             emit('update', build_replay_update_data(telem))
         else:
             emit('update', build_update_data(telem))
@@ -1007,7 +1157,51 @@ def index():
             // "rewind N seconds", computed server-side from the event's age.
             var replayActive = false;
             var replayUnavailable = false;
-            var eventsCollapsed = false;
+
+            // View tabs: 'grid' (drivers) or 'events'. The event log lives on
+            // its own tab now — a full-height list instead of the 22vh strip
+            // that used to push the driver grid down.
+            var activeView = 'grid';
+
+            // Overtakes hidden by default: in a busy race they bury the
+            // contact events, which are the ones worth jumping back to.
+            var showOvertakes = false;
+            var lastEvents = [];
+
+            // Saved-replay review state: a loaded .acreplay serves journalled
+            // events in place of the live log. Unmatched -> offer the session
+            // list so the operator can pick the right one.
+            var reviewActive = false;
+            var reviewMatched = false;
+            var reviewSessions = [];
+
+            function renderReviewBar() {
+                var bar = document.getElementById('review-bar');
+                if (!bar) return;
+                if (!reviewActive) { bar.hidden = true; return; }
+                bar.hidden = false;
+                document.getElementById('review-status').textContent =
+                    reviewMatched ? 'Journal matched' : 'No match - pick a session';
+
+                var picker = document.getElementById('review-picker');
+                if (reviewMatched || !reviewSessions.length) {
+                    picker.innerHTML = '';
+                    return;
+                }
+                var html = '';
+                reviewSessions.forEach(function(s) {
+                    var label = s.replay_file || s.file;
+                    html += '<button type="button" class="ac-btn ac-btn--sm" '
+                        + 'data-file="' + escapeHtml(s.file) + '">'
+                        + escapeHtml(label) + '</button>';
+                });
+                picker.innerHTML = html;
+            }
+
+            function requestReviewSessions() {
+                if (!reviewActive || reviewMatched) return;
+                if (!reviewSessions.length) socket.emit('list_replay_sessions');
+            }
 
             function replayBadgeHtml() {
                 // A refused ac.tryToToggleReplay is otherwise invisible: the
@@ -1054,30 +1248,51 @@ def index():
                 return Math.floor(s / 60) + 'm' + ('0' + (s % 60)).slice(-2);
             }
 
+            function setActiveView(view) {
+                activeView = view;
+                document.getElementById('grid-view').hidden = view !== 'grid';
+                document.getElementById('events-view').hidden = view !== 'events';
+                document.querySelectorAll('.view-tabs button[data-view]').forEach(function(b) {
+                    var on = b.dataset.view === view;
+                    b.classList.toggle('ac-tab--active', on);
+                    b.setAttribute('aria-selected', on ? 'true' : 'false');
+                });
+            }
+
             function renderEvents(events) {
                 var list = document.getElementById('event-list');
-                var toggle = document.getElementById('events-toggle');
                 events = events || [];
-                if (toggle) toggle.textContent = 'Events ' + events.length;
+                lastEvents = events;
 
-                if (eventsCollapsed) {
-                    list.style.display = 'none';
-                    return;
-                }
-                list.style.display = '';
+                // The tab caption counts what the tab actually shows, so a
+                // silent zero means "nothing worth jumping to".
+                var visible = events.filter(function(ev) {
+                    return showOvertakes || ev.kind !== 'overtake';
+                });
+                var count = document.getElementById('events-count');
+                if (count) count.textContent = visible.length;
 
-                if (!events.length) {
-                    list.innerHTML = '<div class="ac-banner ac-banner--dim">No Events Yet</div>';
+                if (!visible.length) {
+                    // The two empties are told apart, so a filtered-out log is
+                    // never mistaken for a detection failure.
+                    list.innerHTML = '<div class="ac-banner ac-banner--dim">'
+                        + (events.length ? 'Only Overtakes — Hidden' : 'No Events Yet')
+                        + '</div>';
                     return;
                 }
 
                 var html = '';
-                events.forEach(function(ev) {
+                visible.forEach(function(ev) {
                     var who = escapeHtml(formatCarNumber(ev.car_number));
                     if (ev.name) who += ' ' + escapeHtml(ev.name);
+                    // Review events carry a replay seek position, not a live
+                    // age; the leading sign tells the two apart at a glance.
+                    var ageHtml = (ev.seek_s != null)
+                        ? ('+' + formatAge(ev.seek_s))
+                        : ('-' + formatAge(ev.age));
                     html += '<div class="event-item' + eventAgeClass(ev.age)
                         + '" data-event="' + ev.id + '">'
-                        + '<span class="ev-age">-' + formatAge(ev.age) + '</span>'
+                        + '<span class="ev-age">' + ageHtml + '</span>'
                         + '<span class="ac-badge ev-kind">' + escapeHtml(ev.label) + '</span>'
                         + '<span class="ev-car">' + who + '</span>'
                         + '</div>';
@@ -1186,11 +1401,25 @@ def index():
                     e.preventDefault();
                     socket.emit('mark_event');
                 });
-                document.getElementById('events-toggle').addEventListener('pointerdown', function(e) {
+                document.querySelector('.view-tabs').addEventListener('pointerdown', function(e) {
+                    var btn = e.target.closest('button[data-view]');
+                    if (btn) {
+                        e.preventDefault();
+                        setActiveView(btn.dataset.view || 'grid');
+                    }
+                });
+                document.getElementById('ovt-toggle').addEventListener('pointerdown', function(e) {
                     e.preventDefault();
-                    eventsCollapsed = !eventsCollapsed;
-                    setPressed(e.currentTarget, !eventsCollapsed);
-                    document.getElementById('event-list').style.display = eventsCollapsed ? 'none' : '';
+                    showOvertakes = !showOvertakes;
+                    setPressed(e.currentTarget, showOvertakes);
+                    renderEvents(lastEvents);
+                });
+                document.getElementById('review-picker').addEventListener('pointerdown', function(e) {
+                    var btn = e.target.closest('button[data-file]');
+                    if (btn) {
+                        e.preventDefault();
+                        socket.emit('load_replay_events', { file: btn.dataset.file });
+                    }
                 });
 
                 socket.emit('get_timetable_url');
@@ -1198,6 +1427,11 @@ def index():
 
             socket.on('events', function(data) {
                 renderEvents(data.events);
+            });
+
+            socket.on('replay_sessions', function(data) {
+                reviewSessions = data.sessions || [];
+                renderReviewBar();
             });
 
             socket.on('replay_status', function(data) {
@@ -1231,6 +1465,18 @@ def index():
                 var replay = data.replay || {};
                 replayActive = !!replay.active;
                 replayUnavailable = replay.last_result === 2;
+
+                // Saved-replay review: drives the review bar and the session
+                // picker when the auto-match came up empty.
+                var review = data.review || {};
+                var wasReviewActive = reviewActive;
+                reviewActive = !!review.active;
+                reviewMatched = !!review.matched;
+                if (reviewActive && !wasReviewActive) {
+                    reviewSessions = [];
+                    requestReviewSessions();
+                }
+                renderReviewBar();
 
                 if (!data.ac_connected) {
                     replayActive = false;
@@ -1432,16 +1678,35 @@ def index():
                 <span class="ac-readout__label">Frame</span>
                 <span class="ac-readout__value" id="replay-frame">--</span>
             </span>
-            <button id="events-toggle" class="ac-btn ac-btn--sm" aria-pressed="true">Events 0</button>
+            <!-- View selection shares the replay bar: Live/Mark are actions on
+                 the left, the tabs sit right. The Events caption is the count
+                 of events the tab will actually show (overtakes excluded while
+                 hidden), so it doubles as the "new incident" telltale. -->
+            <div class="view-tabs ac-tabs" role="tablist" aria-label="Panel view">
+                <button class="ac-tab ac-tab--active" role="tab" aria-selected="true" data-view="grid">Grid</button>
+                <button class="ac-tab" role="tab" aria-selected="false" data-view="events">Events <span id="events-count" class="ev-count">0</span></button>
+            </div>
         </div>
 
-        <div id="event-list" class="event-list"></div>
+        <div id="grid-view" class="view-pane">
+            <div id="subcam-bar" class="subcam-bar" style="display:none"></div>
+            <div id="class-filter-bar" class="class-filter-bar"></div>
 
-        <div id="subcam-bar" class="subcam-bar" style="display:none"></div>
-        <div id="class-filter-bar" class="class-filter-bar"></div>
+            <div id="drivers-list">
+                <div class="ac-banner ac-banner--dim">Connecting</div>
+            </div>
+        </div>
 
-        <div id="drivers-list">
-            <div class="ac-banner ac-banner--dim">Connecting</div>
+        <div id="events-view" class="view-pane" hidden>
+            <div id="review-bar" class="review-bar" hidden>
+                <span class="ac-badge ac-badge--filled">REVIEW</span>
+                <span id="review-status" class="review-status">Journal matched</span>
+                <div id="review-picker" class="review-picker"></div>
+            </div>
+            <div id="event-filter-bar" class="event-filter-bar">
+                <button id="ovt-toggle" class="ac-btn ac-btn--sm" aria-pressed="false" title="Show overtakes in the event list">Overtakes</button>
+            </div>
+            <div id="event-list" class="event-list"></div>
         </div>
 
         </div>
