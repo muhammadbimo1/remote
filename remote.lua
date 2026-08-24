@@ -116,6 +116,13 @@ local leaderboardSuppressed = false
 local REPLAY_ENTER_NOMINAL_REWIND_S = 0.5
 local pendingSeek = nil        -- absolute frame to seek to once replay is active
 
+-- A replay mode change is delayed until the stinger has covered the game.
+-- Motion is 200 ms in + 200 ms out; the covered hold stretches only as long
+-- as AC needs to report the requested replay state.
+local STINGER_HALF_S = 0.2
+local STINGER_WAIT_TIMEOUT_S = 1.5
+local stinger = nil            -- { phase, phaseStarted, action, ..., targetReplay, deadline }
+
 -- Session identity. AC saves a separate replay per session and wipes the
 -- instant-replay buffer when one starts, so markers from the previous session
 -- point into a recording that no longer exists. `sessionGen` is what the web
@@ -303,6 +310,7 @@ local function enterReplay(rewindS, driver, camera, subCam)
     pendingSeek = nil
     shotHold = nil
   end
+  return ok
 end
 
 -- Leaving replay snaps focus back to the player car, which is never what a
@@ -321,6 +329,19 @@ local function exitReplay(reason)
   return ok
 end
 
+local function queueStinger(action, rewindS, driver, camera, subCam)
+  stinger = {
+    phase = 'cover',
+    phaseStarted = os.preciseClock(),
+    action = action,
+    rewindS = rewindS,
+    driver = driver,
+    camera = camera,
+    subCam = subCam,
+    targetReplay = action == REPLAY_ENTER,
+  }
+end
+
 local function processReplayCommands()
   local seq = cmdPage.replay_seq
   if seq == lastReplaySeq then return end
@@ -331,7 +352,7 @@ local function processReplayCommands()
   local now = os.preciseClock()
 
   -- A toggle landing inside another toggle's transition is what crashed AC.
-  if now < replayBusyUntil then
+  if stinger ~= nil or now < replayBusyUntil then
     ac.log(string.format('Replay command %d ignored: transition in progress (active=%s)',
       action, tostring(active)))
     return
@@ -353,13 +374,13 @@ local function processReplayCommands()
       ac.log(string.format('Replay seek (already active): rewind=%.1fs frame=%d',
         rewindS, target))
     else
-      enterReplay(rewindS, driver, camera, subCam)
+      queueStinger(action, rewindS, driver, camera, subCam)
     end
   elseif action == REPLAY_LIVE then
     if active then
       -- Keep the car that was on screen in the replay: leaving replay makes AC
       -- snap focus back to the player car, which is never what a director wants.
-      exitReplay('command')
+      queueStinger(action, 0, -1, -1, -1)
     else
       ac.log('Replay live ignored: not in replay')
     end
@@ -369,6 +390,37 @@ local function processReplayCommands()
     else
       ac.log('Replay seek ignored: not in replay')
     end
+  end
+end
+
+local function processStinger()
+  if stinger == nil then return end
+
+  local now = os.preciseClock()
+  if stinger.phase == 'cover' then
+    if now - stinger.phaseStarted < STINGER_HALF_S then return end
+
+    local ok
+    if stinger.action == REPLAY_ENTER then
+      ok = enterReplay(stinger.rewindS, stinger.driver, stinger.camera, stinger.subCam)
+    else
+      ok = exitReplay('command')
+    end
+
+    if ok then
+      stinger.phase = 'wait'
+      stinger.deadline = now + STINGER_WAIT_TIMEOUT_S
+    else
+      stinger.phase = 'reveal'
+      stinger.phaseStarted = now
+    end
+  elseif stinger.phase == 'wait' then
+    if sim.isReplayActive == stinger.targetReplay or now >= stinger.deadline then
+      stinger.phase = 'reveal'
+      stinger.phaseStarted = now
+    end
+  elseif stinger.phase == 'reveal' and now - stinger.phaseStarted >= STINGER_HALF_S then
+    stinger = nil
   end
 end
 
@@ -621,6 +673,7 @@ function script.update(dt)
   -- deferred replay shot needs to land the frame replay comes up, not up to
   -- 100 ms later.
   processReplayCommands()
+  processStinger()
   processPendingSeek()
   processShotHold()
   processReplayResultExpiry()
@@ -638,6 +691,46 @@ end
 ---------------------------------------------------------------------
 -- In-game UI
 ---------------------------------------------------------------------
+local function smoothstep01(value)
+  local t = math.max(0, math.min(1, value))
+  return t * t * (3 - 2 * t)
+end
+
+local stingerPass = {
+  blendMode = render.BlendMode.AlphaBlend,
+  depthMode = render.DepthMode.Off,
+  textures = { txStinger = 'static/stinger.png' },
+  values = { gOffsetX = -2, gEmissive = 4 },
+  shader = [[
+    float4 main(PS_IN pin) {
+      float2 uv = float2((pin.Tex.x - gOffsetX) * 0.5, pin.Tex.y);
+      if (uv.x < 0 || uv.x > 1) return float4(0, 0, 0, 0);
+      float4 color = txStinger.Sample(samLinear, uv);
+      return float4(color.rgb * gEmissive, color.a);
+    }
+  ]],
+}
+
+-- Registered as a scene render callback, not a UI callback: CSP's clean-OBS
+-- mode removes the UI layer but keeps this transparent render pass.
+function renderStinger()
+  if stinger == nil then return end
+
+  local x
+  if stinger.phase == 'cover' then
+    local t = smoothstep01((os.preciseClock() - stinger.phaseStarted) / STINGER_HALF_S)
+    x = -2 + 1.5 * t
+  elseif stinger.phase == 'wait' then
+    x = -0.5
+  else
+    local t = smoothstep01((os.preciseClock() - stinger.phaseStarted) / STINGER_HALF_S)
+    x = -0.5 + 1.5 * t
+  end
+
+  stingerPass.values.gOffsetX = x
+  render.fullscreenPass(stingerPass)
+end
+
 local COLOR_FOCUSED = rgbm(0.2, 0.6, 1.0, 1.0)
 local COLOR_PIT     = rgbm(1.0, 0.7, 0.2, 1.0)
 local COLOR_OFFLINE = rgbm(0.5, 0.5, 0.5, 1.0)
