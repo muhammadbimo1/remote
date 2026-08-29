@@ -1,68 +1,11 @@
 local sim = ac.getSim()
-local ffi = require('ffi')
 
 ---------------------------------------------------------------------
--- Mmap IPC — layout strings must match ipc_shared.py exactly
--- Using the layout-string API so the GC handle lives on the returned
--- pointer (which surviving functions reference), not on a temporary.
+-- WebSocket IPC — CSP connects to the local web server on its existing port.
 ---------------------------------------------------------------------
-local TELEM_TAG = 'broadcaster_remote_telemetry'
-local CMD_TAG = 'broadcaster_remote_commands'
+local PROTOCOL_VERSION = 1
 
-local telemPage = ac.writeMemoryMappedFile(TELEM_TAG, [[
-  int packet_id;
-  int car_count;
-  int focused_car;
-  int current_camera;
-  int car_cameras_count;
-  int current_car_camera;
-  float track_length;
-  int session_type;
-  int session_index;
-  int session_type_raw;
-  int session_gen;
-  wchar_t session_name[64];
-  int is_replay;
-  int replay_frame;
-  int replay_frames;
-  float replay_frame_ms;
-  int replay_last_result;
-  int is_replay_only;
-  wchar_t replay_file[256];
-  wchar_t replay_temp_dir[256];
-  wchar_t timetable_url[128];
-  struct {
-    int car_id;
-    int session_id;
-    int position;
-    float normalized_spline_pos;
-    float speed_kmh;
-    int lap_time;
-    int best_lap;
-    int last_lap;
-    int lap_count;
-    int is_in_pit;
-    int is_connected;
-    int is_colliding;
-    int is_rolled_over;
-    wchar_t driver_name[64];
-    wchar_t team_name[64];
-  } cars[128];
-//<__EXPAL:0:4>]])
-
-local cmdPage = ac.writeMemoryMappedFile(CMD_TAG, [[
-  int packet_id;
-  int target_driver;
-  int target_camera;
-  int target_car_camera;
-  int command_seq;
-  int replay_seq;
-  int replay_action;
-  float replay_rewind_s;
-  int replay_frame;
-//<__EXPAL:0:4>]])
-
--- Replay actions — must match the REPLAY_* constants in ipc_shared.py
+-- Replay actions — must match the REPLAY_* constants in ac_ipc.py.
 local REPLAY_ENTER = 1
 local REPLAY_LIVE = 2
 local REPLAY_SEEK_FRAME = 3
@@ -77,8 +20,59 @@ local REPLAY_RESULT_REFUSED = 2
 ---------------------------------------------------------------------
 local lastCommandSeq = 0
 local lastReplaySeq = 0
+local pendingCommand = nil
+local pendingReplay = nil
+local packetID = 0
 local updateAccum = 0
 local UPDATE_INTERVAL = 0.1 -- 100 ms
+
+local function validNumber(value)
+  return type(value) == 'number'
+end
+
+local function onIPCMessage(raw)
+  local ok, message = pcall(JSON.parse, raw)
+  if not ok or type(message) ~= 'table' then
+    ac.log('Broadcaster IPC ignored malformed JSON')
+    return
+  end
+  if message.version ~= PROTOCOL_VERSION then return end
+
+  if message.type == 'command' then
+    if not validNumber(message.command_seq)
+        or not validNumber(message.target_driver)
+        or not validNumber(message.target_camera)
+        or not validNumber(message.target_car_camera) then
+      return
+    end
+    pendingCommand = message
+  elseif message.type == 'replay' then
+    if not validNumber(message.replay_seq)
+        or not validNumber(message.replay_action)
+        or not validNumber(message.replay_rewind_s)
+        or not validNumber(message.replay_frame)
+        or not validNumber(message.target_driver)
+        or not validNumber(message.target_camera)
+        or not validNumber(message.target_car_camera) then
+      return
+    end
+    pendingReplay = message
+  end
+end
+
+local ipcSocket = web.socket(
+  'ws://127.0.0.1:5000/ac-ipc',
+  onIPCMessage,
+  {
+    encoding = 'utf8',
+    reconnect = true,
+    onError = function(err)
+      ac.log('Broadcaster IPC WebSocket error: ' .. tostring(err))
+    end,
+    onClose = function(reason)
+      ac.log('Broadcaster IPC WebSocket closed: ' .. tostring(reason or ''))
+    end,
+  })
 
 -- Replay state. Both replay transitions reset the shot: entering resets the
 -- camera, and leaving snaps focus back to the player car. AC does it a frame
@@ -209,20 +203,6 @@ local function getCameraName(mode)
 end
 
 ---------------------------------------------------------------------
--- UTF-16 helper: write a Lua string into a wchar_t[64] field
----------------------------------------------------------------------
-local function writeWchar(dst, str, maxChars)
-  ffi.fill(dst, maxChars * 2, 0)
-  if not str or str == '' then return end
-  local utf16 = ac.utf8To16(str)
-  if utf16 then
-    local maxBytes = (maxChars - 1) * 2
-    local copyLen = math.min(#utf16, maxBytes)
-    ffi.copy(dst, utf16, copyLen)
-  end
-end
-
----------------------------------------------------------------------
 -- Camera switching (mirrors Python changeCamera logic)
 ---------------------------------------------------------------------
 local function changeCamera(cam, carIndex, subCam)
@@ -343,11 +323,15 @@ local function queueStinger(action, rewindS, driver, camera, subCam)
 end
 
 local function processReplayCommands()
-  local seq = cmdPage.replay_seq
+  local command = pendingReplay
+  if command == nil then return end
+  pendingReplay = nil
+
+  local seq = command.replay_seq
   if seq == lastReplaySeq then return end
   lastReplaySeq = seq
 
-  local action = cmdPage.replay_action
+  local action = command.replay_action
   local active = sim.isReplayActive
   local now = os.preciseClock()
 
@@ -359,10 +343,10 @@ local function processReplayCommands()
   end
 
   if action == REPLAY_ENTER then
-    local rewindS = cmdPage.replay_rewind_s
-    local driver = cmdPage.target_driver
-    local camera = cmdPage.target_camera
-    local subCam = cmdPage.target_car_camera
+    local rewindS = command.replay_rewind_s
+    local driver = command.target_driver
+    local camera = command.target_camera
+    local subCam = command.target_car_camera
     if active then
       -- Already in replay: seek straight to the target frame instead of
       -- exit -> settle -> enter. That exit toggle is what crashes AC
@@ -386,7 +370,7 @@ local function processReplayCommands()
     end
   elseif action == REPLAY_SEEK_FRAME then
     if active or sim.isReplayOnlyMode then
-      ac.setReplayPosition(cmdPage.replay_frame, 0)
+      ac.setReplayPosition(command.replay_frame, 0)
     else
       ac.log('Replay seek ignored: not in replay')
     end
@@ -501,14 +485,17 @@ end)
 
 
 local function processCommands()
-  local seq = cmdPage.command_seq
-  if seq ~= lastCommandSeq then
-    lastCommandSeq = seq
-    -- An explicit pick from the panel wins over any shot being held, otherwise
-    -- the hold would drag the operator back to the replay's car.
-    shotHold = nil
-    applyFocus(cmdPage.target_driver, cmdPage.target_camera, cmdPage.target_car_camera)
-  end
+  local command = pendingCommand
+  if command == nil then return end
+  pendingCommand = nil
+
+  local seq = command.command_seq
+  if seq == lastCommandSeq then return end
+  lastCommandSeq = seq
+  -- An explicit pick from the panel wins over any shot being held, otherwise
+  -- the hold would drag the operator back to the replay's car.
+  shotHold = nil
+  applyFocus(command.target_driver, command.target_camera, command.target_car_camera)
 end
 
 ---------------------------------------------------------------------
@@ -575,15 +562,7 @@ end
 ---------------------------------------------------------------------
 local function updateTelemetry()
   local carCount = math.min(sim.carsCount, 128)
-
-  telemPage.car_count = carCount
-  telemPage.focused_car = sim.focusedCar
-  telemPage.current_camera = cspCameraToCustom(sim.cameraMode)
   local focusedCar = ac.getCar(sim.focusedCar)
-  telemPage.car_cameras_count = focusedCar and focusedCar.carCamerasCount or 0
-  telemPage.current_car_camera = sim.carCameraIndex
-  telemPage.track_length = sim.trackLengthM
-  telemPage.session_type = (sim.raceSessionType == ac.SessionType.Race) and 1 or 0
 
   local sessionIndex = sim.currentSessionIndex
   local sessionTypeRaw = sim.raceSessionType
@@ -598,50 +577,25 @@ local function updateTelemetry()
     lastSessionIndex = sessionIndex
     lastSessionTypeRaw = sessionTypeRaw
   end
-  telemPage.session_index = sessionIndex
-  telemPage.session_type_raw = sessionTypeRaw
-  telemPage.session_gen = sessionGen
-  writeWchar(telemPage.session_name, ac.getSessionName(sessionIndex) or '', 64)
 
-  telemPage.is_replay = sim.isReplayActive and 1 or 0
-  telemPage.replay_frame = sim.replayCurrentFrame
-  telemPage.replay_frames = sim.replayFrames
-  telemPage.replay_frame_ms = sim.replayFrameMs
-  telemPage.replay_last_result = replayLastResult
-  telemPage.is_replay_only = sim.isReplayOnlyMode and 1 or 0
-  writeWchar(telemPage.replay_file, ac.getReplayFilename() or '', 256)
-  -- Where AC keeps the per-session .acreplay it is recording right now. The
-  -- web server pairs its event journal to that file by name.
-  writeWchar(telemPage.replay_temp_dir, ac.getFolder(ac.FolderID.ReplaysTemp) or '', 256)
   local serverIP = ac.getServerIP()
   local httpPort = ac.getServerPortHTTP()
   local timetableURL = ''
   if serverIP ~= nil and serverIP ~= '' and httpPort ~= nil and httpPort >= 0 then
     timetableURL = 'http://' .. serverIP .. ':' .. tostring(httpPort) .. '/timetable.json'
   end
-  writeWchar(telemPage.timetable_url, timetableURL, 128)
+
+  local cars = {}
 
   for i = 0, carCount - 1 do
     local car = ac.getCar(i)
-    local c = telemPage.cars[i]
-    c.car_id = i
-    c.session_id = car.sessionID
-    c.position = car.racePosition
-    c.normalized_spline_pos = car.splinePosition
-    c.speed_kmh = car.speedKmh
-    c.lap_time = car.lapTimeMs
-    c.best_lap = car.bestLapTimeMs
-    c.last_lap = car.previousLapTimeMs
-    c.lap_count = car.lapCount
-    c.is_in_pit = car.isInPitlane and 1 or 0
-    c.is_connected = car.isConnected and 1 or 0
     local dmgSum = car.damage[0] + car.damage[1] + car.damage[2] + car.damage[3] + car.damage[4]
     local dmgJumped = prevDamageSum[i] ~= nil and dmgSum > prevDamageSum[i] + 0.01
     prevDamageSum[i] = dmgSum
     local speedDrop = prevSpeedKmh[i] and (prevSpeedKmh[i] - car.speedKmh) or 0
     prevSpeedKmh[i] = car.speedKmh
     local hardImpact = speedDrop >= COLLISION_SPEED_DROP_KMH
-    c.is_colliding = ((collisionFlags[i] or dmgJumped) and hardImpact) and 1 or 0
+    local isColliding = ((collisionFlags[i] or dmgJumped) and hardImpact) == true
     collisionFlags[i] = false
 
     local upY = car.up.y
@@ -656,13 +610,56 @@ local function updateTelemetry()
       ac.log(string.format('Car #%d rollover %s (up.y=%.2f)', i, rolledOver and 'STARTED' or 'ENDED', upY))
       rolloverState[i] = rolledOver
     end
-    c.is_rolled_over = rolledOver and 1 or 0
-
-    writeWchar(c.driver_name, car:driverName(), 64)
-    writeWchar(c.team_name, ac.getDriverTeam(i), 64)
+    cars[#cars + 1] = {
+      car_id = i,
+      session_id = car.sessionID,
+      position = car.racePosition,
+      normalized_spline_pos = car.splinePosition,
+      speed_kmh = car.speedKmh,
+      lap_time = car.lapTimeMs,
+      best_lap = car.bestLapTimeMs,
+      last_lap = car.previousLapTimeMs,
+      lap_count = car.lapCount,
+      is_in_pit = car.isInPitlane == true,
+      is_connected = car.isConnected == true,
+      is_colliding = isColliding,
+      is_rolled_over = rolledOver,
+      driver_name = car:driverName() or '',
+      team_name = ac.getDriverTeam(i) or '',
+    }
   end
 
-  telemPage.packet_id = telemPage.packet_id + 1
+  packetID = packetID + 1
+  local payload = {
+    version = PROTOCOL_VERSION,
+    type = 'telemetry',
+    packet_id = packetID,
+    car_count = #cars,
+    focused_car = sim.focusedCar,
+    current_camera = cspCameraToCustom(sim.cameraMode),
+    car_cameras_count = focusedCar and focusedCar.carCamerasCount or 0,
+    current_car_camera = sim.carCameraIndex,
+    track_length = sim.trackLengthM,
+    session_type = (sim.raceSessionType == ac.SessionType.Race) and 1 or 0,
+    session_index = sessionIndex,
+    session_type_raw = sessionTypeRaw,
+    session_gen = sessionGen,
+    session_name = ac.getSessionName(sessionIndex) or '',
+    is_replay = sim.isReplayActive == true,
+    replay_frame = sim.replayCurrentFrame,
+    replay_frames = sim.replayFrames,
+    replay_frame_ms = sim.replayFrameMs,
+    replay_last_result = replayLastResult,
+    is_replay_only = sim.isReplayOnlyMode == true,
+    replay_file = ac.getReplayFilename() or '',
+    -- Where AC keeps the per-session .acreplay it is recording right now. The
+    -- web server pairs its event journal to that file by name.
+    replay_temp_dir = ac.getFolder(ac.FolderID.ReplaysTemp) or '',
+    timetable_url = timetableURL,
+    cars = cars,
+  }
+  local ok, encoded = pcall(JSON.stringify, payload)
+  if ok then pcall(ipcSocket, encoded) end
 end
 
 ---------------------------------------------------------------------

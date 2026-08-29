@@ -21,6 +21,10 @@ local function loadRemote(isReplayActive)
   local seekCalls = {}
   local renderCalls = {}
   local mmapCount = 0
+  local socketURL = nil
+  local socketParams = nil
+  local socketCallback = nil
+  local telemetryPayloads = {}
   local sim = {
     isReplayActive = isReplayActive,
     isReplayOnlyMode = false,
@@ -29,8 +33,29 @@ local function loadRemote(isReplayActive)
     carCameraIndex = 0,
     replayFrames = 1000,
     replayFrameMs = 60,
+    replayCurrentFrame = 100,
+    carsCount = 1,
+    trackLengthM = 5000,
+    currentSessionIndex = 0,
+    raceSessionType = 3,
     windowWidth = 1920,
     windowHeight = 1080,
+  }
+  local car = {
+    sessionID = 18,
+    racePosition = 1,
+    splinePosition = 0.5,
+    speedKmh = 120,
+    lapTimeMs = 50000,
+    bestLapTimeMs = 100000,
+    previousLapTimeMs = 101000,
+    lapCount = 3,
+    isInPitlane = false,
+    isConnected = true,
+    damage = { [0] = 0, 0, 0, 0, 0 },
+    up = { y = 1 },
+    carCamerasCount = 3,
+    driverName = function() return 'Alex Driver' end,
   }
 
   package.preload.ffi = function()
@@ -61,11 +86,27 @@ local function loadRemote(isReplayActive)
       renderCalls[#renderCalls + 1] = params
     end,
   }
+  _G.JSON = {
+    stringify = function(value)
+      telemetryPayloads[#telemetryPayloads + 1] = value
+      return 'encoded telemetry'
+    end,
+    parse = function(value) return value end,
+  }
+  _G.web = {
+    socket = function(url, callback, params)
+      socketURL = url
+      socketCallback = callback
+      socketParams = params
+      return function() end
+    end,
+  }
   _G.ac = {
     CameraMode = {
       Track = 1, Cockpit = 2, Helicopter = 3, Car = 4, OnBoardFree = 5,
       Drivable = 6, Free = 7,
     },
+    SessionType = { Race = 3 },
     FolderID = { ReplaysTemp = 1 },
     INIConfig = {
       scriptSettings = function()
@@ -73,6 +114,13 @@ local function loadRemote(isReplayActive)
       end,
     },
     getSim = function() return sim end,
+    getCar = function() return car end,
+    getSessionName = function() return 'Race' end,
+    getReplayFilename = function() return '' end,
+    getFolder = function() return 'C:/AC/replay/temp' end,
+    getServerIP = function() return '' end,
+    getServerPortHTTP = function() return -1 end,
+    getDriverTeam = function() return 'PRO 7 | Team' end,
     writeMemoryMappedFile = function()
       mmapCount = mmapCount + 1
       return mmapCount == 1 and telemetry or commands
@@ -103,6 +151,11 @@ local function loadRemote(isReplayActive)
     toggleCalls = toggleCalls,
     seekCalls = seekCalls,
     renderCalls = renderCalls,
+    mmapCount = function() return mmapCount end,
+    socketURL = function() return socketURL end,
+    socketParams = function() return socketParams end,
+    telemetryPayloads = telemetryPayloads,
+    deliver = function(message) socketCallback(message) end,
     update = function(dt) script.update(dt or 0) end,
     setTime = function(value) now = value end,
   }
@@ -135,11 +188,68 @@ end
 
 requestReplay = function(ctx, action)
   ctx.commands.replay_seq = ctx.commands.replay_seq + 1
-  ctx.commands.replay_action = action
-  ctx.commands.replay_rewind_s = 12
-  ctx.commands.target_driver = 4
-  ctx.commands.target_camera = 1
-  ctx.commands.target_car_camera = -1
+  ctx.deliver({
+    version = 1,
+    type = 'replay',
+    replay_seq = ctx.commands.replay_seq,
+    replay_action = action,
+    replay_rewind_s = 12,
+    replay_frame = 0,
+    target_driver = 4,
+    target_camera = 1,
+    target_car_camera = -1,
+  })
+end
+
+local function testWebSocketConnectsToLoopbackWithReconnect()
+  local ctx = loadRemote(false)
+  assertEqual(ctx.socketURL(), 'ws://127.0.0.1:5000/ac-ipc',
+    'the CSP app connects to the local server on its existing port')
+  assertEqual(ctx.socketParams().encoding, 'utf8', 'the socket uses UTF-8 text frames')
+  assertEqual(ctx.socketParams().reconnect, true, 'the socket reconnects automatically')
+  assertEqual(ctx.mmapCount(), 0, 'the app does not create memory-mapped files')
+end
+
+local function testTelemetryUsesVersionedProtocolAtTenHertz()
+  local ctx = loadRemote(false)
+  ctx.update(0.099)
+  assertEqual(#ctx.telemetryPayloads, 0, 'telemetry waits for the 100 ms cadence')
+  ctx.update(0.001)
+  local payload = ctx.telemetryPayloads[1]
+  assertEqual(payload.version, 1, 'telemetry carries protocol version 1')
+  assertEqual(payload.type, 'telemetry', 'telemetry has its message discriminator')
+  assertEqual(payload.car_count, 1, 'telemetry carries the bounded car array')
+  assertEqual(payload.cars[1].session_id, 18, 'telemetry includes remote session IDs')
+  assertEqual(payload.cars[1].driver_name, 'Alex Driver', 'telemetry includes driver names')
+end
+
+local function testCameraCommandsApplyOnceAndMalformedMessagesAreIgnored()
+  local ctx = loadRemote(false)
+  ctx.deliver({
+    version = 1, type = 'command', command_seq = 1,
+    target_driver = 4, target_camera = 1, target_car_camera = -1,
+  })
+  ctx.update()
+  assertEqual(ctx.sim.focusedCar, 4, 'a valid camera command applies')
+
+  ctx.sim.focusedCar = 2
+  ctx.deliver({
+    version = 1, type = 'command', command_seq = 1,
+    target_driver = 5, target_camera = 1, target_car_camera = -1,
+  })
+  ctx.update()
+  assertEqual(ctx.sim.focusedCar, 2, 'a duplicate command sequence is ignored')
+
+  ctx.deliver({
+    version = 2, type = 'command', command_seq = 2,
+    target_driver = 6, target_camera = 1, target_car_camera = -1,
+  })
+  ctx.deliver({
+    version = 1, type = 'command', command_seq = 3,
+    target_driver = 7,
+  })
+  ctx.update()
+  assertEqual(ctx.sim.focusedCar, 2, 'unsupported and malformed commands are ignored')
 end
 
 local function testEnterWaitsUntilScreenIsCovered()
@@ -186,4 +296,7 @@ testEnterWaitsUntilScreenIsCovered()
 testLiveWaitsUntilScreenIsCovered()
 testSeekWithinReplayDoesNotRunAStinger()
 testStingerRendersInScenePassForCleanOutput()
+testWebSocketConnectsToLoopbackWithReconnect()
+testTelemetryUsesVersionedProtocolAtTenHertz()
+testCameraCommandsApplyOnceAndMalformedMessagesAreIgnored()
 print('test_remote_lua.lua: all tests passed')
