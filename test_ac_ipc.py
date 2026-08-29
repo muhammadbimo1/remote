@@ -169,6 +169,22 @@ class ACIPCTransportTest(unittest.TestCase):
         transport.attach(FakeSocket())
         self.assertEqual(transport.connection_generation(), 2)
 
+    def test_latest_snapshot_and_generation_are_read_as_one_state(self):
+        transport = ACIPCTransport()
+        first_socket = FakeSocket()
+        transport.attach(first_socket)
+        transport.ingest(json.dumps(telemetry_message(packet_id=7)),
+                         source=first_socket)
+
+        snapshot, generation = transport.latest_with_generation()
+        self.assertEqual(snapshot.packet_id, 7)
+        self.assertEqual(generation, 1)
+
+        transport.attach(FakeSocket())
+        snapshot, generation = transport.latest_with_generation()
+        self.assertIsNone(snapshot)
+        self.assertEqual(generation, 2)
+
     def test_detaching_displaced_socket_does_not_clear_new_socket(self):
         transport = ACIPCTransport()
         old_socket = FakeSocket()

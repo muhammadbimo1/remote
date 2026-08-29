@@ -273,6 +273,17 @@ class EventJournal:
             self._session_started_at = started_at
             self._session_letter = letter
 
+    def end_session(self):
+        """Forget the active AC run without modifying its journal file."""
+        with self._lock:
+            self._path = None
+            self._count = 0
+            self._label = None
+            self._replay_dir = None
+            self._replay_file = None
+            self._session_started_at = None
+            self._session_letter = None
+
     def append(self, event, context=None):
         """Write one event. Returns the record written, or None on failure.
 

@@ -587,6 +587,17 @@ class DisconnectStateResetTest(unittest.TestCase):
         with remote_web._resync_lock:
             self.assertEqual(remote_web.progress_offsets, {})
 
+    def test_mark_is_rejected_without_fresh_ac_telemetry(self):
+        with patch.object(remote_web.ac_transport, 'is_connected',
+                          return_value=False), \
+                patch.object(remote_web.event_log, 'mark') as mark, \
+                patch.object(remote_web, 'record_event') as record, \
+                patch.object(remote_web, 'emit'):
+            remote_web.handle_mark_event()
+
+        mark.assert_not_called()
+        record.assert_not_called()
+
 
 class ReviewModeTest(unittest.TestCase):
     def tearDown(self):

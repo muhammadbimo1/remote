@@ -12,11 +12,16 @@ class AutoDirector:
 
     def __init__(self):
         self.enabled = False
+        self.max_idle_dwell = 45.0        # no-action shots can breathe before rotating
+        self.debug = False
+        self.reset_run_state()
+
+    def reset_run_state(self):
+        """Clear observations and timing that belong to the previous AC run."""
         self.current_focus = None        # car_id currently shown
         self.focus_start = 0.0           # when we cut to current car
         self.last_cut_time = 0.0
         self.min_dwell = 24.0             # current min dwell (varies by reason)
-        self.max_idle_dwell = 45.0        # no-action shots can breathe before rotating
 
         # Previous frame state (keyed by car_id)
         self.prev_positions = {}
@@ -44,8 +49,6 @@ class AutoDirector:
         self.last_shown = {}               # {car_id: monotonic_time}
         self.endurance_mode = False
 
-        # Debug logging (toggled at runtime via web UI)
-        self.debug = False
         self._last_debug_log = 0.0
 
     def tick(self, cars, track_length):

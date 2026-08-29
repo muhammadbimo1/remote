@@ -39,6 +39,18 @@ class EventJournalTest(unittest.TestCase):
         self.journal.append(event())
         self.assertTrue(os.path.isfile(self.journal.path))
 
+    def test_end_session_invalidates_old_journal_association(self):
+        self.journal.start_session('Race')
+        self.journal.append(event())
+        old_path = self.journal.path
+
+        self.journal.end_session()
+
+        self.assertTrue(os.path.isfile(old_path))
+        self.assertIsNone(self.journal.path)
+        self.assertIsNone(self.journal.replay_file)
+        self.assertEqual(self.journal.count, 0)
+
     def test_record_carries_wall_clock_and_driver(self):
         self.journal.append(event())
         record = self._lines(self.journal.path)[0]

@@ -547,8 +547,11 @@ def reset_ac_run_state():
     dropped = len(event_log.snapshot())
     event_log.clear()
     event_log.window_s = EventLog.BUFFER_S
+    event_journal.end_session()
     with _resync_lock:
         progress_offsets.clear()
+    with director_lock:
+        director.reset_run_state()
     _prev_rollover_state.clear()
     _current_session = None
     _last_live_payload = None
@@ -781,7 +784,7 @@ def monitor_telemetry():
     last_connection_generation = 0
 
     while True:
-        telem = read_telemetry()
+        telem, connection_generation = ac_transport.latest_with_generation()
         if telem is None:
             if ac_connected:
                 publish_focused_highlight(None)
@@ -794,7 +797,6 @@ def monitor_telemetry():
             time.sleep(0.1)
             continue
 
-        connection_generation = ac_transport.connection_generation()
         if connection_generation != last_connection_generation:
             if last_connection_generation != 0 and ac_connected:
                 publish_focused_highlight(None)
@@ -994,6 +996,10 @@ def handle_go_live():
 @socketio.on('mark_event')
 def handle_mark_event():
     """Drop a marker on the focused car with no detection involved."""
+    if not ac_transport.is_connected():
+        emit('replay_status', {
+            'ok': False, 'error': 'AC telemetry is disconnected'})
+        return
     name = ''
     if _last_live_payload:
         for d in _last_live_payload.get('drivers', []):

@@ -224,6 +224,12 @@ class ACIPCTransport(object):
         with self._lock:
             return self._latest if self._fresh_locked() else None
 
+    def latest_with_generation(self):
+        """Return one coherent view of telemetry and socket generation."""
+        with self._lock:
+            snapshot = self._latest if self._fresh_locked() else None
+            return snapshot, self._generation
+
     def is_connected(self):
         with self._lock:
             return self._fresh_locked()

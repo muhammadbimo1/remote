@@ -65,5 +65,50 @@ class AutoDirectorIdleModeTest(unittest.TestCase):
             )
 
 
+class AutoDirectorRunResetTest(unittest.TestCase):
+    def test_reset_clears_run_state_but_preserves_operator_settings(self):
+        director = AutoDirector()
+        director.enabled = True
+        director.debug = True
+        director.current_focus = 9
+        director.focus_start = 12.0
+        director.last_cut_time = 13.0
+        director.prev_positions = {9: 1}
+        director.prev_class_positions = {9: 1}
+        director.prev_in_pit = {9: False}
+        director.prev_best_lap = {9: 90000}
+        director.collision_seen = {9: 14.0}
+        director.position_change_seen = {9: 14.0}
+        director.class_position_change_seen = {9: 14.0}
+        director.fast_lap_seen = {9: 14.0}
+        director.rollover_active = {9: 14.0}
+        director.class_best_laps = {'GT3': 90000}
+        director.last_class_leader_shown = {'GT3': 14.0}
+        director.overall_best_lap = 90000
+        director.last_leader_show = 14.0
+        director.last_shown = {9: 14.0}
+        director.endurance_mode = True
+        director._last_debug_log = 14.0
+
+        director.reset_run_state()
+
+        self.assertTrue(director.enabled)
+        self.assertTrue(director.debug)
+        self.assertIsNone(director.current_focus)
+        self.assertEqual(director.focus_start, 0.0)
+        self.assertEqual(director.last_cut_time, 0.0)
+        for value in (
+                director.prev_positions, director.prev_class_positions,
+                director.prev_in_pit, director.prev_best_lap,
+                director.collision_seen, director.position_change_seen,
+                director.class_position_change_seen, director.fast_lap_seen,
+                director.rollover_active, director.class_best_laps,
+                director.last_class_leader_shown, director.last_shown):
+            self.assertEqual(value, {})
+        self.assertEqual(director.overall_best_lap, 0)
+        self.assertEqual(director.last_leader_show, 0.0)
+        self.assertFalse(director.endurance_mode)
+        self.assertEqual(director._last_debug_log, 0.0)
+
 if __name__ == "__main__":
     unittest.main()
