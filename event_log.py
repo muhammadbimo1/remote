@@ -113,10 +113,10 @@ class EventLog:
 
         return new_events
 
-    def mark(self, car_id, name='', car_number=None):
+    def mark(self, car_id, name=''):
         """Operator-triggered marker on the currently focused car."""
         now = self._clock()
-        car = {'car_id': car_id, 'display_name': name, 'car_number': car_number}
+        car = {'car_id': car_id, 'display_name': name}
         return self._add(now, 'mark', car, cooldown=self.MARK_COOLDOWN_S)
 
     def _add(self, now, kind, car, cooldown=None):
@@ -134,7 +134,6 @@ class EventLog:
                 'kind': kind,
                 'label': self.KIND_LABELS.get(kind, kind.upper()[:3]),
                 'car_id': cid,
-                'car_number': car.get('car_number'),
                 'name': car.get('display_name') or car.get('name') or '',
                 't': now,
             }

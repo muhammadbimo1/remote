@@ -20,7 +20,7 @@ class TeamNamePayloadTest(unittest.TestCase):
         car.speed_kmh = 120.0
         car.lap_count = 3
         car.is_connected = 1
-        car.driver_name = "23 | Alex Driver"
+        car.driver_name = "Alex Driver"
         car.team_name = "Blue Arrow Racing"
 
         data = build_update_data(telem)
@@ -47,19 +47,8 @@ class TeamNamePayloadTest(unittest.TestCase):
         self.assertEqual(remote_web.get_car_class("AM 51 | Team C"), ("AM", "#e69138"))
 
 
-class CarNumberTest(unittest.TestCase):
-    def test_car_number_comes_from_name_prefix(self):
-        self.assertEqual(remote_web._parse_driver_name("23 | Alex Driver"),
-                         (23, "Alex Driver"))
-
-    def test_car_number_is_none_without_a_numeric_prefix(self):
-        cases = ["Alex Driver", "Alex | Driver", " | Alex Driver"]
-        for raw_name in cases:
-            with self.subTest(raw_name=raw_name):
-                car_number, _ = remote_web._parse_driver_name(raw_name)
-                self.assertIsNone(car_number)
-
-    def test_payload_car_number_is_null_and_not_the_slot_index(self):
+class DriverNameTest(unittest.TestCase):
+    def test_driver_name_is_passed_through_unchanged(self):
         telem = TelemetryPage()
         telem.car_count = 1
         telem.track_length = 5000.0
@@ -68,11 +57,12 @@ class CarNumberTest(unittest.TestCase):
         car.car_id = 4
         car.position = 1
         car.is_connected = 1
-        car.driver_name = "Unnumbered Driver"
+        car.driver_name = "23 | Alex Driver"
 
         driver = build_update_data(telem)["drivers"][0]
 
-        self.assertIsNone(driver["car_number"])
+        self.assertEqual(driver["name"], "23 | Alex Driver")
+        self.assertNotIn("car_number", driver)
         self.assertEqual(driver["num"], 5)
 
 
@@ -511,7 +501,7 @@ class ReviewModeTest(unittest.TestCase):
             'replay_file': 'x', 'session': {'file': 'AC_1.jsonl'},
             'manual': False,
             'events': [{'id': 1, 'kind': 'collision', 'label': 'HIT',
-                        'car_id': 0, 'car_number': 23, 'name': 'A', 't': 1.0,
+                        'car_id': 0, 'name': 'A', 't': 1.0,
                         'age': 0, 'frame': 400, 'seek_s': 10.0}],
         }
         telem = TelemetryPage()

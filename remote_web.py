@@ -201,31 +201,12 @@ def get_car_class(team_name):
 def _parse_team_name(team_name):
     """Strip the "CLASS 42 | " prefix, leaving just the team.
 
-    The class and the race number are already rendered as their own badge and
-    number on the card, so repeating them in the team line only eats width.
-    Names without a pipe are passed through unchanged.
+    The class is already rendered as its own badge, so repeating the prefix in
+    the team line only eats width. Names without a pipe are passed through.
     """
     if not team_name or '|' not in team_name:
         return team_name
     return team_name.split('|', 1)[1].strip()
-
-
-def _parse_driver_name(raw_name):
-    """Parse the "NN | Driver Name" mmap format. Returns (car_number, display_name).
-    The name prefix is the only source of truth for the race number: car_number is
-    None when the prefix is missing or non-numeric, never the car slot index."""
-    parts = raw_name.split('|', 1)
-    if len(parts) == 2:
-        try:
-            car_number = int(parts[0].strip())
-        except ValueError:
-            car_number = None
-        display_name = parts[1].strip()
-    else:
-        car_number = None
-        display_name = raw_name
-    return car_number, display_name
-
 
 
 def open_telemetry_mmap():
@@ -336,14 +317,12 @@ def compute_gaps(telem):
 
         raw_name = c.driver_name
         team_name = c.team_name
-        car_number, display_name = _parse_driver_name(raw_name)
 
         cls_name, cls_color = get_car_class(team_name)
 
         cars.append({
             'car_id': c.car_id,
-            'car_number': car_number,
-            'display_name': display_name,
+            'display_name': raw_name,
             'team_name': _parse_team_name(team_name),
             'car_class': cls_name,
             'class_color': cls_color,
@@ -624,7 +603,6 @@ def build_update_data(telem, cars_with_gaps=None):
             'name': c.get('display_name', c['name']),
             'team_name': c.get('team_name', ''),
             'num': c['car_id'] + 1,
-            'car_number': c.get('car_number'),
             'car_class': c.get('car_class', 'Unclassed'),
             'class_color': c.get('class_color', '#999'),
             'class_position': c.get('class_position', c['position']),
@@ -749,7 +727,6 @@ def _review_event_from_record(record, index, default_frame_ms):
         'kind': record.get('kind'),
         'label': record.get('label'),
         'car_id': record.get('car_id'),
-        'car_number': record.get('car_number'),
         'name': record.get('driver') or '',
         't': record.get('t'),
         'age': 0,
@@ -1070,14 +1047,12 @@ def handle_go_live():
 def handle_mark_event():
     """Drop a marker on the focused car with no detection involved."""
     name = ''
-    number = None
     if _last_live_payload:
         for d in _last_live_payload.get('drivers', []):
             if d['num'] - 1 == latest_focused_car:
                 name = d.get('name', '')
-                number = d.get('car_number')
                 break
-    event = event_log.mark(latest_focused_car, name=name, car_number=number)
+    event = event_log.mark(latest_focused_car, name=name)
     record_event(event)
     emit('events', {'events': event_log.snapshot()}, broadcast=True)
     if event:
@@ -1201,12 +1176,6 @@ def index():
 
             function setPressed(el, on) {
                 if (el) el.setAttribute('aria-pressed', on ? 'true' : 'false');
-            }
-
-            // Race number comes only from the "NN | Name" prefix; there is no
-            // slot-index fallback, so an unnumbered entry renders as '--'.
-            function formatCarNumber(carNumber) {
-                return (carNumber === null || carNumber === undefined) ? '--' : '#' + carNumber;
             }
 
             // Timetable sync had a colour-coded dot. With one hue available the
@@ -1363,8 +1332,7 @@ def index():
 
                 var html = '';
                 visible.forEach(function(ev) {
-                    var who = escapeHtml(formatCarNumber(ev.car_number));
-                    if (ev.name) who += ' ' + escapeHtml(ev.name);
+                    var who = ev.name ? escapeHtml(ev.name) : '--';
                     // Review events carry a replay seek position, not a live
                     // age; the leading sign tells the two apart at a glance.
                     var ageHtml = (ev.seek_s != null)
@@ -1569,11 +1537,11 @@ def index():
                     return;
                 }
 
-                // Resolve focused car number for the header chip
+                // Resolve the focused driver for the header chip.
                 var focusLabel = '--';
                 for (var i = 0; i < data.drivers.length; i++) {
                     if (data.drivers[i].num - 1 === data.current_driver) {
-                        focusLabel = formatCarNumber(data.drivers[i].car_number);
+                        focusLabel = escapeHtml(data.drivers[i].name || '--');
                         break;
                     }
                 }
@@ -1659,7 +1627,6 @@ def index():
 
                         grid += '<div class="driver-info">';
                         grid += '<span class="pos">' + d.position + '</span>';
-                        grid += '<span class="num">' + escapeHtml(formatCarNumber(d.car_number)) + '</span>';
                         grid += '<span class="name">' + escapeHtml(d.name) + '</span>';
                         grid += '<span class="right">';
                         // No ON AIR badge: the focused car already carries the

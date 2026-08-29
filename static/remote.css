@@ -588,12 +588,11 @@ body {
     border-color: var(--rm-fill);
 }
 
-/* --- Card row 1: position, number, name, badges ---
+/* --- Card row 1: position, name, badges ---
 
    Every row starts hard against the same left edge — position, team and Gap all
    line up, and nothing is indented under anything else. The position column is
-   the one fixed-width element: two digits, right-aligned, so P1 and P24 put the
-   car number in the same place on every card in the grid. */
+   the one fixed-width element: two digits and right-aligned. */
 .driver-info {
     display: flex;
     align-items: baseline;
@@ -612,13 +611,6 @@ body {
     text-shadow: var(--glow-text);
 }
 
-.driver-info .num {
-    font-size: var(--type-small);
-    color: var(--ink-dim);
-    font-variant-numeric: tabular-nums;
-    flex: 0 0 auto;
-}
-
 .driver-info .name {
     font-size: var(--type-body);
     line-height: 1.05;
@@ -631,9 +623,8 @@ body {
     flex: 1 1 auto;
 }
 
-/* Own row, full card width. The class and race number that used to prefix this
-   string are stripped server-side (_parse_team_name) — they are already the
-   badge on the right and the number on the left. */
+/* Own row, full card width. The upstream class/number prefix is stripped
+   server-side (_parse_team_name); the class already has a badge on the right. */
 .team-name {
     font-family: var(--font-micro);
     font-size: var(--type-micro);

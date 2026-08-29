@@ -23,7 +23,6 @@ def car(car_id, position=1, **kw):
         'is_colliding': 0,
         'is_rolled_over': 0,
         'display_name': 'Driver {}'.format(car_id),
-        'car_number': 10 + car_id,
     }
     base.update(kw)
     return base
@@ -130,10 +129,10 @@ class MarkTest(unittest.TestCase):
         self.log = EventLog(clock=self.clock)
 
     def test_mark_logs_immediately(self):
-        event = self.log.mark(3, name='Alex Driver', car_number=23)
+        event = self.log.mark(3, name='Alex Driver')
         self.assertEqual(event['kind'], 'mark')
         self.assertEqual(event['label'], 'MRK')
-        self.assertEqual(event['car_number'], 23)
+        self.assertNotIn('car_number', event)
 
     def test_double_tap_is_swallowed(self):
         self.log.mark(3)

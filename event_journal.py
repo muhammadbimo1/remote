@@ -327,7 +327,6 @@ class EventJournal:
             'kind': event.get('kind'),
             'label': event.get('label'),
             'car_id': event.get('car_id'),
-            'car_number': event.get('car_number'),
             'driver': event.get('name'),
         }
         if self._replay_file:

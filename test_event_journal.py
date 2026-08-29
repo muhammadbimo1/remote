@@ -15,7 +15,6 @@ def event(**kw):
         'kind': 'collision',
         'label': 'HIT',
         'car_id': 7,
-        'car_number': 23,
         'name': 'Alex Driver',
         't': 1754600000.5,
     }
@@ -45,7 +44,7 @@ class EventJournalTest(unittest.TestCase):
         record = self._lines(self.journal.path)[0]
 
         self.assertEqual(record['kind'], 'collision')
-        self.assertEqual(record['car_number'], 23)
+        self.assertNotIn('car_number', record)
         self.assertEqual(record['driver'], 'Alex Driver')
         self.assertEqual(record['t'], 1754600000.5)
         self.assertIn('iso', record)
