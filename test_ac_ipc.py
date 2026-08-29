@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 import unittest
 
 from ac_ipc import ACIPCTransport, MAX_CARS, ProtocolError, TelemetrySnapshot
@@ -105,6 +107,15 @@ class TelemetrySnapshotTest(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             TelemetrySnapshot.from_message(telemetry_message([car]))
 
+    def test_published_snapshots_cannot_be_mutated(self):
+        snapshot = TelemetrySnapshot.from_message(
+            telemetry_message([car_message()]))
+
+        with self.assertRaises(AttributeError):
+            snapshot.focused_car = 7
+        with self.assertRaises(AttributeError):
+            snapshot.cars[0].position = 9
+
 
 class ACIPCTransportTest(unittest.TestCase):
     def test_ingest_replaces_latest_snapshot_atomically(self):
@@ -150,6 +161,14 @@ class ACIPCTransportTest(unittest.TestCase):
         self.assertTrue(old_socket.closed)
         self.assertFalse(new_socket.closed)
 
+    def test_each_attached_socket_starts_a_new_connection_generation(self):
+        transport = ACIPCTransport()
+        self.assertEqual(transport.connection_generation(), 0)
+        transport.attach(FakeSocket())
+        self.assertEqual(transport.connection_generation(), 1)
+        transport.attach(FakeSocket())
+        self.assertEqual(transport.connection_generation(), 2)
+
     def test_detaching_displaced_socket_does_not_clear_new_socket(self):
         transport = ACIPCTransport()
         old_socket = FakeSocket()
@@ -176,7 +195,7 @@ class ACIPCTransportTest(unittest.TestCase):
         self.assertEqual(socket.sent[-1]['replay_seq'], 1)
 
     def test_command_and_replay_payloads_are_versioned(self):
-        transport = ACIPCTransport()
+        transport = ACIPCTransport(connection_id='server-a')
         socket = FakeSocket()
         transport.attach(socket)
 
@@ -185,11 +204,13 @@ class ACIPCTransportTest(unittest.TestCase):
 
         self.assertEqual(socket.sent[0], {
             'version': 1, 'type': 'command', 'command_seq': 1,
+            'connection_id': 'server-a',
             'target_driver': 4, 'target_camera': 4,
             'target_car_camera': 2,
         })
         self.assertEqual(socket.sent[1], {
             'version': 1, 'type': 'replay', 'replay_seq': 1,
+            'connection_id': 'server-a',
             'replay_action': 3, 'replay_rewind_s': 0.0,
             'replay_frame': 200, 'target_driver': -1,
             'target_camera': -1, 'target_car_camera': -1,
@@ -204,6 +225,38 @@ class ACIPCTransportTest(unittest.TestCase):
 
         self.assertTrue(socket.closed)
         self.assertFalse(transport.has_socket())
+
+    def test_concurrent_commands_are_sent_in_sequence_order(self):
+        class GateInt(object):
+            def __init__(self, entered, release):
+                self.entered = entered
+                self.release = release
+
+            def __int__(self):
+                self.entered.set()
+                self.release.wait(2)
+                return 1
+
+        entered = threading.Event()
+        release = threading.Event()
+        transport = ACIPCTransport()
+        socket = FakeSocket()
+        transport.attach(socket)
+        first = threading.Thread(target=transport.send_command,
+                                 args=(GateInt(entered, release), 1, -1))
+        second = threading.Thread(target=transport.send_command,
+                                  args=(2, 1, -1))
+
+        first.start()
+        self.assertTrue(entered.wait(1))
+        second.start()
+        time.sleep(0.02)
+        release.set()
+        first.join(2)
+        second.join(2)
+
+        self.assertEqual([m['command_seq'] for m in socket.sent], [1, 2])
+        self.assertEqual([m['target_driver'] for m in socket.sent], [1, 2])
 
 
 if __name__ == '__main__':

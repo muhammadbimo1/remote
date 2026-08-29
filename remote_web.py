@@ -537,6 +537,31 @@ def timetable_poll_loop():
 _prev_rollover_state = {}
 
 
+def reset_ac_run_state():
+    """Drop every cache whose identity or timestamps belong to one AC run."""
+    global _current_session, _last_live_payload, _latest_replay_context
+    global _latest_cars_by_id, review_journal
+    global latest_focused_car, latest_current_camera
+    global latest_current_car_camera, latest_replay_file
+
+    dropped = len(event_log.snapshot())
+    event_log.clear()
+    event_log.window_s = EventLog.BUFFER_S
+    with _resync_lock:
+        progress_offsets.clear()
+    _prev_rollover_state.clear()
+    _current_session = None
+    _last_live_payload = None
+    _latest_replay_context = {}
+    _latest_cars_by_id = {}
+    review_journal = None
+    latest_focused_car = 0
+    latest_current_camera = 0
+    latest_current_car_camera = 0
+    latest_replay_file = ''
+    return dropped
+
+
 def build_update_data(telem, cars_with_gaps=None):
     """Build the SocketIO update payload from telemetry."""
     if cars_with_gaps is None:
@@ -753,34 +778,36 @@ def monitor_telemetry():
     global review_journal
 
     last_packet_id = -1
+    last_connection_generation = 0
 
     while True:
         telem = read_telemetry()
         if telem is None:
             if ac_connected:
                 publish_focused_highlight(None)
+                dropped = reset_ac_run_state()
                 ac_connected = False
                 socketio.emit('update', {
-                    'ac_connected': False, 'drivers': []})
-                print('[remote_web] AC telemetry disconnected')
+                    'ac_connected': False, 'drivers': [], 'events': []})
+                print('[remote_web] AC telemetry disconnected '
+                      '({} events dropped)'.format(dropped))
             time.sleep(0.1)
             continue
+
+        connection_generation = ac_transport.connection_generation()
+        if connection_generation != last_connection_generation:
+            if last_connection_generation != 0 and ac_connected:
+                publish_focused_highlight(None)
+                dropped = reset_ac_run_state()
+                print('[remote_web] AC WebSocket replaced '
+                      '({} events dropped)'.format(dropped))
+            last_connection_generation = connection_generation
+            last_packet_id = -1
 
         if not ac_connected:
             ac_connected = True
             last_packet_id = -1
-            # Stale offsets must not survive an AC restart — car_ids are reused.
-            with _resync_lock:
-                progress_offsets.clear()
-            # Same reasoning for the event log, and its timestamps point into a
-            # replay buffer that no longer exists. Logged because from the
-            # panel this looks identical to events ageing out of the window.
-            dropped = len(event_log.snapshot())
-            # Forget the session so the next tick rotates the journal with a
-            # fresh label rather than appending a new AC run to the old file.
-            _current_session = None
-            print('[remote_web] AC telemetry connected '
-                  '({} events pending drop)'.format(dropped))
+            print('[remote_web] AC telemetry connected')
 
         if telem.packet_id != last_packet_id:
             last_packet_id = telem.packet_id
@@ -1032,6 +1059,8 @@ def handle_ac_ipc():
             except TimeoutError:
                 continue
             if raw is None:
+                if getattr(websocket, 'connected', True):
+                    continue
                 break
             try:
                 ac_transport.ingest(raw, source=websocket)

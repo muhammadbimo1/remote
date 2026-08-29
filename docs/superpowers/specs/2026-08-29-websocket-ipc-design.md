@@ -103,6 +103,7 @@ protection is no longer needed because each WebSocket message is atomic.
 ```json
 {
   "version": 1,
+  "connection_id": "6b71930ce8a64f31978da36ec260de65",
   "type": "command",
   "command_seq": 12,
   "target_driver": 4,
@@ -116,6 +117,7 @@ protection is no longer needed because each WebSocket message is atomic.
 ```json
 {
   "version": 1,
+  "connection_id": "6b71930ce8a64f31978da36ec260de65",
   "type": "replay",
   "replay_seq": 8,
   "replay_action": 1,
@@ -130,6 +132,11 @@ protection is no longer needed because each WebSocket message is atomic.
 Camera and replay counters remain separate. Replay messages never synthesize a
 camera command or increment `command_seq`, preserving the rule that the replay
 transition parks and later reapplies the requested shot.
+
+Python creates a new opaque `connection_id` on every server start and includes
+it in both outgoing message types. Lua resets its receive-side sequence state
+when that ID changes, so the first command after a Python restart cannot collide
+with the previous server process's last sequence number.
 
 ## Python Transport Boundary
 

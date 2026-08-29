@@ -17,6 +17,8 @@ Lua and Python exchange UTF-8 JSON objects with `version = 1` and a `type` discr
 - **Camera commands** (`type = "command"`): Python sends, Lua receives. New command detected by `command_seq` change.
 - **Replay commands** (`type = "replay"`): Python sends, Lua receives. New action detected by the independent `replay_seq` counter.
 
+Each Python process creates a new `connection_id` and includes it in camera and replay messages. Lua resets both receive-side sequence counters when that ID changes; do not remove this epoch or the first command after a Python restart can collide with the previous process's last sequence number.
+
 Only `/ac-ipc` is restricted to the actual loopback peer (`127.0.0.1` or `::1`); never use forwarded headers for that decision. The rest of port 5000 must remain reachable from other devices on the same network. CSP is the WebSocket client and Python is the server. Telemetry is stale after 2 seconds, and either side must recover when the other restarts.
 
 Camera IDs use a custom 1-5 numbering (Track, Cockpit, Helicopter, Car/F6, Free) mapped to/from `ac.CameraMode` enums in Lua.

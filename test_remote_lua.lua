@@ -176,6 +176,7 @@ end
 requestReplay = function(ctx, action)
   ctx.deliver({
     version = 1,
+    connection_id = 'server-a',
     type = 'replay',
     replay_seq = ctx.nextReplaySeq(),
     replay_action = action,
@@ -212,6 +213,7 @@ local function testCameraCommandsApplyOnceAndMalformedMessagesAreIgnored()
   local ctx = loadRemote(false)
   ctx.deliver({
     version = 1, type = 'command', command_seq = 1,
+    connection_id = 'server-a',
     target_driver = 4, target_camera = 1, target_car_camera = -1,
   })
   ctx.update()
@@ -220,6 +222,7 @@ local function testCameraCommandsApplyOnceAndMalformedMessagesAreIgnored()
   ctx.sim.focusedCar = 2
   ctx.deliver({
     version = 1, type = 'command', command_seq = 1,
+    connection_id = 'server-a',
     target_driver = 5, target_camera = 1, target_car_camera = -1,
   })
   ctx.update()
@@ -227,14 +230,34 @@ local function testCameraCommandsApplyOnceAndMalformedMessagesAreIgnored()
 
   ctx.deliver({
     version = 2, type = 'command', command_seq = 2,
+    connection_id = 'server-a',
     target_driver = 6, target_camera = 1, target_car_camera = -1,
   })
   ctx.deliver({
     version = 1, type = 'command', command_seq = 3,
+    connection_id = 'server-a',
     target_driver = 7,
   })
   ctx.update()
   assertEqual(ctx.sim.focusedCar, 2, 'unsupported and malformed commands are ignored')
+end
+
+local function testNewServerEpochAcceptsAResetSequence()
+  local ctx = loadRemote(false)
+  ctx.deliver({
+    version = 1, connection_id = 'server-a', type = 'command', command_seq = 1,
+    target_driver = 4, target_camera = 1, target_car_camera = -1,
+  })
+  ctx.update()
+  assertEqual(ctx.sim.focusedCar, 4, 'the first server command applies')
+
+  ctx.deliver({
+    version = 1, connection_id = 'server-b', type = 'command', command_seq = 1,
+    target_driver = 6, target_camera = 1, target_car_camera = -1,
+  })
+  ctx.update()
+  assertEqual(ctx.sim.focusedCar, 6,
+    'a replacement server can restart its sequence counter')
 end
 
 local function testEnterWaitsUntilScreenIsCovered()
@@ -284,4 +307,5 @@ testStingerRendersInScenePassForCleanOutput()
 testWebSocketConnectsToLoopbackWithReconnect()
 testTelemetryUsesVersionedProtocolAtTenHertz()
 testCameraCommandsApplyOnceAndMalformedMessagesAreIgnored()
+testNewServerEpochAcceptsAResetSequence()
 print('test_remote_lua.lua: all tests passed')

@@ -16,6 +16,7 @@
 - `/ac-ipc` must accept only actual loopback peers and must not trust forwarded-address headers.
 - The protocol version is exactly `1`; telemetry is capped at 128 cars and stale after 2 seconds.
 - Camera `command_seq` and `replay_seq` remain independent.
+- Camera and replay messages carry a per-Python-process `connection_id`; Lua resets receive-side counters when it changes.
 - Replay toggles continue to flow only through `enterReplay()` and `exitReplay()`.
 - Replay settle timing, leaderboard suppression, pending seek, stinger, and shot holding are behavior-preserving code.
 - Lua code must not invoke shell commands or external tools.
@@ -32,7 +33,7 @@
 **Interfaces:**
 - Produces: `PROTOCOL_VERSION`, `MAX_CARS`, `REPLAY_NONE`, `REPLAY_ENTER`, `REPLAY_LIVE`, and `REPLAY_SEEK_FRAME` constants.
 - Produces: `TelemetrySnapshot.from_message(message)` returning an attribute-based snapshot whose `cars` is a tuple of `CarSnapshot` objects.
-- Produces: `ACIPCTransport(clock=time.monotonic, stale_after=2.0)` with `attach(socket)`, `detach(socket)`, `ingest(raw)`, `latest()`, `is_connected()`, `send_command(...)`, and `send_replay_command(...)`.
+- Produces: `ACIPCTransport(clock=time.monotonic, stale_after=2.0, connection_id=None)` with `attach(socket)`, `detach(socket)`, `ingest(raw)`, `latest()`, `is_connected()`, `send_command(...)`, and `send_replay_command(...)`.
 
 - [ ] **Step 1: Write failing validation tests**
 

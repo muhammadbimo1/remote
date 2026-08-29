@@ -20,6 +20,7 @@ local REPLAY_RESULT_REFUSED = 2
 ---------------------------------------------------------------------
 local lastCommandSeq = 0
 local lastReplaySeq = 0
+local lastConnectionID = nil
 local pendingCommand = nil
 local pendingReplay = nil
 local packetID = 0
@@ -36,18 +37,34 @@ local function onIPCMessage(raw)
     ac.log('Broadcaster IPC ignored malformed JSON')
     return
   end
-  if message.version ~= PROTOCOL_VERSION then return end
+  if message.version ~= PROTOCOL_VERSION then
+    ac.log('Broadcaster IPC ignored unsupported protocol version')
+    return
+  end
+
+  local function acceptConnection()
+    if message.connection_id ~= lastConnectionID then
+      lastConnectionID = message.connection_id
+      lastCommandSeq = 0
+      lastReplaySeq = 0
+      pendingCommand = nil
+      pendingReplay = nil
+    end
+  end
 
   if message.type == 'command' then
-    if not validNumber(message.command_seq)
+    if type(message.connection_id) ~= 'string' or message.connection_id == ''
+        or not validNumber(message.command_seq)
         or not validNumber(message.target_driver)
         or not validNumber(message.target_camera)
         or not validNumber(message.target_car_camera) then
       return
     end
+    acceptConnection()
     pendingCommand = message
   elseif message.type == 'replay' then
-    if not validNumber(message.replay_seq)
+    if type(message.connection_id) ~= 'string' or message.connection_id == ''
+        or not validNumber(message.replay_seq)
         or not validNumber(message.replay_action)
         or not validNumber(message.replay_rewind_s)
         or not validNumber(message.replay_frame)
@@ -56,7 +73,10 @@ local function onIPCMessage(raw)
         or not validNumber(message.target_car_camera) then
       return
     end
+    acceptConnection()
     pendingReplay = message
+  else
+    ac.log('Broadcaster IPC ignored unknown message type')
   end
 end
 

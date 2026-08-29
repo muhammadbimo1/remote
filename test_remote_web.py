@@ -521,7 +521,8 @@ class IPCPeerSecurityTest(unittest.TestCase):
 
         class OneMessageSocket(object):
             def __init__(self):
-                self.messages = [remote_web.json.dumps({
+                self.connected = True
+                self.messages = [None, remote_web.json.dumps({
                     'version': 1, 'type': 'telemetry', 'packet_id': 9,
                     'car_count': 0, 'focused_car': 0, 'current_camera': 1,
                     'car_cameras_count': 0, 'current_car_camera': 0,
@@ -552,6 +553,39 @@ class IPCPeerSecurityTest(unittest.TestCase):
             self.assertEqual(remote_web.handle_ac_ipc(), '')
 
         self.assertEqual(observed_packet_ids, [9])
+
+
+class DisconnectStateResetTest(unittest.TestCase):
+    def test_reset_clears_all_state_that_belongs_to_the_old_ac_run(self):
+        remote_web._current_session = (1, 0, 3)
+        remote_web._last_live_payload = {'drivers': [{'num': 1}]}
+        remote_web._latest_replay_context = {'session': 'Race'}
+        remote_web._latest_cars_by_id = {0: {'car_id': 0}}
+        remote_web.review_journal = {'events': [{'id': 1}]}
+        remote_web.latest_focused_car = 7
+        remote_web.latest_current_camera = 4
+        remote_web.latest_current_car_camera = 2
+        remote_web.latest_replay_file = 'old.acreplay'
+        remote_web._prev_rollover_state[0] = True
+        remote_web.event_log.mark(0, name='Old Driver')
+        with remote_web._resync_lock:
+            remote_web.progress_offsets[0] = 3.0
+
+        remote_web.reset_ac_run_state()
+
+        self.assertIsNone(remote_web._current_session)
+        self.assertIsNone(remote_web._last_live_payload)
+        self.assertEqual(remote_web._latest_replay_context, {})
+        self.assertEqual(remote_web._latest_cars_by_id, {})
+        self.assertIsNone(remote_web.review_journal)
+        self.assertEqual(remote_web.latest_focused_car, 0)
+        self.assertEqual(remote_web.latest_current_camera, 0)
+        self.assertEqual(remote_web.latest_current_car_camera, 0)
+        self.assertEqual(remote_web.latest_replay_file, '')
+        self.assertEqual(remote_web._prev_rollover_state, {})
+        self.assertEqual(remote_web.event_log.snapshot(), [])
+        with remote_web._resync_lock:
+            self.assertEqual(remote_web.progress_offsets, {})
 
 
 class ReviewModeTest(unittest.TestCase):

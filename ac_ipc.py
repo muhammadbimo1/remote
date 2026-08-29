@@ -3,6 +3,7 @@
 import json
 import threading
 import time
+import uuid
 
 
 PROTOCOL_VERSION = 1
@@ -52,7 +53,21 @@ def _string(message, name):
     return value
 
 
-class CarSnapshot(object):
+class _FrozenSnapshot(object):
+    __slots__ = ('_frozen',)
+
+    def __setattr__(self, name, value):
+        if getattr(self, '_frozen', False):
+            raise AttributeError('{} is immutable'.format(
+                type(self).__name__))
+        object.__setattr__(self, name, value)
+
+    def _freeze(self):
+        object.__setattr__(self, '_frozen', True)
+        return self
+
+
+class CarSnapshot(_FrozenSnapshot):
     __slots__ = (
         'car_id', 'session_id', 'position', 'normalized_spline_pos',
         'speed_kmh', 'lap_time', 'best_lap', 'last_lap', 'lap_count',
@@ -75,10 +90,10 @@ class CarSnapshot(object):
             setattr(result, name, _boolean(message, name))
         result.driver_name = _string(message, 'driver_name')
         result.team_name = _string(message, 'team_name')
-        return result
+        return result._freeze()
 
 
-class TelemetrySnapshot(object):
+class TelemetrySnapshot(_FrozenSnapshot):
     __slots__ = (
         'packet_id', 'car_count', 'focused_car', 'current_camera',
         'car_cameras_count', 'current_car_camera', 'track_length',
@@ -122,13 +137,13 @@ class TelemetrySnapshot(object):
             raise ProtocolError('car_count does not match cars array')
         result.cars = tuple(CarSnapshot.from_message(car)
                             for car in cars_message)
-        return result
+        return result._freeze()
 
 
 class ACIPCTransport(object):
     """Owns the active AC socket, latest telemetry and command counters."""
 
-    def __init__(self, clock=None, stale_after=2.0):
+    def __init__(self, clock=None, stale_after=2.0, connection_id=None):
         self._clock = clock or time.monotonic
         self._stale_after = float(stale_after)
         self._lock = threading.RLock()
@@ -137,11 +152,16 @@ class ACIPCTransport(object):
         self._last_received = None
         self._command_seq = 0
         self._replay_seq = 0
+        self._generation = 0
+        self._connection_id = connection_id or uuid.uuid4().hex
+        if not isinstance(self._connection_id, str) or not self._connection_id:
+            raise ValueError('connection_id must be a non-empty string')
 
     def attach(self, socket):
         with self._lock:
             old_socket = self._socket
             self._socket = socket
+            self._generation += 1
             self._latest = None
             self._last_received = None
         if old_socket is not None and old_socket is not socket:
@@ -166,6 +186,10 @@ class ACIPCTransport(object):
     def has_socket(self):
         with self._lock:
             return self._socket is not None
+
+    def connection_generation(self):
+        with self._lock:
+            return self._generation
 
     def ingest(self, raw, source=None):
         if isinstance(raw, bytes):
@@ -228,29 +252,29 @@ class ACIPCTransport(object):
                      target_car_camera=-1):
         with self._lock:
             self._command_seq += 1
-            sequence = self._command_seq
-        return self._send({
-            'version': PROTOCOL_VERSION,
-            'type': 'command',
-            'command_seq': sequence,
-            'target_driver': int(target_driver),
-            'target_camera': int(target_camera),
-            'target_car_camera': int(target_car_camera),
-        })
+            return self._send({
+                'version': PROTOCOL_VERSION,
+                'connection_id': self._connection_id,
+                'type': 'command',
+                'command_seq': self._command_seq,
+                'target_driver': int(target_driver),
+                'target_camera': int(target_camera),
+                'target_car_camera': int(target_car_camera),
+            })
 
     def send_replay_command(self, action, rewind_s=0.0, frame=0,
                             driver=None, camera=None, target_car_camera=-1):
         with self._lock:
             self._replay_seq += 1
-            sequence = self._replay_seq
-        return self._send({
-            'version': PROTOCOL_VERSION,
-            'type': 'replay',
-            'replay_seq': sequence,
-            'replay_action': int(action),
-            'replay_rewind_s': float(rewind_s),
-            'replay_frame': int(frame),
-            'target_driver': -1 if driver is None else int(driver),
-            'target_camera': -1 if camera is None else int(camera),
-            'target_car_camera': int(target_car_camera),
-        })
+            return self._send({
+                'version': PROTOCOL_VERSION,
+                'connection_id': self._connection_id,
+                'type': 'replay',
+                'replay_seq': self._replay_seq,
+                'replay_action': int(action),
+                'replay_rewind_s': float(rewind_s),
+                'replay_frame': int(frame),
+                'target_driver': -1 if driver is None else int(driver),
+                'target_camera': -1 if camera is None else int(camera),
+                'target_car_camera': int(target_car_camera),
+            })
