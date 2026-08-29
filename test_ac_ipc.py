@@ -196,6 +196,51 @@ class ACIPCTransportTest(unittest.TestCase):
         self.assertTrue(transport.send_command(0, 1, -1))
         self.assertEqual(new_socket.sent[-1]['type'], 'command')
 
+    def test_command_from_superseded_telemetry_generation_is_rejected(self):
+        transport = ACIPCTransport()
+        old_socket = FakeSocket()
+        new_socket = FakeSocket()
+        transport.attach(old_socket)
+        observed_generation = transport.connection_generation()
+        transport.attach(new_socket)
+
+        self.assertFalse(transport.send_command(
+            0, 1, -1, expected_generation=observed_generation))
+        self.assertEqual(new_socket.sent, [])
+
+    def test_generation_guard_rejects_superseded_tick(self):
+        transport = ACIPCTransport()
+        transport.attach(FakeSocket())
+        observed_generation = transport.connection_generation()
+        transport.attach(FakeSocket())
+
+        with transport.generation_guard(observed_generation) as current:
+            self.assertFalse(current)
+
+    def test_generation_guard_serializes_socket_replacement(self):
+        transport = ACIPCTransport()
+        first_socket = FakeSocket()
+        transport.attach(first_socket)
+        transport.ingest(json.dumps(telemetry_message()), source=first_socket)
+        generation = transport.connection_generation()
+        replacement_started = threading.Event()
+        replacement_finished = threading.Event()
+
+        def replace_socket():
+            replacement_started.set()
+            transport.attach(FakeSocket())
+            replacement_finished.set()
+
+        with transport.generation_guard(generation) as current:
+            self.assertTrue(current)
+            thread = threading.Thread(target=replace_socket)
+            thread.start()
+            self.assertTrue(replacement_started.wait(1.0))
+            self.assertFalse(replacement_finished.wait(0.05))
+
+        thread.join(1.0)
+        self.assertTrue(replacement_finished.is_set())
+
     def test_replay_send_does_not_increment_camera_sequence(self):
         transport = ACIPCTransport()
         socket = FakeSocket()

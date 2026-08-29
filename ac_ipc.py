@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 
 
 PROTOCOL_VERSION = 1
@@ -230,6 +231,13 @@ class ACIPCTransport(object):
             snapshot = self._latest if self._fresh_locked() else None
             return snapshot, self._generation
 
+    @contextmanager
+    def generation_guard(self, expected_generation):
+        """Keep a telemetry generation current while its side effects run."""
+        with self._lock:
+            yield (self._generation == expected_generation and
+                   self._fresh_locked())
+
     def is_connected(self):
         with self._lock:
             return self._fresh_locked()
@@ -255,8 +263,11 @@ class ACIPCTransport(object):
                 return False
 
     def send_command(self, target_driver, target_camera,
-                     target_car_camera=-1):
+                     target_car_camera=-1, expected_generation=None):
         with self._lock:
+            if (expected_generation is not None and
+                    self._generation != expected_generation):
+                return False
             self._command_seq += 1
             return self._send({
                 'version': PROTOCOL_VERSION,
@@ -269,8 +280,12 @@ class ACIPCTransport(object):
             })
 
     def send_replay_command(self, action, rewind_s=0.0, frame=0,
-                            driver=None, camera=None, target_car_camera=-1):
+                            driver=None, camera=None, target_car_camera=-1,
+                            expected_generation=None):
         with self._lock:
+            if (expected_generation is not None and
+                    self._generation != expected_generation):
+                return False
             self._replay_seq += 1
             return self._send({
                 'version': PROTOCOL_VERSION,

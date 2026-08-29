@@ -753,10 +753,12 @@ def exit_review():
     review_journal = None
 
 
-def send_command(target_driver, target_camera, target_car_camera=-1):
+def send_command(target_driver, target_camera, target_car_camera=-1,
+                 expected_generation=None):
     """Send a camera/focus command to the active CSP WebSocket."""
     return ac_transport.send_command(
-        target_driver, target_camera, target_car_camera)
+        target_driver, target_camera, target_car_camera,
+        expected_generation=expected_generation)
 
 
 def send_replay_command(action, rewind_s=0.0, frame=0, driver=None, camera=None):
@@ -812,80 +814,87 @@ def monitor_telemetry():
             print('[remote_web] AC telemetry connected')
 
         if telem.packet_id != last_packet_id:
-            last_packet_id = telem.packet_id
+            director_cars = None
+            with ac_transport.generation_guard(
+                    connection_generation) as current:
+                if not current:
+                    continue
+                last_packet_id = telem.packet_id
 
-            is_replay_only = bool(getattr(telem, 'is_replay_only', 0))
-            replay_file = (getattr(telem, 'replay_file', '') or '').strip()
-            latest_replay_file = replay_file
+                is_replay_only = bool(getattr(telem, 'is_replay_only', 0))
+                replay_file = (getattr(telem, 'replay_file', '') or '').strip()
+                latest_replay_file = replay_file
 
-            if is_replay_only:
-                # A saved .acreplay is open (AC launched in replay mode). Serve
-                # the matching journal instead of the live log, and don't let
-                # the replay's embedded session identity rotate the journal.
-                if review_journal is None or (
-                        not review_journal.get('manual') and
-                        review_journal.get('replay_file') != replay_file):
-                    enter_review(replay_file, telem)
-            else:
-                if review_journal is not None:
-                    exit_review()
-                maybe_rotate_session(telem)
+                if is_replay_only:
+                    # A saved .acreplay is open (AC launched in replay mode).
+                    # Serve the matching journal instead of the live log, and
+                    # don't rotate it on the replay's embedded session identity.
+                    if review_journal is None or (
+                            not review_journal.get('manual') and
+                            review_journal.get('replay_file') != replay_file):
+                        enter_review(replay_file, telem)
+                else:
+                    if review_journal is not None:
+                        exit_review()
+                    maybe_rotate_session(telem)
 
-            latest_focused_car = telem.focused_car
-            latest_current_camera = telem.current_camera
-            latest_current_car_camera = telem.current_car_camera
-            publish_focused_highlight(telem)
+                latest_focused_car = telem.focused_car
+                latest_current_camera = telem.current_camera
+                latest_current_car_camera = telem.current_car_camera
+                publish_focused_highlight(telem)
 
-            if is_replay_only or telem.is_replay:
-                # Car data now comes from the replay frame being shown, so it
-                # is not race state: no event detection, no director cuts, and
-                # the driver list is served from the last live payload.
-                data = build_replay_update_data(telem)
-            else:
-                # Retention follows AC's actual recorded replay length rather
-                # than a guessed constant: an event is only worth keeping while
-                # it is still inside the buffer we could rewind into.
-                recorded_s = telem.replay_frames * telem.replay_frame_ms / 1000.0
-                if recorded_s > 0:
-                    before = event_log.window_s
-                    after = event_log.set_window(recorded_s)
-                    # Only worth a line when it moves materially — this is the
-                    # readout that tells you whether AC reports its buffer at
-                    # all while live, or whether the fallback is in charge.
-                    if abs(after - before) > 30:
-                        print('[remote_web] event window now {:.0f}s '
-                              '(AC reports {:.0f}s recorded)'.format(after, recorded_s))
+                if is_replay_only or telem.is_replay:
+                    # Replay car data is not live race state: freeze the driver
+                    # list, skip event detection, and suppress director cuts.
+                    data = build_replay_update_data(telem)
+                else:
+                    # Retention follows AC's actual recorded replay length.
+                    recorded_s = (telem.replay_frames *
+                                  telem.replay_frame_ms / 1000.0)
+                    if recorded_s > 0:
+                        before = event_log.window_s
+                        after = event_log.set_window(recorded_s)
+                        if abs(after - before) > 30:
+                            print('[remote_web] event window now {:.0f}s '
+                                  '(AC reports {:.0f}s recorded)'.format(
+                                      after, recorded_s))
 
-                cars_with_gaps = compute_gaps(telem)
-                _latest_replay_context = {
-                    'session': session_label(telem),
-                    'session_index': telem.session_index,
-                    'session_s': round(recorded_s, 2) if recorded_s > 0 else None,
-                    'replay_frame': telem.replay_frames or None,
-                    'replay_frame_ms': telem.replay_frame_ms or None,
-                }
-                _latest_cars_by_id = {c['car_id']: c for c in cars_with_gaps}
+                    cars_with_gaps = compute_gaps(telem)
+                    _latest_replay_context = {
+                        'session': session_label(telem),
+                        'session_index': telem.session_index,
+                        'session_s': (round(recorded_s, 2)
+                                      if recorded_s > 0 else None),
+                        'replay_frame': telem.replay_frames or None,
+                        'replay_frame_ms': telem.replay_frame_ms or None,
+                    }
+                    _latest_cars_by_id = {
+                        c['car_id']: c for c in cars_with_gaps}
 
-                # Detect before building: build_update_data snapshots the event
-                # log, so observing afterwards would hold every event back a
-                # tick — and strand the last one if telemetry stops.
-                # Overtakes are a race-only signal: practice/qualifying
-                # positions reshuffle with every lap improvement, which would
-                # flood the log with passes nobody made.
-                race = telem.session_type == 1
-                for event in event_log.observe(cars_with_gaps,
-                                               detect_overtakes=race):
-                    record_event(event)
-                data = build_update_data(telem, cars_with_gaps)
-                _last_live_payload = data
+                    # Observe before building so the payload includes events
+                    # detected during this telemetry tick.
+                    race = telem.session_type == 1
+                    for event in event_log.observe(
+                            cars_with_gaps, detect_overtakes=race):
+                        record_event(event)
+                    data = build_update_data(telem, cars_with_gaps)
+                    _last_live_payload = data
+                    director_cars = cars_with_gaps
 
+            if director_cars is not None:
                 with director_lock:
                     if director.enabled:
-                        cmd = director.tick(cars_with_gaps, telem.track_length)
+                        cmd = director.tick(
+                            director_cars, telem.track_length)
                         if cmd:
-                            send_command(cmd['driver'], 1)  # always Track cam
+                            send_command(
+                                cmd['driver'], 1,
+                                expected_generation=connection_generation)
 
-            socketio.emit('update', data)
+            with ac_transport.generation_guard(
+                    connection_generation) as current:
+                if current:
+                    socketio.emit('update', data)
 
         time.sleep(0.1)
 
