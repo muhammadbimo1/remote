@@ -130,11 +130,14 @@ local leaderboardSuppressed = false
 local REPLAY_ENTER_NOMINAL_REWIND_S = 0.5
 local pendingSeek = nil        -- absolute frame to seek to once replay is active
 
--- A replay mode change is delayed until the stinger has covered the game.
--- Motion is 200 ms in + 200 ms out; the covered hold stretches only as long
--- as AC needs to report the requested replay state.
-local STINGER_HALF_S = 0.3
-local STINGER_WAIT_TIMEOUT_S = 1.5
+-- Stinger timing configuration. A replay mode change is delayed until the
+-- stinger has covered the game; the covered hold lasts only as long as AC
+-- needs to report the requested replay state, up to the configured timeout.
+local STINGER_TIMING = {
+  slideInS = 0.3,
+  coveredWaitTimeoutS = 1.5,
+  slideOutS = 0.4,
+}
 local stinger = nil            -- { phase, phaseStarted, action, ..., targetReplay, deadline }
 
 -- Session identity. AC saves a separate replay per session and wipes the
@@ -402,7 +405,7 @@ local function processStinger()
 
   local now = os.preciseClock()
   if stinger.phase == 'cover' then
-    if now - stinger.phaseStarted < STINGER_HALF_S then return end
+    if now - stinger.phaseStarted < STINGER_TIMING.slideInS then return end
 
     local ok
     if stinger.action == REPLAY_ENTER then
@@ -413,7 +416,7 @@ local function processStinger()
 
     if ok then
       stinger.phase = 'wait'
-      stinger.deadline = now + STINGER_WAIT_TIMEOUT_S
+      stinger.deadline = now + STINGER_TIMING.coveredWaitTimeoutS
     else
       stinger.phase = 'reveal'
       stinger.phaseStarted = now
@@ -423,7 +426,7 @@ local function processStinger()
       stinger.phase = 'reveal'
       stinger.phaseStarted = now
     end
-  elseif stinger.phase == 'reveal' and now - stinger.phaseStarted >= STINGER_HALF_S then
+  elseif stinger.phase == 'reveal' and now - stinger.phaseStarted >= STINGER_TIMING.slideOutS then
     stinger = nil
   end
 end
@@ -717,13 +720,13 @@ local stingerPass = {
   blendMode = render.BlendMode.AlphaBlend,
   depthMode = render.DepthMode.Off,
   textures = { txStinger = 'static/stinger.png' },
-  values = { gOffsetX = -2, gEmissive = 1 },
+  values = { gOffsetX = -2, gEmissive = 3, gWhiteReference = 1 },
   shader = [[
     float4 main(PS_IN pin) {
       float2 uv = float2((pin.Tex.x - gOffsetX) * 0.5, pin.Tex.y);
       if (uv.x < 0 || uv.x > 1) return float4(0, 0, 0, 0);
       float4 color = txStinger.Sample(samLinear, uv);
-      return float4(color.rgb * gEmissive, color.a);
+      return float4(color.rgb * gWhiteReference * gEmissive, color.a);
     }
   ]],
 }
@@ -735,19 +738,19 @@ function renderStinger()
 
   local x
   if stinger.phase == 'cover' then
-    local t = smoothstep01((os.preciseClock() - stinger.phaseStarted) / STINGER_HALF_S)
+    local t = smoothstep01((os.preciseClock() - stinger.phaseStarted) / STINGER_TIMING.slideInS)
     x = -2 + 1.5 * t
   elseif stinger.phase == 'wait' then
     x = -0.5
   else
-    local t = smoothstep01((os.preciseClock() - stinger.phaseStarted) / STINGER_HALF_S)
+    local t = smoothstep01((os.preciseClock() - stinger.phaseStarted) / STINGER_TIMING.slideOutS)
     x = -0.5 + 1.5 * t
   end
 
   stingerPass.values.gOffsetX = x
   -- Match CSP's HDR value for display white so exposure changes do not dim
   -- or brighten the stinger along with the scene.
-  stingerPass.values.gEmissive = sim.whiteReferencePoint
+  stingerPass.values.gWhiteReference = sim.whiteReferencePoint
   render.fullscreenPass(stingerPass)
 end
 
