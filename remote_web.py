@@ -1766,7 +1766,30 @@ def index():
 
     return render_template_string(html)
 
+def disable_console_quick_edit():
+    # With QuickEdit enabled, clicking or selecting text in the console pauses
+    # the process, which freezes the server. Disable it so the window can't
+    # accidentally hang the whole app.
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return
+        kernel32.SetConsoleMode(
+            handle,
+            (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS,
+        )
+    except Exception:
+        pass
+
 if __name__ == '__main__':
+    disable_console_quick_edit()
     try:
         highlight_config = load_highlight_config(REMOTE_CONFIG_PATH)
     except HighlightConfigError as exc:

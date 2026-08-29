@@ -9,3 +9,5 @@ remote_config.json
 
 # Local isolated development worktrees.
 .worktrees/
+
+dist/
