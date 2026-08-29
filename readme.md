@@ -1,7 +1,23 @@
 
 ## What This Is
 
-**Broadcaster Remote** — an Assetto Corsa CSP Lua app that exposes broadcast camera and driver controls via a web interface. It has two runtime halves communicating through shared memory (mmap)
+**Broadcaster Remote** — an Assetto Corsa CSP Lua app that exposes broadcast camera and driver controls through a web interface.
+
+The CSP app connects to the Python server over a native CSP WebSocket at
+`ws://127.0.0.1:5000/ac-ipc`. It sends telemetry at 10 Hz and receives camera
+and replay commands over the same connection. The IPC route is loopback-only,
+while the browser panel continues to listen on `0.0.0.0:5000` and is accessible
+from other devices on the same network at `http://<race-rig-ip>:5000`.
+
+## Running
+
+- Enable **Broadcaster Remote** in AC's app sidebar (CSP required).
+- Install Python dependencies: `flask`, `flask-socketio`,
+  `simple-websocket`, and `requests`.
+- Start the server with `python remote_web.py`.
+
+The Lua WebSocket reconnects automatically if the Python server is restarted.
+The Python server accepts a replacement connection if the Lua app is reloaded.
 
 ## Broadcast highlight relay
 

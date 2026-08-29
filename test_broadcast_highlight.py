@@ -3,7 +3,6 @@ import os
 import tempfile
 import unittest
 
-from ipc_shared import TelemetryPage
 from broadcast_highlight import (
     AUTH_ERROR,
     BroadcastHighlightClient,
@@ -14,6 +13,20 @@ from broadcast_highlight import (
     focused_remote_car_id,
     load_highlight_config,
 )
+
+
+class CarFixture(object):
+    def __init__(self):
+        self.car_id = 0
+        self.session_id = 0
+        self.is_connected = False
+
+
+class TelemetryFixture(object):
+    def __init__(self):
+        self.car_count = 0
+        self.focused_car = 0
+        self.cars = [CarFixture() for _ in range(128)]
 
 
 class HighlightConfigTest(unittest.TestCase):
@@ -60,7 +73,7 @@ class HighlightConfigTest(unittest.TestCase):
 
 class FocusedRemoteCarIdTest(unittest.TestCase):
     def test_maps_focused_local_car_to_connected_session_id(self):
-        telem = TelemetryPage()
+        telem = TelemetryFixture()
         telem.car_count = 3
         telem.focused_car = 2
 
@@ -77,7 +90,7 @@ class FocusedRemoteCarIdTest(unittest.TestCase):
         self.assertEqual(focused_remote_car_id(telem), 18)
 
     def test_returns_none_without_a_connected_focused_car(self):
-        telem = TelemetryPage()
+        telem = TelemetryFixture()
         telem.car_count = 1
         telem.focused_car = 0
         telem.cars[0].car_id = 0

@@ -6,21 +6,10 @@ end
 
 local function loadRemote(isReplayActive)
   local now = 0
-  local telemetry = { cars = {} }
-  local commands = {
-    replay_seq = 0,
-    replay_action = 0,
-    replay_rewind_s = 0,
-    replay_frame = 0,
-    command_seq = 0,
-    target_driver = -1,
-    target_camera = 1,
-    target_car_camera = -1,
-  }
+  local replaySeq = 0
   local toggleCalls = {}
   local seekCalls = {}
   local renderCalls = {}
-  local mmapCount = 0
   local socketURL = nil
   local socketParams = nil
   local socketCallback = nil
@@ -121,10 +110,6 @@ local function loadRemote(isReplayActive)
     getServerIP = function() return '' end,
     getServerPortHTTP = function() return -1 end,
     getDriverTeam = function() return 'PRO 7 | Team' end,
-    writeMemoryMappedFile = function()
-      mmapCount = mmapCount + 1
-      return mmapCount == 1 and telemetry or commands
-    end,
     onSessionStart = function() end,
     onCarCollision = function() end,
     onReplay = function() end,
@@ -146,12 +131,14 @@ local function loadRemote(isReplayActive)
   dofile('remote.lua')
 
   return {
-    commands = commands,
     sim = sim,
     toggleCalls = toggleCalls,
     seekCalls = seekCalls,
     renderCalls = renderCalls,
-    mmapCount = function() return mmapCount end,
+    nextReplaySeq = function()
+      replaySeq = replaySeq + 1
+      return replaySeq
+    end,
     socketURL = function() return socketURL end,
     socketParams = function() return socketParams end,
     telemetryPayloads = telemetryPayloads,
@@ -187,11 +174,10 @@ local function testStingerRendersInScenePassForCleanOutput()
 end
 
 requestReplay = function(ctx, action)
-  ctx.commands.replay_seq = ctx.commands.replay_seq + 1
   ctx.deliver({
     version = 1,
     type = 'replay',
-    replay_seq = ctx.commands.replay_seq,
+    replay_seq = ctx.nextReplaySeq(),
     replay_action = action,
     replay_rewind_s = 12,
     replay_frame = 0,
@@ -207,7 +193,6 @@ local function testWebSocketConnectsToLoopbackWithReconnect()
     'the CSP app connects to the local server on its existing port')
   assertEqual(ctx.socketParams().encoding, 'utf8', 'the socket uses UTF-8 text frames')
   assertEqual(ctx.socketParams().reconnect, true, 'the socket reconnects automatically')
-  assertEqual(ctx.mmapCount(), 0, 'the app does not create memory-mapped files')
 end
 
 local function testTelemetryUsesVersionedProtocolAtTenHertz()

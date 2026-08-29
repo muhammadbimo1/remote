@@ -4,24 +4,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-**Broadcaster Remote** — an Assetto Corsa CSP Lua app that exposes broadcast camera and driver controls via a web interface. It has two runtime halves communicating through shared memory (mmap):
+**Broadcaster Remote** — an Assetto Corsa CSP Lua app that exposes broadcast camera and driver controls via a web interface. It has two runtime halves communicating over a loopback WebSocket:
 
-1. **`remote.lua`** — CSP Lua plugin running inside AC. Writes telemetry (car positions, gaps, camera state) to a memory-mapped file at 10 Hz, reads camera/focus commands from a second mmap, and renders an in-game IMGUI window.
-2. **`remote_web.py`** + **`ipc_shared.py`** — standalone Flask + SocketIO web server (Python 3). Reads the telemetry mmap, pushes live updates to browser clients, and writes commands back to the command mmap.
+1. **`remote.lua`** — CSP Lua plugin running inside AC. Connects to `ws://127.0.0.1:5000/ac-ipc` with CSP's native `web.socket()`, sends JSON telemetry (car positions, gaps, camera state) at 10 Hz, receives camera/focus commands on the same connection, and renders an in-game IMGUI window.
+2. **`remote_web.py`** + **`ac_ipc.py`** — standalone Flask + SocketIO web server (Python 3). Accepts the loopback-only AC WebSocket, validates immutable telemetry snapshots, pushes live updates to browser clients, and sends commands back to Lua. Normal HTTP and Socket.IO routes still listen on `0.0.0.0:5000` for LAN clients.
 
 ### IPC Contract
 
-The FFI structs in `remote.lua` (lines 7-39) and the ctypes structs in `ipc_shared.py` **must stay in sync** — field order, types, packing (`#pragma pack(4)` / `_pack_ = 4`), and `wchar_t[64]` sizing. A mismatch causes silent data corruption.
+Lua and Python exchange UTF-8 JSON objects with `version = 1` and a `type` discriminator. `ac_ipc.py` validates every required scalar and car field, rejects messages with more than 128 cars, and publishes a snapshot only after the whole message is valid.
 
-- **Telemetry mmap** (`broadcaster_remote_telemetry`): Lua writes, Python reads. Torn-read protection via `packet_id`.
-- **Command mmap** (`broadcaster_remote_commands`): Python writes, Lua reads. New command detected by `command_seq` change.
+- **Telemetry** (`type = "telemetry"`): Lua sends, Python receives. `packet_id` suppresses duplicate processing and resets naturally when Lua reconnects.
+- **Camera commands** (`type = "command"`): Python sends, Lua receives. New command detected by `command_seq` change.
+- **Replay commands** (`type = "replay"`): Python sends, Lua receives. New action detected by the independent `replay_seq` counter.
+
+Only `/ac-ipc` is restricted to the actual loopback peer (`127.0.0.1` or `::1`); never use forwarded headers for that decision. The rest of port 5000 must remain reachable from other devices on the same network. CSP is the WebSocket client and Python is the server. Telemetry is stale after 2 seconds, and either side must recover when the other restarts.
 
 Camera IDs use a custom 1-5 numbering (Track, Cockpit, Helicopter, Car/F6, Free) mapped to/from `ac.CameraMode` enums in Lua.
 
 ### Action Replay
 
-The command mmap carries a **second sequence counter**, `replay_seq`, alongside `command_seq`.
-Replay commands (`REPLAY_ENTER` / `REPLAY_LIVE` / `REPLAY_SEEK_FRAME` in `ipc_shared.py`) bump
+The WebSocket protocol carries a **second sequence counter**, `replay_seq`, alongside `command_seq`.
+Replay commands (`REPLAY_ENTER` / `REPLAY_LIVE` / `REPLAY_SEEK_FRAME` in `ac_ipc.py`) bump
 only `replay_seq`, deliberately leaving `command_seq` alone: entering instant replay resets the
 camera, so Lua parks the requested driver/camera in `shotHold` and applies it once
 `sim.isReplayActive` matches. Bumping `command_seq` too would make Lua apply the shot
@@ -36,7 +39,7 @@ operator pick always wins. Leaving replay — commanded or AC's own exit at the 
 the on-screen shot first and holds it on the live side.
 
 Jumps are expressed as **seconds to rewind**, never frame indices — `event_log.py` only has to
-timestamp incidents in wall clock. `replay_frame` / `replay_frames` in the telemetry page feed the
+timestamp incidents in wall clock. `replay_frame` / `replay_frames` in the telemetry message feed the
 readout and nothing else.
 
 `ac.tryToToggleReplay(active, rewindS)`'s `rewindS` **overshoots** on this rig: it converts seconds
@@ -123,7 +126,7 @@ Shell commands launch visible CLI windows which breaks the user experience.
 ## Running
 
 - **Lua side**: Loads automatically when the "Broadcaster Remote" app is enabled in AC's app sidebar (CSP required).
-- **Web server**: `python remote_web.py` — serves on `0.0.0.0:5000`. Requires `flask` and `flask-socketio`.
+- **Web server**: `python remote_web.py` — serves on `0.0.0.0:5000`. Requires `flask`, `flask-socketio`, `simple-websocket`, and `requests`.
 
 ## Web UI
 

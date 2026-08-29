@@ -21,7 +21,7 @@ Endpoint: `GET /api/connected_drivers`. Auth: none. Polling cadence: 1 Hz upstre
 **Reliable fields per driver**:
 - `Position` — track position (1-based), survives disconnects.
 - `RaceNumber` — integer car number. Best join key.
-- `DriverName` — sometimes returned as `"NN | Name"` (same prefix format as AC mmap), sometimes as bare `"Name"`.
+- `DriverName` — sometimes returned as `"NN | Name"` (same prefix format as AC telemetry), sometimes as bare `"Name"`.
 - `GapToLeader` — milliseconds. `0` for leader and `0` whenever Split is non-numeric.
 - `Split` — display string. `"00:00.000"` for leader, `"MM:SS.mmm"` for within-lap gaps, `"N lap"` / `"N laps"` for lapped cars.
 
@@ -59,7 +59,7 @@ Triggered by an explicit user button, not background polling.
          target = leader_progress - (gap_ms / 1000) / lap_time_s
      offset = target - (local.lap_count + local.spline)
 6. Atomically replace the offsets dict.
-7. Clear the dict on AC reconnect (mmap reopen) — car_ids are reused.
+7. Clear the dict on AC WebSocket reconnect — car_ids are reused.
 ```
 
 The conversion `gap_seconds / lap_time_s = gap_in_progress_units` is the key insight: a 10-second gap at a 67-second lap is `10/67 ≈ 0.149` of a lap of progress. This is approximate (faster cars cover more progress per second than slower ones), but it's accurate to within a fraction of a second of the relay value.
@@ -71,7 +71,7 @@ The conversion `gap_seconds / lap_time_s = gap_in_progress_units` is the key ins
 Race number first, name fallback. Race number is robust to display-name encoding differences and renames mid-race.
 
 ```
-RaceNumber from local mmap: parsed from "NN | Driver Name" prefix.
+RaceNumber from local telemetry: parsed from "NN | Driver Name" prefix.
 RaceNumber from API: top-level field, reliable except for broadcast cars (0).
 Name fallback: lowered, trimmed; also strip any "NN | " prefix on the API side
   before comparing, since some upstreams pass that through.
@@ -128,7 +128,7 @@ The duplicate Bimo row at server slot 34 was a stale/unmatched server entry. Req
 
 Captured during the live race to validate the math:
 
-| Driver         | AC P | mmap laps | mmap spline | API P | API Split    | computed offset |
+| Driver         | AC P | telemetry laps | telemetry spline | API P | API Split    | computed offset |
 |----------------|------|-----------|-------------|-------|--------------|-----------------|
 | Iga (leader)   | 1    | 37        | 0.840       | 1     | 00:00.000    | 0.000           |
 | Rafid          | 2    | 38        | 0.216       | 2     | 1 lap        | -1.378          |
@@ -144,11 +144,11 @@ Pre-fix Rafid appears 1.376 laps *ahead* of Iga (38.216 > 37.840). Post-fix his 
 
 ## 8. Edge cases worth handling explicitly
 
-- **AC restart**: clear offsets when the mmap is (re)opened. car_ids get reused across game sessions and stale offsets corrupt new races.
+- **AC restart**: clear offsets when the telemetry WebSocket reconnects. car_ids get reused across game sessions and stale offsets corrupt new races.
 - **Leader can't be matched**: fail closed. Set status `'no_leader'`, return False, leave existing offsets alone.
 - **API unreachable / non-200 / non-JSON**: silent fallback. Existing offsets stay, single warning logged.
-- **Driver in mmap but not in API**: leave their offset at whatever it was (typically 0). Don't try to invent one.
-- **Driver in API but not in mmap**: skip silently.
+- **Driver in telemetry but not in API**: leave their offset at whatever it was (typically 0). Don't try to invent one.
+- **Driver in API but not in telemetry**: skip silently.
 - **`gap_ms <= 0` for non-leader**: treat as missing data, skip.
 - **`RaceNumber == 0` in API**: broadcast/marshal car, skip.
 - **Server `timetable.json` row with no connected local match**: skip it. Stale server entries can retain a real driver name/GUID but should not update local cars.
@@ -188,6 +188,6 @@ All changes are in `remote_web.py`. Key entry points:
 - `resync_progress_offsets()` — the work behind the button.
 - `compute_gaps()` — adds `progress_offsets[car_id]` to `total_progress` under the lock.
 - `@socketio.on('resync_gaps')` — UI trigger.
-- Mmap-reopen path in `monitor_telemetry()` clears the dict.
+- WebSocket reconnect path in `monitor_telemetry()` clears the dict.
 
 Lua port note: `SubStandingLua` consumes AC server `/timetable.json` for lap-count sync. Its `EntryList[*].CarID` values must be mapped through local connected cars' `StateCar.sessionID` before applying `Laps`; direct `drivers[entry.CarID]` indexing is wrong whenever local car indices differ from server entry slots.
