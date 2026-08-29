@@ -133,7 +133,7 @@ local pendingSeek = nil        -- absolute frame to seek to once replay is activ
 -- A replay mode change is delayed until the stinger has covered the game.
 -- Motion is 200 ms in + 200 ms out; the covered hold stretches only as long
 -- as AC needs to report the requested replay state.
-local STINGER_HALF_S = 0.2
+local STINGER_HALF_S = 0.3
 local STINGER_WAIT_TIMEOUT_S = 1.5
 local stinger = nil            -- { phase, phaseStarted, action, ..., targetReplay, deadline }
 
@@ -717,7 +717,7 @@ local stingerPass = {
   blendMode = render.BlendMode.AlphaBlend,
   depthMode = render.DepthMode.Off,
   textures = { txStinger = 'static/stinger.png' },
-  values = { gOffsetX = -2, gEmissive = 4 },
+  values = { gOffsetX = -2, gEmissive = 1 },
   shader = [[
     float4 main(PS_IN pin) {
       float2 uv = float2((pin.Tex.x - gOffsetX) * 0.5, pin.Tex.y);
@@ -745,6 +745,9 @@ function renderStinger()
   end
 
   stingerPass.values.gOffsetX = x
+  -- Match CSP's HDR value for display white so exposure changes do not dim
+  -- or brighten the stinger along with the scene.
+  stingerPass.values.gEmissive = sim.whiteReferencePoint
   render.fullscreenPass(stingerPass)
 end
 
