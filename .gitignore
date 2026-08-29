@@ -6,3 +6,6 @@ event_logs/
 
 # Local relay credentials, never committed.
 remote_config.json
+
+# Local isolated development worktrees.
+.worktrees/
