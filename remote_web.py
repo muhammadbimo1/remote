@@ -1,20 +1,25 @@
-import mmap
-import ctypes
 import threading
 import time
 import json
 import os
 import re
+import ipaddress
 from collections import defaultdict
 from urllib.parse import urlparse
-from flask import Flask, render_template_string, request
+from flask import Flask, abort, render_template_string, request
 from flask_socketio import SocketIO, emit
+from simple_websocket import ConnectionClosed, Server
 
 import requests
 
-from ipc_shared import TelemetryPage, CommandPage, MAX_CARS
-from ipc_shared import TELEMETRY_TAG, COMMAND_TAG
-from ipc_shared import REPLAY_ENTER, REPLAY_LIVE, REPLAY_SEEK_FRAME
+from ac_ipc import (
+    ACIPCTransport,
+    MAX_CARS,
+    ProtocolError,
+    REPLAY_ENTER,
+    REPLAY_LIVE,
+    REPLAY_SEEK_FRAME,
+)
 from auto_director import AutoDirector
 from event_log import EventLog
 from event_journal import EventJournal, match_replay
@@ -28,14 +33,7 @@ from broadcast_highlight import (
 app = Flask(__name__)
 socketio = SocketIO(app)
 
-# mmap handles (opened lazily by monitor thread)
-telemetry_mmap = None
-telemetry_page = None
-command_mmap = None
-command_page = None
-command_lock = threading.Lock()
-command_seq_counter = 0
-replay_seq_counter = 0
+ac_transport = ACIPCTransport()
 
 ac_connected = False
 
@@ -58,7 +56,7 @@ EVENT_JOURNAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 event_journal = EventJournal(EVENT_JOURNAL_DIR)
 
 # Telemetry context for the journal, refreshed on every live tick so the MARK
-# handler can stamp a record without reading the mmap itself.
+# handler can stamp a record without reaching across the transport itself.
 _latest_replay_context = {}
 _latest_cars_by_id = {}
 
@@ -151,9 +149,7 @@ REPLAY_MIN_REWIND_S = 5.0
 _last_live_payload = None
 
 # Latest telemetry snapshot captured by the monitor thread. The request
-# handlers read this instead of calling read_telemetry() themselves —
-# concurrent seek/read on the shared mmap object races and produces torn
-# reads, which cause the handler to fall back to driver 0.
+# handlers read this instead of waiting for another telemetry update.
 latest_focused_car = 0
 latest_current_camera = 0
 latest_current_car_camera = 0
@@ -209,47 +205,9 @@ def _parse_team_name(team_name):
     return team_name.split('|', 1)[1].strip()
 
 
-def open_telemetry_mmap():
-    """Try to open the telemetry shared memory. Returns (mmap, page) or (None, None)."""
-    try:
-        m = mmap.mmap(0, ctypes.sizeof(TelemetryPage), TELEMETRY_TAG)
-        page = TelemetryPage.from_buffer_copy(m)
-        return m, page
-    except Exception:
-        return None, None
-
-
-def open_command_mmap():
-    """Try to open the command shared memory. Returns (mmap, page) or (None, None)."""
-    try:
-        m = mmap.mmap(0, ctypes.sizeof(CommandPage), COMMAND_TAG)
-        page = CommandPage.from_buffer(m)
-        return m, page
-    except Exception:
-        return None, None
-
-
 def read_telemetry():
-    """Read telemetry with torn-read protection. Returns a TelemetryPage copy or None."""
-    global telemetry_mmap
-    if telemetry_mmap is None:
-        return None
-    try:
-        telemetry_mmap.seek(0)
-        buf = telemetry_mmap.read(ctypes.sizeof(TelemetryPage))
-        page1 = TelemetryPage.from_buffer_copy(bytearray(buf))
-        pid1 = page1.packet_id
-
-        telemetry_mmap.seek(0)
-        buf2 = telemetry_mmap.read(ctypes.sizeof(TelemetryPage))
-        page2 = TelemetryPage.from_buffer_copy(bytearray(buf2))
-        pid2 = page2.packet_id
-
-        if pid1 != pid2:
-            return None  # torn read, skip this cycle
-        return page2
-    except Exception:
-        return None
+    """Return the latest fresh, atomically validated telemetry snapshot."""
+    return ac_transport.latest()
 
 
 def _format_lap_delta(delta_ms):
@@ -433,7 +391,7 @@ def _compute_gap_seconds(ahead, behind, track_length):
 
 
 def get_timetable_url(telem):
-    """Return the AC server timetable URL provided by the Lua mmap."""
+    """Return the AC server timetable URL provided by Lua telemetry."""
     return (getattr(telem, 'timetable_url', '') or '').strip()
 
 
@@ -768,51 +726,26 @@ def exit_review():
 
 
 def send_command(target_driver, target_camera, target_car_camera=-1):
-    """Write a command to shared memory."""
-    global command_mmap, command_page, command_seq_counter
-    with command_lock:
-        if command_mmap is None:
-            command_mmap, command_page = open_command_mmap()
-        if command_page is None:
-            return False
-        command_seq_counter += 1
-        command_page.target_driver = target_driver
-        command_page.target_camera = target_camera
-        command_page.target_car_camera = target_car_camera
-        command_page.command_seq = command_seq_counter
-        return True
+    """Send a camera/focus command to the active CSP WebSocket."""
+    return ac_transport.send_command(
+        target_driver, target_camera, target_car_camera)
 
 
 def send_replay_command(action, rewind_s=0.0, frame=0, driver=None, camera=None):
-    """Write a replay command to shared memory.
+    """Send a replay command without synthesizing a camera command.
 
-    `driver`/`camera` are written but command_seq is deliberately NOT bumped:
+    `driver`/`camera` are carried but command_seq is deliberately NOT bumped:
     entering instant replay resets the camera, so Lua parks the shot and applies
     it once replay is live. Bumping command_seq here would make Lua apply it
     immediately, where the replay toggle clobbers it.
     """
-    global command_mmap, command_page, replay_seq_counter
-    with command_lock:
-        if command_mmap is None:
-            command_mmap, command_page = open_command_mmap()
-        if command_page is None:
-            return False
-        if driver is not None:
-            command_page.target_driver = driver
-        if camera is not None:
-            command_page.target_camera = camera
-            command_page.target_car_camera = -1
-        replay_seq_counter += 1
-        command_page.replay_action = action
-        command_page.replay_rewind_s = float(rewind_s)
-        command_page.replay_frame = int(frame)
-        command_page.replay_seq = replay_seq_counter
-        return True
+    return ac_transport.send_replay_command(
+        action, rewind_s, frame, driver, camera, -1)
 
 
 def monitor_telemetry():
-    """Background thread: poll telemetry mmap and push updates via SocketIO."""
-    global telemetry_mmap, telemetry_page, ac_connected
+    """Process fresh WebSocket telemetry and push updates via SocketIO."""
+    global ac_connected
     global latest_focused_car, latest_current_camera, latest_current_car_camera
     global latest_replay_file
     global _last_live_payload, _latest_replay_context, _latest_cars_by_id
@@ -822,17 +755,20 @@ def monitor_telemetry():
     last_packet_id = -1
 
     while True:
-        # Try to connect if not connected
-        if telemetry_mmap is None:
-            telemetry_mmap, telemetry_page = open_telemetry_mmap()
-            if telemetry_mmap is None:
-                if ac_connected:
-                    publish_focused_highlight(None)
-                    ac_connected = False
-                    socketio.emit('update', {'ac_connected': False, 'drivers': []})
-                time.sleep(2)
-                continue
+        telem = read_telemetry()
+        if telem is None:
+            if ac_connected:
+                publish_focused_highlight(None)
+                ac_connected = False
+                socketio.emit('update', {
+                    'ac_connected': False, 'drivers': []})
+                print('[remote_web] AC telemetry disconnected')
+            time.sleep(0.1)
+            continue
+
+        if not ac_connected:
             ac_connected = True
+            last_packet_id = -1
             # Stale offsets must not survive an AC restart — car_ids are reused.
             with _resync_lock:
                 progress_offsets.clear()
@@ -843,23 +779,8 @@ def monitor_telemetry():
             # Forget the session so the next tick rotates the journal with a
             # fresh label rather than appending a new AC run to the old file.
             _current_session = None
-            print('[remote_web] telemetry mmap (re)opened '
+            print('[remote_web] AC telemetry connected '
                   '({} events pending drop)'.format(dropped))
-
-        telem = read_telemetry()
-        if telem is None:
-            # Check if mmap is still valid
-            try:
-                telemetry_mmap.seek(0)
-                telemetry_mmap.read(4)
-            except Exception:
-                telemetry_mmap = None
-                telemetry_page = None
-                publish_focused_highlight(None)
-                ac_connected = False
-                continue
-            time.sleep(0.1)
-            continue
 
         if telem.packet_id != last_packet_id:
             last_packet_id = telem.packet_id
@@ -1087,6 +1008,43 @@ def handle_connect():
         emit('update', {'ac_connected': False, 'drivers': []})
 
 
+def is_loopback_peer(address):
+    """Return true only for a literal loopback peer address."""
+    try:
+        return ipaddress.ip_address(address).is_loopback
+    except (TypeError, ValueError):
+        return False
+
+
+@app.route('/ac-ipc', websocket=True)
+def handle_ac_ipc():
+    """Receive CSP telemetry and keep the same socket for outgoing commands."""
+    if not is_loopback_peer(request.remote_addr):
+        abort(403)
+
+    websocket = Server.accept(request.environ, max_message_size=262144)
+    ac_transport.attach(websocket)
+    print('[remote_web] AC WebSocket connected')
+    try:
+        while ac_transport.is_current(websocket):
+            try:
+                raw = websocket.receive(timeout=1)
+            except TimeoutError:
+                continue
+            if raw is None:
+                break
+            try:
+                ac_transport.ingest(raw, source=websocket)
+            except ProtocolError as exc:
+                print('[remote_web] ignored invalid AC IPC message: {}'.format(exc))
+    except ConnectionClosed:
+        pass
+    finally:
+        if ac_transport.detach(websocket):
+            print('[remote_web] AC WebSocket disconnected')
+    return ''
+
+
 
 # Main route for the web interface
 @app.route('/', methods=['GET', 'POST'])
@@ -1099,7 +1057,7 @@ def index():
             drv = selected_num - 1
             # Use the latest cached camera from the monitor thread so we
             # preserve it. (Doing our own read_telemetry here races the
-            # monitor's seek/read on the same mmap object.)
+            # monitor's independently refreshed transport snapshot.)
             camera = latest_current_camera
             # Preserve current F6 sub-cam, otherwise Lua's cam=4/subCam=-1 path
             # cycles to the next angle on every driver pick.

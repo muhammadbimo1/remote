@@ -1,9 +1,58 @@
 import unittest
 from unittest.mock import patch
+from werkzeug.exceptions import Forbidden
 
-from ipc_shared import TelemetryPage, CommandPage
+from ac_ipc import ACIPCTransport
+from test_ac_ipc import FakeSocket
 import remote_web
 from remote_web import apply_timetable_offsets, build_update_data
+
+
+class CarFixture(object):
+    def __init__(self):
+        self.car_id = 0
+        self.session_id = 0
+        self.position = 0
+        self.normalized_spline_pos = 0.0
+        self.speed_kmh = 0.0
+        self.lap_time = 0
+        self.best_lap = 0
+        self.last_lap = 0
+        self.lap_count = 0
+        self.is_in_pit = False
+        self.is_connected = False
+        self.is_colliding = False
+        self.is_rolled_over = False
+        self.driver_name = ''
+        self.team_name = ''
+
+
+class TelemetryPage(object):
+    """Mutable test fixture mirroring a validated telemetry snapshot."""
+
+    def __init__(self):
+        self.packet_id = 0
+        self.car_count = 0
+        self.focused_car = 0
+        self.current_camera = 0
+        self.car_cameras_count = 0
+        self.current_car_camera = 0
+        self.track_length = 0.0
+        self.session_type = 0
+        self.session_index = 0
+        self.session_type_raw = 0
+        self.session_gen = 0
+        self.session_name = ''
+        self.is_replay = False
+        self.replay_frame = 0
+        self.replay_frames = 0
+        self.replay_frame_ms = 0.0
+        self.replay_last_result = 0
+        self.is_replay_only = False
+        self.replay_file = ''
+        self.replay_temp_dir = ''
+        self.timetable_url = ''
+        self.cars = [CarFixture() for _ in range(remote_web.MAX_CARS)]
 
 
 class TeamNamePayloadTest(unittest.TestCase):
@@ -421,20 +470,88 @@ class ReplayCommandTest(unittest.TestCase):
     def test_replay_command_does_not_bump_the_camera_sequence(self):
         """Lua parks the shot until replay is live; bumping command_seq here
         would make it apply the focus immediately, where the toggle eats it."""
-        page = CommandPage()
-        with patch.object(remote_web, 'command_page', page), \
-                patch.object(remote_web, 'command_mmap', object()):
-            before = page.command_seq
+        transport = ACIPCTransport()
+        socket = FakeSocket()
+        transport.attach(socket)
+        with patch.object(remote_web, 'ac_transport', transport):
             ok = remote_web.send_replay_command(
                 remote_web.REPLAY_ENTER, rewind_s=12.5, driver=3, camera=1)
 
         self.assertTrue(ok)
-        self.assertEqual(page.command_seq, before)
-        self.assertEqual(page.replay_action, remote_web.REPLAY_ENTER)
-        self.assertAlmostEqual(page.replay_rewind_s, 12.5, places=3)
-        self.assertEqual(page.target_driver, 3)
-        self.assertEqual(page.target_camera, 1)
-        self.assertNotEqual(page.replay_seq, 0)
+        message = socket.sent[-1]
+        self.assertNotIn('command_seq', message)
+        self.assertEqual(message['replay_action'], remote_web.REPLAY_ENTER)
+        self.assertAlmostEqual(message['replay_rewind_s'], 12.5, places=3)
+        self.assertEqual(message['target_driver'], 3)
+        self.assertEqual(message['target_camera'], 1)
+        self.assertEqual(message['replay_seq'], 1)
+
+    def test_camera_command_is_sent_over_active_ac_socket(self):
+        transport = ACIPCTransport()
+        socket = FakeSocket()
+        transport.attach(socket)
+        with patch.object(remote_web, 'ac_transport', transport):
+            ok = remote_web.send_command(4, 4, 2)
+
+        self.assertTrue(ok)
+        self.assertEqual(socket.sent[-1]['type'], 'command')
+        self.assertEqual(socket.sent[-1]['target_car_camera'], 2)
+
+
+class IPCPeerSecurityTest(unittest.TestCase):
+    def test_ipv4_and_ipv6_loopback_are_allowed(self):
+        self.assertTrue(remote_web.is_loopback_peer('127.0.0.1'))
+        self.assertTrue(remote_web.is_loopback_peer('::1'))
+
+    def test_lan_and_forwarded_text_are_rejected(self):
+        self.assertFalse(remote_web.is_loopback_peer('192.168.1.25'))
+        self.assertFalse(remote_web.is_loopback_peer(
+            '127.0.0.1, 192.168.1.25'))
+
+    def test_lan_peer_is_rejected_before_websocket_accept(self):
+        with remote_web.app.test_request_context(
+                '/ac-ipc', environ_base={'REMOTE_ADDR': '192.168.1.25'}), \
+                patch.object(remote_web.Server, 'accept') as accept:
+            with self.assertRaises(Forbidden):
+                remote_web.handle_ac_ipc()
+        accept.assert_not_called()
+
+    def test_loopback_peer_can_send_telemetry(self):
+        observed_packet_ids = []
+
+        class OneMessageSocket(object):
+            def __init__(self):
+                self.messages = [remote_web.json.dumps({
+                    'version': 1, 'type': 'telemetry', 'packet_id': 9,
+                    'car_count': 0, 'focused_car': 0, 'current_camera': 1,
+                    'car_cameras_count': 0, 'current_car_camera': 0,
+                    'track_length': 5000.0, 'session_type': 1,
+                    'session_index': 0, 'session_type_raw': 3,
+                    'session_gen': 1, 'session_name': 'Race',
+                    'is_replay': False, 'replay_frame': 0,
+                    'replay_frames': 100, 'replay_frame_ms': 60.0,
+                    'replay_last_result': 0, 'is_replay_only': False,
+                    'replay_file': '', 'replay_temp_dir': '',
+                    'timetable_url': '', 'cars': [],
+                })]
+
+            def receive(self, timeout=None):
+                if self.messages:
+                    return self.messages.pop(0)
+                snapshot = remote_web.ac_transport.latest()
+                observed_packet_ids.append(snapshot.packet_id)
+                raise remote_web.ConnectionClosed()
+
+            def close(self):
+                pass
+
+        socket = OneMessageSocket()
+        with remote_web.app.test_request_context(
+                '/ac-ipc', environ_base={'REMOTE_ADDR': '127.0.0.1'}), \
+                patch.object(remote_web.Server, 'accept', return_value=socket):
+            self.assertEqual(remote_web.handle_ac_ipc(), '')
+
+        self.assertEqual(observed_packet_ids, [9])
 
 
 class ReviewModeTest(unittest.TestCase):
