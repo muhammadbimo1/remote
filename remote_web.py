@@ -18,6 +18,12 @@ from ipc_shared import REPLAY_ENTER, REPLAY_LIVE, REPLAY_SEEK_FRAME
 from auto_director import AutoDirector
 from event_log import EventLog
 from event_journal import EventJournal, match_replay
+from broadcast_highlight import (
+    BroadcastHighlightClient,
+    HighlightConfigError,
+    focused_remote_car_id,
+    load_highlight_config,
+)
 
 app = Flask(__name__)
 socketio = SocketIO(app)
@@ -32,6 +38,12 @@ command_seq_counter = 0
 replay_seq_counter = 0
 
 ac_connected = False
+
+# Optional live-timing relay integration. Configuration is loaded only when
+# this file is run as the server, keeping imports side-effect free for tests.
+REMOTE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'remote_config.json')
+highlight_client = None
 
 director = AutoDirector()
 director_lock = threading.Lock()
@@ -166,6 +178,13 @@ last_poll_error = ''
 last_poll_matched = 0
 
 
+def publish_focused_highlight(telem):
+    """Publish the relay/timetable CarID corresponding to CSP's local focus."""
+    if highlight_client is None:
+        return False
+    return highlight_client.publish(focused_remote_car_id(telem))
+
+
 def get_car_class(team_name):
     """Return (class_name, class_color) parsed from a team name.
 
@@ -252,6 +271,61 @@ def read_telemetry():
         return None
 
 
+def _format_lap_delta(delta_ms):
+    return '+{:.3f}s'.format(delta_ms / 1000.0)
+
+
+def _apply_timing_standings(cars):
+    """Rank practice/qualifying cars and gaps by their best lap."""
+    cars.sort(key=lambda c: (
+        c['best_lap'] <= 0,
+        c['best_lap'] if c['best_lap'] > 0 else float('inf'),
+        c['position'],
+        c['car_id']))
+
+    timed = [car for car in cars if car['best_lap'] > 0]
+    leader = timed[0] if timed else None
+    previous_timed = None
+    for position, car in enumerate(cars, 1):
+        car['position'] = position
+        if car['best_lap'] <= 0:
+            car['gap'] = '-'
+            car['interval'] = '-'
+            car['interval_seconds'] = float('inf')
+            continue
+        if car is leader:
+            car['gap'] = 'Leader'
+            car['interval'] = '-'
+            car['interval_seconds'] = float('inf')
+        else:
+            gap_ms = car['best_lap'] - leader['best_lap']
+            interval_ms = car['best_lap'] - previous_timed['best_lap']
+            car['gap'] = _format_lap_delta(gap_ms)
+            car['interval'] = _format_lap_delta(interval_ms)
+            car['interval_seconds'] = interval_ms / 1000.0
+        previous_timed = car
+
+    by_class = defaultdict(list)
+    for car in cars:
+        by_class[car['car_class']].append(car)
+
+    for cls_cars in by_class.values():
+        previous_timed = None
+        for class_position, car in enumerate(cls_cars, 1):
+            car['class_position'] = class_position
+            if car['best_lap'] <= 0 or previous_timed is None:
+                car['class_interval'] = '-'
+                car['class_interval_seconds'] = float('inf')
+            else:
+                interval_ms = car['best_lap'] - previous_timed['best_lap']
+                car['class_interval'] = _format_lap_delta(interval_ms)
+                car['class_interval_seconds'] = interval_ms / 1000.0
+            if car['best_lap'] > 0:
+                previous_timed = car
+
+    return cars
+
+
 def compute_gaps(telem):
     """Compute gap to leader and interval to car ahead for each car."""
     cars = []
@@ -296,6 +370,9 @@ def compute_gaps(telem):
     for idx, car in enumerate(cars):
         offset = offsets_snapshot.get(car['car_id'], 0.0)
         car['total_progress'] = car['lap_count'] + car['spline'] + offset
+
+    if telem.session_type_raw in (1, 2):
+        return _apply_timing_standings(cars)
 
     # Overall gaps and intervals
     for idx, car in enumerate(cars):
@@ -773,6 +850,7 @@ def monitor_telemetry():
             telemetry_mmap, telemetry_page = open_telemetry_mmap()
             if telemetry_mmap is None:
                 if ac_connected:
+                    publish_focused_highlight(None)
                     ac_connected = False
                     socketio.emit('update', {'ac_connected': False, 'drivers': []})
                 time.sleep(2)
@@ -800,6 +878,7 @@ def monitor_telemetry():
             except Exception:
                 telemetry_mmap = None
                 telemetry_page = None
+                publish_focused_highlight(None)
                 ac_connected = False
                 continue
             time.sleep(0.1)
@@ -828,6 +907,7 @@ def monitor_telemetry():
             latest_focused_car = telem.focused_car
             latest_current_camera = telem.current_camera
             latest_current_car_camera = telem.current_car_camera
+            publish_focused_highlight(telem)
 
             if is_replay_only or telem.is_replay:
                 # Car data now comes from the replay frame being shown, so it
@@ -1718,6 +1798,15 @@ def index():
     return render_template_string(html)
 
 if __name__ == '__main__':
+    try:
+        highlight_config = load_highlight_config(REMOTE_CONFIG_PATH)
+    except HighlightConfigError as exc:
+        print('[remote_web] broadcast highlight configuration error: {}'.format(exc))
+    else:
+        if highlight_config is not None:
+            highlight_client = BroadcastHighlightClient(highlight_config)
+            highlight_client.start()
+            print('[remote_web] broadcast highlight enabled')
     threading.Thread(target=monitor_telemetry, daemon=True).start()
     threading.Thread(target=timetable_poll_loop, daemon=True).start()
     socketio.run(app, host='0.0.0.0')

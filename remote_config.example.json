@@ -1,0 +1,7 @@
+{
+  "broadcastHighlight": {
+    "url": "http://localhost:3000/api/broadcast-highlight",
+    "username": "lua-app",
+    "password": "welovesatriapandu"
+  }
+}

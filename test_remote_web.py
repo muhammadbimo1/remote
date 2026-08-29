@@ -76,6 +76,79 @@ class CarNumberTest(unittest.TestCase):
         self.assertEqual(driver["num"], 5)
 
 
+class StandingsOrderTest(unittest.TestCase):
+    def _telem(self, session_type_raw, cars):
+        telem = TelemetryPage()
+        telem.session_type_raw = session_type_raw
+        telem.car_count = len(cars)
+        telem.track_length = 5000.0
+        for index, spec in enumerate(cars):
+            car = telem.cars[index]
+            car.car_id = index
+            car.position = spec['position']
+            car.normalized_spline_pos = spec.get('spline', 0.5)
+            car.speed_kmh = 120.0
+            car.best_lap = spec['best_lap']
+            car.lap_count = spec.get('lap_count', 3)
+            car.is_connected = 1
+            car.driver_name = spec['name']
+            car.team_name = spec.get('team_name', 'PRO | Team')
+        return telem
+
+    def test_practice_and_qualifying_rank_by_fastest_lap(self):
+        cars = [
+            {'name': 'Slower', 'position': 1, 'best_lap': 95000},
+            {'name': 'Fastest', 'position': 3, 'best_lap': 93000},
+            {'name': 'No Time', 'position': 2, 'best_lap': 0},
+        ]
+
+        for session_type_raw in (1, 2):
+            with self.subTest(session_type_raw=session_type_raw):
+                drivers = build_update_data(
+                    self._telem(session_type_raw, cars))['drivers']
+
+                self.assertEqual(
+                    [d['name'] for d in drivers],
+                    ['Fastest', 'Slower', 'No Time'])
+                self.assertEqual([d['position'] for d in drivers], [1, 2, 3])
+                self.assertEqual(
+                    [d['gap'] for d in drivers],
+                    ['Leader', '+2.000s', '-'])
+                self.assertEqual(
+                    [d['interval'] for d in drivers],
+                    ['-', '+2.000s', '-'])
+
+    def test_qualifying_class_standings_use_fastest_lap(self):
+        telem = self._telem(2, [
+            {'name': 'PRO Fast', 'position': 3, 'best_lap': 93000,
+             'team_name': 'PRO | Team A'},
+            {'name': 'AM Fast', 'position': 2, 'best_lap': 94000,
+             'team_name': 'AM | Team B'},
+            {'name': 'PRO Slow', 'position': 1, 'best_lap': 95000,
+             'team_name': 'PRO | Team C'},
+        ])
+
+        drivers = build_update_data(telem)['drivers']
+
+        self.assertEqual([d['name'] for d in drivers],
+                         ['PRO Fast', 'AM Fast', 'PRO Slow'])
+        self.assertEqual([d['class_position'] for d in drivers], [1, 1, 2])
+        self.assertEqual(drivers[2]['class_interval'], '+2.000s')
+
+    def test_race_standings_remain_ordered_by_race_position(self):
+        drivers = build_update_data(self._telem(3, [
+            {'name': 'Race Leader', 'position': 1, 'best_lap': 95000,
+             'spline': 0.7},
+            {'name': 'Faster Lap', 'position': 2, 'best_lap': 93000,
+             'spline': 0.6},
+        ]))['drivers']
+
+        self.assertEqual([d['name'] for d in drivers],
+                         ['Race Leader', 'Faster Lap'])
+        self.assertEqual([d['position'] for d in drivers], [1, 2])
+        self.assertEqual(drivers[0]['gap'], 'Leader')
+
+
 class TimetableOffsetTest(unittest.TestCase):
     def tearDown(self):
         with remote_web._resync_lock:
@@ -107,6 +180,47 @@ class TimetableOffsetTest(unittest.TestCase):
         self.assertEqual(matched, 1)
         with remote_web._resync_lock:
             self.assertEqual(remote_web.progress_offsets, {2: 3.0})
+
+
+class BroadcastHighlightIntegrationTest(unittest.TestCase):
+    def setUp(self):
+        self.old_client = remote_web.highlight_client
+
+    def tearDown(self):
+        remote_web.highlight_client = self.old_client
+
+    def test_focused_local_car_publishes_remote_session_id(self):
+        published = []
+
+        class Recorder(object):
+            def publish(self, car_id):
+                published.append(car_id)
+                return True
+
+        telem = TelemetryPage()
+        telem.car_count = 3
+        telem.focused_car = 2
+        car = telem.cars[2]
+        car.car_id = 2
+        car.session_id = 18
+        car.is_connected = 1
+        remote_web.highlight_client = Recorder()
+
+        self.assertTrue(remote_web.publish_focused_highlight(telem))
+        self.assertEqual(published, [18])
+
+    def test_missing_telemetry_publishes_clear(self):
+        published = []
+
+        class Recorder(object):
+            def publish(self, car_id):
+                published.append(car_id)
+                return True
+
+        remote_web.highlight_client = Recorder()
+
+        self.assertTrue(remote_web.publish_focused_highlight(None))
+        self.assertEqual(published, [None])
 
 
 class TimetableUrlTest(unittest.TestCase):
