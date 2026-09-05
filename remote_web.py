@@ -2,6 +2,7 @@ import threading
 import time
 import json
 import os
+import sys
 import re
 import ipaddress
 from collections import defaultdict
@@ -30,7 +31,20 @@ from broadcast_highlight import (
     load_highlight_config,
 )
 
-app = Flask(__name__)
+def _runtime_dir():
+    """Directory next to the executable/script, where files live at runtime.
+
+    When frozen by PyInstaller, `__file__` points inside the bundled runtime
+    (_internal/_MEIPASS) rather than where the user launched from. Writable
+    files — the config and the event journal — and the served `static/` folder
+    must sit next to the .exe so they persist and stay editable across runs.
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+app = Flask(__name__, static_folder=os.path.join(_runtime_dir(), 'static'))
 socketio = SocketIO(app)
 
 ac_transport = ACIPCTransport()
@@ -39,8 +53,7 @@ ac_connected = False
 
 # Optional live-timing relay integration. Configuration is loaded only when
 # this file is run as the server, keeping imports side-effect free for tests.
-REMOTE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  'remote_config.json')
+REMOTE_CONFIG_PATH = os.path.join(_runtime_dir(), 'remote_config.json')
 highlight_client = None
 
 director = AutoDirector()
@@ -51,8 +64,7 @@ event_log = EventLog()
 # Permanent record, kept next to the server. Unlike event_log this is never
 # pruned — it exists to annotate the replay saved at the end of the session,
 # by which time the live buffer has long rolled over.
-EVENT_JOURNAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 'event_logs')
+EVENT_JOURNAL_DIR = os.path.join(_runtime_dir(), 'event_logs')
 event_journal = EventJournal(EVENT_JOURNAL_DIR)
 
 # Telemetry context for the journal, refreshed on every live tick so the MARK
