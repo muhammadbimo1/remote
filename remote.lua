@@ -394,6 +394,13 @@ local function processReplayCommands()
   elseif action == REPLAY_SEEK_FRAME then
     if active or sim.isReplayOnlyMode then
       ac.setReplayPosition(command.replay_frame, 0)
+      if command.target_driver >= 0 or command.target_camera > 0 then
+        -- Seeking a saved replay can reset the shot just like an instant-replay
+        -- jump. Replay-only mode reports isReplayActive=false, so hold against
+        -- the actual flag value instead of assuming the instant-replay side.
+        holdShot(command.target_driver, command.target_camera,
+          command.target_car_camera, active)
+      end
     else
       ac.log('Replay seek ignored: not in replay')
     end

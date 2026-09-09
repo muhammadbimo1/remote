@@ -7,6 +7,15 @@ import time
 from collections import defaultdict
 
 
+INCIDENT_ACQUIRE_S = 3.0
+INCIDENT_COVERAGE_S = 10.0
+ROLLOVER_RECOVERY_S = 6.0
+INCIDENT_PRIORITY = {'collision': 1, 'rollover': 2}
+BATTLE_ENTRY_S = 1.5
+BATTLE_EXIT_S = 2.0
+BATTLE_GRACE_S = 1.0
+
+
 class AutoDirector:
     IDLE_REASONS = {'default', 'leader', 'class_leader', 'front_runner'}
 
@@ -39,6 +48,13 @@ class AutoDirector:
         # refreshed each tick; once recovered, it decays via _score_car.
         self.rollover_active = {}
 
+        # Presentation protection is independent from event acquisition.
+        self.incident_focus = None
+        self.incident_reason = None
+        self.incident_coverage_until = 0.0
+        self.current_battle_opponents = set()
+        self.battle_last_active = 0.0
+
         # Per-class tracking
         self.class_best_laps = {}          # {class_name: best_lap_ms}
         self.last_class_leader_shown = {}  # {class_name: monotonic_time}
@@ -51,7 +67,7 @@ class AutoDirector:
 
         self._last_debug_log = 0.0
 
-    def tick(self, cars, track_length):
+    def tick(self, cars, track_length, is_race=True):
         """Called every telemetry cycle (~100ms).
 
         Args:
@@ -73,7 +89,7 @@ class AutoDirector:
             return None
 
         self._detect_endurance(cars)
-        self._detect_events(cars, now)
+        self._detect_events(cars, now, is_race)
 
         scores = []
         for car in connected:
@@ -103,8 +119,21 @@ class AutoDirector:
         connected = sum(1 for c in cars if c.get('is_connected'))
         self.endurance_mode = connected > 2 and lapped / connected > 0.3
 
-    def _detect_events(self, cars, now):
+    def _detect_events(self, cars, now, is_race):
         """Compare current frame to previous, populate event cooldowns."""
+        previous_overall_holders = {
+            position: cid for cid, position in self.prev_positions.items()
+            if position is not None
+        }
+        previous_class_holders = {}
+        classes_by_id = {car['car_id']: car.get('car_class', 'Unclassed')
+                         for car in cars}
+        for cid, position in self.prev_class_positions.items():
+            if position is not None and cid in classes_by_id:
+                previous_class_holders[(classes_by_id[cid], position)] = cid
+        in_pit_now = {car['car_id']: bool(car.get('is_in_pit'))
+                      for car in cars}
+
         for car in cars:
             cid = car['car_id']
             if not car.get('is_connected'):
@@ -118,17 +147,30 @@ class AutoDirector:
             if car.get('is_rolled_over'):
                 self.rollover_active[cid] = now
 
-            # Overall position change (improvement = overtake)
+            # A pass is race-only and pit-aware. Overall and class position
+            # changes from the same move acquire one event timestamp.
             prev_pos = self.prev_positions.get(cid)
             cur_pos = car.get('position')
-            if prev_pos is not None and cur_pos is not None and cur_pos < prev_pos:
-                self.position_change_seen[cid] = now
-
-            # Class position change
             prev_cls_pos = self.prev_class_positions.get(cid)
             cur_cls_pos = car.get('class_position')
-            if prev_cls_pos is not None and cur_cls_pos is not None and cur_cls_pos < prev_cls_pos:
-                self.class_position_change_seen[cid] = now
+            gained_overall = (prev_pos is not None and cur_pos is not None
+                              and cur_pos < prev_pos)
+            gained_class = (prev_cls_pos is not None and cur_cls_pos is not None
+                            and cur_cls_pos < prev_cls_pos)
+            eligible_overall = False
+            eligible_class = False
+            if is_race and not car.get('is_in_pit'):
+                if gained_overall:
+                    displaced = previous_overall_holders.get(cur_pos)
+                    eligible_overall = (displaced is None
+                                        or not in_pit_now.get(displaced, False))
+                if gained_class:
+                    displaced = previous_class_holders.get((
+                        car.get('car_class', 'Unclassed'), cur_cls_pos))
+                    eligible_class = (displaced is None
+                                      or not in_pit_now.get(displaced, False))
+            if eligible_overall or eligible_class:
+                self.position_change_seen[cid] = now
 
             # Fast lap (personal best)
             best = car.get('best_lap', 0)
@@ -163,56 +205,54 @@ class AutoDirector:
 
         # --- Rollover (top priority while flipped, decays after recovery) ---
         ro_time = self.rollover_active.get(cid)
-        if ro_time and now - ro_time < 6.0:
+        if ro_time and now - ro_time < ROLLOVER_RECOVERY_S:
             if car.get('is_rolled_over'):
                 ro_score = 150.0
             else:
-                ro_score = 150.0 * (1.0 - (now - ro_time) / 6.0)
+                ro_score = 150.0 * (
+                    1.0 - (now - ro_time) / ROLLOVER_RECOVERY_S)
+            parts['rollover'] = ro_score
             if ro_score > score:
                 score = ro_score
                 reason = 'rollover'
-                parts['rollover'] = ro_score
 
         # --- Collision (highest priority among contact events) ---
         col_time = self.collision_seen.get(cid)
-        if col_time and now - col_time < 3.0:
-            col_score = 100 * (1.0 - (now - col_time) / 3.0)
+        if col_time and now - col_time < INCIDENT_ACQUIRE_S:
+            col_score = 100 * (
+                1.0 - (now - col_time) / INCIDENT_ACQUIRE_S)
+            parts['collision'] = col_score
             if col_score > score:
                 score = col_score
+            if reason != 'rollover':
                 reason = 'collision'
-                parts['collision'] = col_score
 
         # --- Overall position change ---
         pc_time = self.position_change_seen.get(cid)
         if pc_time and now - pc_time < 5.0:
             pc_score = 70 * (1.0 - (now - pc_time) / 5.0)
+            parts['overtake'] = pc_score
             if pc_score > score:
                 score = pc_score
+            if reason not in ('rollover', 'collision'):
                 reason = 'overtake'
-                parts['overtake'] = pc_score
-
-        # --- Class position change ---
-        cpc_time = self.class_position_change_seen.get(cid)
-        if cpc_time and now - cpc_time < 5.0:
-            cpc_score = 60 * (1.0 - (now - cpc_time) / 5.0)
-            score += cpc_score
-            parts['class_overtake'] = cpc_score
-            if cpc_score > 50 and reason == 'default':
-                reason = 'class_overtake'
 
         # --- Class battle (same class, tight interval) ---
-        cls_int = car.get('class_interval_seconds', float('inf'))
-        if cls_int < 1.5:
-            battle_score = 60 * (1.0 - cls_int / 1.5)
+        cls_int = self._nearest_battle_gap(
+            car, 'class_battle', 'class_interval_seconds')
+        class_battle_active = cls_int < BATTLE_ENTRY_S
+        if class_battle_active:
+            battle_score = 60 * (1.0 - cls_int / BATTLE_ENTRY_S)
             score += battle_score
             parts['class_battle'] = battle_score
             if battle_score > 20 and reason in ('default',):
                 reason = 'class_battle'
 
         # --- Overall battle (different class proximity on track) ---
-        ovr_int = car.get('interval_seconds', float('inf'))
-        if ovr_int < 1.5:
-            ovr_battle = 40 * (1.0 - ovr_int / 1.5)
+        ovr_int = self._nearest_battle_gap(
+            car, 'battle', 'interval_seconds')
+        if ovr_int < BATTLE_ENTRY_S and not class_battle_active:
+            ovr_battle = 40 * (1.0 - ovr_int / BATTLE_ENTRY_S)
             score += ovr_battle
             parts['battle'] = ovr_battle
             if reason == 'default' and ovr_battle > 15:
@@ -246,9 +286,7 @@ class AutoDirector:
 
         # --- Staleness penalty (current focus), paused during active battle ---
         if cid == self.current_focus:
-            cur_cls_int = car.get('class_interval_seconds', float('inf'))
-            cur_ovr_int = car.get('interval_seconds', float('inf'))
-            in_battle = cur_cls_int < 2.0 or cur_ovr_int < 2.0
+            in_battle = self._current_battle_is_active(car, now)
             if not in_battle:
                 focused_time = now - self.focus_start
                 over_dwell = focused_time - self.min_dwell
@@ -277,10 +315,19 @@ class AutoDirector:
         if not scores:
             return None
 
-        scores.sort(key=lambda x: x[1], reverse=True)
+        scores.sort(
+            key=lambda x: (self._incident_priority(x[3]), x[1]),
+            reverse=True,
+        )
         best_car, best_score, best_reason, best_parts = scores[0]
 
         elapsed = now - self.last_cut_time if self.last_cut_time else float('inf')
+
+        if (self.incident_focus != self.current_focus
+                or now >= self.incident_coverage_until):
+            self.incident_focus = None
+            self.incident_reason = None
+            self.incident_coverage_until = 0.0
 
         # Locate the currently-focused entry for context (used for both
         # overrides logging and hysteresis comparison below).
@@ -299,23 +346,48 @@ class AutoDirector:
         # Compute hysteresis up-front so the debug snapshot can show it.
         hysteresis = 15
         if current_car is not None:
-            cur_cls_int = current_car.get('class_interval_seconds', float('inf'))
-            cur_ovr_int = current_car.get('interval_seconds', float('inf'))
-            if cur_cls_int < 2.0 or cur_ovr_int < 2.0:
+            if self._current_battle_is_active(current_car, now):
                 hysteresis += 15
         if self.endurance_mode:
             hysteresis += 5
 
-        # Rollover override (1s floor, beats collision since score >= 100)
-        if best_reason == 'rollover' and best_score > 100 and elapsed > 1.0:
+        best_incident_priority = self._incident_priority(best_parts)
+        protected_priority = INCIDENT_PRIORITY.get(self.incident_reason, 0)
+        coverage_active = now < self.incident_coverage_until
+
+        # An incident already on screen extends coverage without another
+        # camera command or a reset of the original shot start.
+        if (best_car['car_id'] == self.current_focus
+                and best_incident_priority):
+            if (best_car.get('is_colliding')
+                    or best_car.get('is_rolled_over')):
+                self.incident_focus = self.current_focus
+                self.incident_reason = best_reason
+                self.incident_coverage_until = max(
+                    self.incident_coverage_until,
+                    now + INCIDENT_COVERAGE_S,
+                )
+            return None
+
+        # Protected coverage only yields to a strictly more severe incident.
+        if coverage_active and best_incident_priority <= protected_priority:
+            return None
+
+        # Rollover override (1s floor). Test the rollover component itself,
+        # never aggregate battle/lap points.
+        if (best_reason == 'rollover'
+                and best_parts.get('rollover', 0) > 100
+                and elapsed > 1.0):
             return self._do_cut(best_car, best_reason, now,
                                 score=best_score, parts=best_parts,
                                 current_score=current_score,
                                 current_parts=current_parts,
                                 hysteresis=hysteresis)
 
-        # Collision override (1s floor)
-        if best_reason == 'collision' and best_score > 80 and elapsed > 1.0:
+        # Collision override (1s floor), likewise component-gated.
+        if (best_reason == 'collision'
+                and best_parts.get('collision', 0) > 80
+                and elapsed > 1.0):
             return self._do_cut(best_car, best_reason, now,
                                 score=best_score, parts=best_parts,
                                 current_score=current_score,
@@ -402,6 +474,17 @@ class AutoDirector:
         self.current_focus = cid
         self.focus_start = now
         self.last_cut_time = now
+        self.current_battle_opponents = set(car.get('battle_opponent_ids', ()))
+        self.battle_last_active = now if self.current_battle_opponents else 0.0
+
+        if reason in INCIDENT_PRIORITY:
+            self.incident_focus = cid
+            self.incident_reason = reason
+            self.incident_coverage_until = now + INCIDENT_COVERAGE_S
+        else:
+            self.incident_focus = None
+            self.incident_reason = None
+            self.incident_coverage_until = 0.0
 
         # Track leader/class leader show times (still used for telemetry,
         # even though the unconditional bonus has been removed).
@@ -414,8 +497,8 @@ class AutoDirector:
         # Set min dwell based on reason and mode
         mult = 1.5 if self.endurance_mode else 1.0
         dwell_map = {
-            'rollover': 6,
-            'collision': 4,
+            'rollover': INCIDENT_COVERAGE_S,
+            'collision': INCIDENT_COVERAGE_S,
             'overtake': 5,
             'class_overtake': 5,
             'class_battle': 10,    # was 6 — protect battles
@@ -429,6 +512,38 @@ class AutoDirector:
         self.min_dwell = dwell_map.get(reason, 8) * mult
 
         return {'driver': cid}
+
+    @staticmethod
+    def _incident_priority(parts):
+        if parts.get('rollover', 0) > 0:
+            return INCIDENT_PRIORITY['rollover']
+        if parts.get('collision', 0) > 0:
+            return INCIDENT_PRIORITY['collision']
+        return 0
+
+    @staticmethod
+    def _nearest_battle_gap(car, prefix, legacy_key):
+        ahead_key = prefix + '_gap_ahead_seconds'
+        behind_key = prefix + '_gap_behind_seconds'
+        if ahead_key in car or behind_key in car:
+            return min(car.get(ahead_key, float('inf')),
+                       car.get(behind_key, float('inf')))
+        return car.get(legacy_key, float('inf'))
+
+    def _current_battle_is_active(self, car, now):
+        cls_gap = self._nearest_battle_gap(
+            car, 'class_battle', 'class_interval_seconds')
+        overall_gap = self._nearest_battle_gap(
+            car, 'battle', 'interval_seconds')
+        close = min(cls_gap, overall_gap) < BATTLE_EXIT_S
+        opponents = set(car.get('battle_opponent_ids', ()))
+        same_battle = (not self.current_battle_opponents
+                       or bool(self.current_battle_opponents & opponents))
+        if close and same_battle:
+            self.battle_last_active = now
+            return True
+        return (self.battle_last_active > 0
+                and now - self.battle_last_active < BATTLE_GRACE_S)
 
     def _fmt_parts(self, parts):
         """Format scoring breakdown as 'key=+12.3 key=-4.5' sorted by magnitude."""

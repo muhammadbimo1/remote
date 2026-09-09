@@ -96,6 +96,48 @@ class TeamNamePayloadTest(unittest.TestCase):
         self.assertEqual(remote_web.get_car_class("AM 51 | Team C"), ("AM", "#e69138"))
 
 
+class IncidentNoticeMarkupTest(unittest.TestCase):
+    def test_collision_notice_has_independent_six_second_duration(self):
+        html = remote_web.app.test_client().get('/').get_data(as_text=True)
+
+        self.assertIn('var INCIDENT_NOTICE_MS = 6000;', html)
+        self.assertIn(
+            'Date.now() - collisionTimers[d.num] < INCIDENT_NOTICE_MS', html)
+
+
+class AutoDirectorMonitorIntegrationTest(unittest.TestCase):
+    def test_monitor_passes_explicit_race_context(self):
+        self.assertTrue(hasattr(remote_web, 'run_auto_director'))
+
+        class RecordingDirector(object):
+            enabled = True
+
+            def __init__(self):
+                self.race_contexts = []
+
+            def tick(self, cars, track_length, is_race):
+                self.race_contexts.append(is_race)
+                return None
+
+        original = remote_web.director
+        recorder = RecordingDirector()
+        remote_web.director = recorder
+        try:
+            qualifying = TelemetryPage()
+            qualifying.session_type = 0
+            qualifying.track_length = 5000.0
+            race = TelemetryPage()
+            race.session_type = 1
+            race.track_length = 5000.0
+
+            remote_web.run_auto_director([], qualifying, 7)
+            remote_web.run_auto_director([], race, 7)
+        finally:
+            remote_web.director = original
+
+        self.assertEqual(recorder.race_contexts, [False, True])
+
+
 class DriverNameTest(unittest.TestCase):
     def test_driver_name_is_passed_through_unchanged(self):
         telem = TelemetryPage()
@@ -186,6 +228,34 @@ class StandingsOrderTest(unittest.TestCase):
                          ['Race Leader', 'Faster Lap'])
         self.assertEqual([d['position'] for d in drivers], [1, 2])
         self.assertEqual(drivers[0]['gap'], 'Leader')
+
+    def test_physical_battle_context_is_symmetric(self):
+        cars = remote_web.compute_gaps(self._telem(3, [
+            {'name': 'Defender', 'position': 1, 'best_lap': 95000,
+             'spline': 0.500},
+            {'name': 'Attacker', 'position': 2, 'best_lap': 96000,
+             'spline': 0.499},
+        ]))
+
+        self.assertIn('battle_gap_behind_seconds', cars[0])
+        self.assertIn('battle_gap_ahead_seconds', cars[1])
+        self.assertLess(cars[0]['battle_gap_behind_seconds'], 1.5)
+        self.assertLess(cars[1]['battle_gap_ahead_seconds'], 1.5)
+        self.assertEqual(cars[0]['battle_opponent_ids'], [1])
+        self.assertEqual(cars[1]['battle_opponent_ids'], [0])
+
+    def test_qualifying_lap_delta_is_not_physical_battle_gap(self):
+        cars = remote_web.compute_gaps(self._telem(2, [
+            {'name': 'Fast', 'position': 1, 'best_lap': 95000,
+             'spline': 0.8},
+            {'name': 'Close Lap', 'position': 2, 'best_lap': 95100,
+             'spline': 0.2},
+        ]))
+
+        self.assertIn('battle_gap_behind_seconds', cars[0])
+        self.assertIn('battle_gap_ahead_seconds', cars[1])
+        self.assertGreater(cars[0]['battle_gap_behind_seconds'], 2.0)
+        self.assertGreater(cars[1]['battle_gap_ahead_seconds'], 2.0)
 
 
 class TimetableOffsetTest(unittest.TestCase):
@@ -318,6 +388,7 @@ class ReplayPayloadTest(unittest.TestCase):
     def tearDown(self):
         remote_web.event_log.clear()
         remote_web._last_live_payload = None
+        remote_web._replay_fallback_payload = None
 
     def _live_telem(self):
         telem = TelemetryPage()
@@ -370,14 +441,27 @@ class ReplayPayloadTest(unittest.TestCase):
         self.assertTrue(data["replay"]["active"])
         self.assertEqual(data["replay"]["frame"], 7)
 
-    def test_replay_payload_without_a_live_snapshot_is_empty_not_crashing(self):
+    def test_replay_payload_without_a_live_snapshot_seeds_driver_grid(self):
         telem = self._live_telem()
         telem.is_replay = 1
 
         data = remote_web.build_replay_update_data(telem)
 
-        self.assertEqual(data["drivers"], [])
+        self.assertEqual(len(data["drivers"]), 1)
+        self.assertEqual(data["drivers"][0]["name"], "23 | Alex Driver")
         self.assertTrue(data["ac_connected"])
+
+    def test_replay_seeded_driver_grid_stays_frozen(self):
+        telem = self._live_telem()
+        telem.is_replay = 1
+        first = remote_web.build_replay_update_data(telem)
+
+        telem.cars[0].position = 9
+        telem.cars[0].driver_name = "Replay Frame Name"
+        second = remote_web.build_replay_update_data(telem)
+
+        self.assertEqual(second["drivers"], first["drivers"])
+        self.assertEqual(second["drivers"][0]["name"], "23 | Alex Driver")
 
 
 class ReplayPollGuardTest(unittest.TestCase):
@@ -697,7 +781,8 @@ class ReviewModeTest(unittest.TestCase):
                 patch.object(remote_web, 'emit'):
             remote_web.handle_jump_to_event({'id': 1})
 
-        send.assert_called_once_with(remote_web.REPLAY_SEEK_FRAME, frame=400)
+        send.assert_called_once_with(
+            remote_web.REPLAY_SEEK_FRAME, frame=400, driver=0, camera=1)
 
     def test_jump_in_review_missing_event_does_not_seek(self):
         remote_web.review_journal = {

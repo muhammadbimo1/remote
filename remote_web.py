@@ -115,7 +115,8 @@ def maybe_rotate_session(telem):
     not be jumpable, and they must not share a file with the new session's.
     Returns the label if a rotation happened, else None.
     """
-    global _current_session, _last_live_payload, _latest_cars_by_id
+    global _current_session, _last_live_payload, _replay_fallback_payload
+    global _latest_cars_by_id
 
     identity = session_identity(telem)
     if identity == _current_session:
@@ -139,6 +140,7 @@ def maybe_rotate_session(telem):
         started_at=started_at,
         letter=SESSION_TYPE_LETTERS.get(telem.session_type_raw, 'O'))
     _last_live_payload = None
+    _replay_fallback_payload = None
     _latest_cars_by_id = {}
     # Lap-count corrections belong to the session that produced them.
     with _resync_lock:
@@ -160,6 +162,11 @@ REPLAY_MIN_REWIND_S = 5.0
 # gaps read out of a replay frame are not the race state the operator needs.
 _last_live_payload = None
 
+# If the server starts while replay is already active there is no live payload
+# to freeze. Seed the grid once from that replay's roster, then keep it frozen
+# so replay-frame standings are never presented as current race state.
+_replay_fallback_payload = None
+
 # Latest telemetry snapshot captured by the monitor thread. The request
 # handlers read this instead of waiting for another telemetry update.
 latest_focused_car = 0
@@ -177,6 +184,8 @@ CLASS_COLORS = {
 # --- Timetable re-sync (poll AC server /timetable.json) ---
 TIMETABLE_POLL_INTERVAL = 60.0
 TIMETABLE_TIMEOUT = 3.0
+BATTLE_EXIT_S = 2.0
+BATTLE_SPEED_FLOOR_MS = 10.0
 
 _resync_lock = threading.Lock()
 progress_offsets = {}        # { car_id:int -> float lap-count correction }
@@ -277,6 +286,53 @@ def _apply_timing_standings(cars):
     return cars
 
 
+def _physical_gap_seconds(ahead, behind, track_length):
+    """Stable proximity estimate for two adjacent cars on the same lap."""
+    progress = ahead['total_progress'] - behind['total_progress']
+    if progress < 0 or progress >= 1.0 or track_length <= 0:
+        return float('inf')
+    distance = progress * track_length
+    speed_ms = max(
+        BATTLE_SPEED_FLOOR_MS,
+        (ahead['speed_kmh'] + behind['speed_kmh']) / 7.2,
+    )
+    return distance / speed_ms
+
+
+def _apply_physical_battle_context(cars, track_length):
+    """Attach reciprocal on-track gaps independently of UI standings."""
+    inf = float('inf')
+    for car in cars:
+        car['battle_gap_ahead_seconds'] = inf
+        car['battle_gap_behind_seconds'] = inf
+        car['class_battle_gap_ahead_seconds'] = inf
+        car['class_battle_gap_behind_seconds'] = inf
+        car['battle_opponent_ids'] = set()
+
+    eligible = [c for c in cars
+                if c.get('is_connected') and not c.get('is_in_pit')]
+    ordered = sorted(eligible, key=lambda c: c['total_progress'], reverse=True)
+
+    def attach_pairs(group, prefix):
+        for ahead, behind in zip(group, group[1:]):
+            gap = _physical_gap_seconds(ahead, behind, track_length)
+            ahead[prefix + '_gap_behind_seconds'] = gap
+            behind[prefix + '_gap_ahead_seconds'] = gap
+            if gap < BATTLE_EXIT_S:
+                ahead['battle_opponent_ids'].add(behind['car_id'])
+                behind['battle_opponent_ids'].add(ahead['car_id'])
+
+    attach_pairs(ordered, 'battle')
+    by_class = defaultdict(list)
+    for car in ordered:
+        by_class[car['car_class']].append(car)
+    for class_cars in by_class.values():
+        attach_pairs(class_cars, 'class_battle')
+
+    for car in cars:
+        car['battle_opponent_ids'] = sorted(car['battle_opponent_ids'])
+
+
 def compute_gaps(telem):
     """Compute gap to leader and interval to car ahead for each car."""
     cars = []
@@ -319,6 +375,8 @@ def compute_gaps(telem):
     for idx, car in enumerate(cars):
         offset = offsets_snapshot.get(car['car_id'], 0.0)
         car['total_progress'] = car['lap_count'] + car['spline'] + offset
+
+    _apply_physical_battle_context(cars, track_length)
 
     if telem.session_type_raw in (1, 2):
         return _apply_timing_standings(cars)
@@ -551,7 +609,8 @@ _prev_rollover_state = {}
 
 def reset_ac_run_state():
     """Drop every cache whose identity or timestamps belong to one AC run."""
-    global _current_session, _last_live_payload, _latest_replay_context
+    global _current_session, _last_live_payload, _replay_fallback_payload
+    global _latest_replay_context
     global _latest_cars_by_id, review_journal
     global latest_focused_car, latest_current_camera
     global latest_current_car_camera, latest_replay_file
@@ -567,6 +626,7 @@ def reset_ac_run_state():
     _prev_rollover_state.clear()
     _current_session = None
     _last_live_payload = None
+    _replay_fallback_payload = None
     _latest_replay_context = {}
     _latest_cars_by_id = {}
     review_journal = None
@@ -675,8 +735,13 @@ def build_replay_update_data(telem):
     operator can still act on (camera state, focus, replay position, the event
     log) is current.
     """
+    global _replay_fallback_payload
+
     if _last_live_payload is None:
-        data = {'ac_connected': True, 'drivers': []}
+        if (_replay_fallback_payload is None or
+                not _replay_fallback_payload['drivers']):
+            _replay_fallback_payload = build_update_data(telem)
+        data = dict(_replay_fallback_payload)
     else:
         data = dict(_last_live_payload)
 
@@ -740,7 +805,10 @@ def enter_review(replay_file, telem):
     sim.isReplayOnlyMode is set. A `None` session means no journal matched —
     the events list is empty and the operator can pick one manually.
     """
-    global review_journal
+    global review_journal, _replay_fallback_payload
+    if (review_journal is None or
+            review_journal.get('replay_file') != replay_file):
+        _replay_fallback_payload = None
     sessions = event_journal.list_sessions()
     session, confidence = match_replay(replay_file, telem.replay_frames,
                                        telem.replay_frame_ms, sessions)
@@ -761,8 +829,9 @@ def enter_review(replay_file, telem):
 
 def exit_review():
     """Leave saved-replay review, back to live/instant-replay behaviour."""
-    global review_journal
+    global review_journal, _replay_fallback_payload
     review_journal = None
+    _replay_fallback_payload = None
 
 
 def send_command(target_driver, target_camera, target_car_camera=-1,
@@ -785,12 +854,29 @@ def send_replay_command(action, rewind_s=0.0, frame=0, driver=None, camera=None)
         action, rewind_s, frame, driver, camera, -1)
 
 
+def run_auto_director(director_cars, telem, connection_generation):
+    """Evaluate one live telemetry tick with explicit session context."""
+    with director_lock:
+        if not director.enabled:
+            return
+        cmd = director.tick(
+            director_cars,
+            telem.track_length,
+            is_race=telem.session_type == 1,
+        )
+        if cmd:
+            send_command(
+                cmd['driver'], 1,
+                expected_generation=connection_generation)
+
+
 def monitor_telemetry():
     """Process fresh WebSocket telemetry and push updates via SocketIO."""
     global ac_connected
     global latest_focused_car, latest_current_camera, latest_current_car_camera
     global latest_replay_file
-    global _last_live_payload, _latest_replay_context, _latest_cars_by_id
+    global _last_live_payload, _replay_fallback_payload
+    global _latest_replay_context, _latest_cars_by_id
     global _current_session
     global review_journal
 
@@ -891,17 +977,12 @@ def monitor_telemetry():
                         record_event(event)
                     data = build_update_data(telem, cars_with_gaps)
                     _last_live_payload = data
+                    _replay_fallback_payload = None
                     director_cars = cars_with_gaps
 
             if director_cars is not None:
-                with director_lock:
-                    if director.enabled:
-                        cmd = director.tick(
-                            director_cars, telem.track_length)
-                        if cmd:
-                            send_command(
-                                cmd['driver'], 1,
-                                expected_generation=connection_generation)
+                run_auto_director(
+                    director_cars, telem, connection_generation)
 
             with ac_transport.generation_guard(
                     connection_generation) as current:
@@ -949,7 +1030,9 @@ def handle_jump_to_event(data):
             return
         with director_lock:
             director.enabled = False
-        ok = send_replay_command(REPLAY_SEEK_FRAME, frame=event['frame'])
+        ok = send_replay_command(
+            REPLAY_SEEK_FRAME, frame=event['frame'],
+            driver=event.get('car_id'), camera=1)
         print('[remote_web] replay seek: event={} kind={} frame={}'.format(
             event_id, event['kind'], event['frame']))
         emit('replay_status', {'ok': ok, 'frame': event['frame'],
@@ -1148,6 +1231,7 @@ def index():
         <script>
             const socket = io();
             var collisionTimers = {};
+            var INCIDENT_NOTICE_MS = 6000;
             var activeClassFilter = 'ALL';
             var ttStatus = 'idle';
 
@@ -1171,7 +1255,7 @@ def index():
             window.fakeCollision = function(num) {
                 num = num || 1;
                 collisionTimers[num] = Date.now();
-                console.log('[collision debug] forced collision on num', num, '— will last 1s');
+                console.log('[collision debug] forced collision on num', num, '— will last 6s');
             };
 
             function changeCamera(camId, carCam) {
@@ -1617,7 +1701,8 @@ def index():
                             collisionTimers[d.num] = Date.now();
                             console.log('[collision] socket reports colliding: num=' + d.num + ' name=' + d.name);
                         }
-                        var isColliding = collisionTimers[d.num] && (Date.now() - collisionTimers[d.num] < 1000);
+                        var isColliding = collisionTimers[d.num]
+                            && (Date.now() - collisionTimers[d.num] < INCIDENT_NOTICE_MS);
                         var isRolledOver = !!d.rolled_over;
                         var isSelected = d.num - 1 === data.current_driver;
                         var isOffline = d.status === 'OFFLINE';

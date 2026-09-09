@@ -300,9 +300,32 @@ local function testSeekWithinReplayDoesNotRunAStinger()
   assertEqual(ctx.seekCalls[1].frame, 800, 'the rewind converts to the expected replay frame')
 end
 
+local function testSavedReplaySeekAppliesEventShot()
+  local ctx = loadRemote(false)
+  ctx.sim.isReplayOnlyMode = true
+  ctx.deliver({
+    version = 1,
+    connection_id = 'server-a',
+    type = 'replay',
+    replay_seq = ctx.nextReplaySeq(),
+    replay_action = 3,
+    replay_rewind_s = 0,
+    replay_frame = 400,
+    target_driver = 4,
+    target_camera = 1,
+    target_car_camera = -1,
+  })
+
+  ctx.update()
+  assertEqual(ctx.seekCalls[1].frame, 400, 'a saved replay jump seeks to the event frame')
+  assertEqual(ctx.sim.focusedCar, 4, 'a saved replay jump focuses the event driver')
+  assertEqual(ctx.sim.cameraMode, 1, 'a saved replay jump selects the requested camera')
+end
+
 testEnterWaitsUntilScreenIsCovered()
 testLiveWaitsUntilScreenIsCovered()
 testSeekWithinReplayDoesNotRunAStinger()
+testSavedReplaySeekAppliesEventShot()
 testStingerRendersInScenePassForCleanOutput()
 testWebSocketConnectsToLoopbackWithReconnect()
 testTelemetryUsesVersionedProtocolAtTenHertz()
