@@ -97,7 +97,7 @@ class CarSnapshot(_FrozenSnapshot):
 class TelemetrySnapshot(_FrozenSnapshot):
     __slots__ = (
         'packet_id', 'car_count', 'focused_car', 'current_camera',
-        'car_cameras_count', 'current_car_camera', 'track_length',
+        'car_cameras_count', 'current_car_camera', 'track_length', 'track_name',
         'session_type', 'session_index', 'session_type_raw', 'session_gen',
         'session_name', 'is_replay', 'replay_frame', 'replay_frames',
         'replay_frame_ms', 'replay_last_result', 'is_replay_only',
@@ -130,7 +130,7 @@ class TelemetrySnapshot(_FrozenSnapshot):
             setattr(result, name, _number(message, name))
         for name in ('is_replay', 'is_replay_only'):
             setattr(result, name, _boolean(message, name))
-        for name in ('session_name', 'replay_file', 'replay_temp_dir',
+        for name in ('track_name', 'session_name', 'replay_file', 'replay_temp_dir',
                      'timetable_url'):
             setattr(result, name, _string(message, name))
 

@@ -31,6 +31,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from datetime import datetime
 
 
@@ -149,6 +150,7 @@ class EventJournal:
         self._path = None
         self._count = 0
         self._label = None
+        self._track_name = None
         self._replay_dir = None
         self._replay_file = None
         self._session_started_at = None
@@ -253,7 +255,7 @@ class EventJournal:
         return records
 
     def start_session(self, label=None, replay_dir=None, started_at=None,
-                      letter=None):
+                      letter=None, track_name=None):
         """Begin a new file on the next append, tagged with `label`.
 
         AC records a separate replay per session and wipes the instant-replay
@@ -262,12 +264,14 @@ class EventJournal:
 
         Given `replay_dir` (AC's replay/temp) and the session start, the
         journal names itself after the .acreplay being recorded, so the pair
-        sits together in a directory listing.
+        sits together in a directory listing. If no replay matches,
+        `track_name` is included in the timestamped fallback filename.
         """
         with self._lock:
             self._path = None
             self._count = 0
             self._label = label
+            self._track_name = track_name
             self._replay_dir = replay_dir
             self._replay_file = None
             self._session_started_at = started_at
@@ -279,6 +283,7 @@ class EventJournal:
             self._path = None
             self._count = 0
             self._label = None
+            self._track_name = None
             self._replay_dir = None
             self._replay_file = None
             self._session_started_at = None
@@ -318,7 +323,8 @@ class EventJournal:
             stem = os.path.splitext(self._replay_file)[0]
             return os.path.join(self.directory, stem + '.jsonl')
         stamp = datetime.fromtimestamp(self._clock()).strftime('%Y%m%d-%H%M%S')
-        slug = self._slug(self._label)
+        slug = '-'.join(filter(None, (
+            self._slug(self._track_name), self._slug(self._label))))
         name = 'events-{}-{}.jsonl'.format(stamp, slug) if slug \
             else 'events-{}.jsonl'.format(stamp)
         return os.path.join(self.directory, name)
@@ -327,7 +333,9 @@ class EventJournal:
     def _slug(label):
         if not label:
             return ''
-        slug = re.sub(r'[^A-Za-z0-9]+', '-', str(label)).strip('-').lower()
+        ascii_label = unicodedata.normalize('NFKD', str(label)).encode(
+            'ascii', 'ignore').decode('ascii')
+        slug = re.sub(r'[^A-Za-z0-9]+', '-', ascii_label).strip('-').lower()
         return slug[:32]
 
     def _build_record(self, event, context):

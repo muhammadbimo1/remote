@@ -108,6 +108,15 @@ class EventJournalTest(unittest.TestCase):
         self.assertNotIn('#', name)
         self.assertTrue(name.endswith('-race-session-1.jsonl'), name)
 
+    def test_unmatched_filename_includes_the_track_name(self):
+        self.journal.start_session('Race', track_name='Nürburgring / GP')
+        self.journal.append(event())
+
+        self.assertTrue(
+            os.path.basename(self.journal.path).endswith(
+                '-nurburgring-gp-race.jsonl'),
+            os.path.basename(self.journal.path))
+
     def test_new_session_starts_a_new_file(self):
         self.journal.append(event())
         first = self.journal.path
@@ -204,7 +213,8 @@ class ReplayPairingTest(unittest.TestCase):
         self.journal = EventJournal(os.path.join(self.dir, 'event_logs'))
 
     def test_journal_takes_the_replay_stem_as_its_name(self):
-        self.journal.start_session('Race', replay_dir=self.replays,
+        self.journal.start_session('Race', track_name='Road Atlanta',
+                                   replay_dir=self.replays,
                                    started_at=datetime(2026, 8, 8, 21, 20, 46).timestamp(),
                                    letter='R')
         self.journal.append(event())

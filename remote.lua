@@ -670,6 +670,7 @@ local function updateTelemetry()
     car_cameras_count = focusedCar and focusedCar.carCamerasCount or 0,
     current_car_camera = sim.carCameraIndex,
     track_length = sim.trackLengthM,
+    track_name = ac.getTrackName() or '',
     session_type = (sim.raceSessionType == ac.SessionType.Race) and 1 or 0,
     session_index = sessionIndex,
     session_type_raw = sessionTypeRaw,

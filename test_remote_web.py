@@ -38,6 +38,7 @@ class TelemetryPage(object):
         self.car_cameras_count = 0
         self.current_car_camera = 0
         self.track_length = 0.0
+        self.track_name = ''
         self.session_type = 0
         self.session_index = 0
         self.session_type_raw = 0
@@ -493,9 +494,12 @@ class SessionRotationTest(unittest.TestCase):
     def setUp(self):
         remote_web._current_session = None
         self.rotations = []
+        self.rotation_calls = []
         patcher = patch.object(
             remote_web.event_journal, 'start_session',
-            side_effect=lambda label=None, **kw: self.rotations.append(label))
+            side_effect=lambda label=None, **kw: (
+                self.rotations.append(label),
+                self.rotation_calls.append((label, kw))))
         self.addCleanup(patcher.stop)
         patcher.start()
 
@@ -514,6 +518,16 @@ class SessionRotationTest(unittest.TestCase):
     def test_first_telemetry_opens_a_journal(self):
         self.assertEqual(remote_web.maybe_rotate_session(self._telem()), 'Race')
         self.assertEqual(self.rotations, ['Race'])
+
+    def test_rotation_passes_track_name_to_the_journal(self):
+        telem = self._telem()
+        telem.track_name = 'Silverstone Grand Prix'
+
+        remote_web.maybe_rotate_session(telem)
+
+        self.assertEqual(
+            self.rotation_calls[0][1]['track_name'],
+            'Silverstone Grand Prix')
 
     def test_same_session_does_not_rotate(self):
         remote_web.maybe_rotate_session(self._telem())
@@ -610,7 +624,8 @@ class IPCPeerSecurityTest(unittest.TestCase):
                     'version': 1, 'type': 'telemetry', 'packet_id': 9,
                     'car_count': 0, 'focused_car': 0, 'current_camera': 1,
                     'car_cameras_count': 0, 'current_car_camera': 0,
-                    'track_length': 5000.0, 'session_type': 1,
+                    'track_length': 5000.0,
+                    'track_name': 'Silverstone Grand Prix', 'session_type': 1,
                     'session_index': 0, 'session_type_raw': 3,
                     'session_gen': 1, 'session_name': 'Race',
                     'is_replay': False, 'replay_frame': 0,
@@ -694,6 +709,7 @@ class ReviewModeTest(unittest.TestCase):
             3, 25.0)
 
         self.assertEqual(ev['frame'], 4000)
+        self.assertEqual(ev['seek_frame'], 3880)
         self.assertEqual(ev['seek_s'], 100.0)
         self.assertEqual(ev['id'], 3)
 
@@ -703,7 +719,16 @@ class ReviewModeTest(unittest.TestCase):
             1, 25.0)
 
         self.assertEqual(ev['frame'], 4000)
+        self.assertEqual(ev['seek_frame'], 3880)
         self.assertEqual(ev['seek_s'], 100.0)
+
+    def test_review_event_lead_in_clamps_to_first_frame(self):
+        ev = remote_web._review_event_from_record(
+            {'replay_frame': 50, 'kind': 'collision', 'label': 'HIT'},
+            1, 25.0)
+
+        self.assertEqual(ev['frame'], 50)
+        self.assertEqual(ev['seek_frame'], 0)
 
     def test_enter_review_loads_the_matched_journal(self):
         telem = TelemetryPage()
@@ -774,7 +799,7 @@ class ReviewModeTest(unittest.TestCase):
             'replay_file': 'x', 'session': {'file': 'AC_1.jsonl'},
             'manual': False,
             'events': [{'id': 1, 'kind': 'collision', 'label': 'HIT',
-                        'car_id': 0, 'frame': 400}],
+                        'car_id': 0, 'frame': 400, 'seek_frame': 280}],
         }
         with patch.object(remote_web, 'send_replay_command',
                           return_value=True) as send, \
@@ -782,7 +807,7 @@ class ReviewModeTest(unittest.TestCase):
             remote_web.handle_jump_to_event({'id': 1})
 
         send.assert_called_once_with(
-            remote_web.REPLAY_SEEK_FRAME, frame=400, driver=0, camera=1)
+            remote_web.REPLAY_SEEK_FRAME, frame=280, driver=0, camera=1)
 
     def test_jump_in_review_missing_event_does_not_seek(self):
         remote_web.review_journal = {

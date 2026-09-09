@@ -38,6 +38,7 @@ def telemetry_message(cars=None, **overrides):
         'car_cameras_count': 3,
         'current_car_camera': 0,
         'track_length': 5000.0,
+        'track_name': 'Silverstone Grand Prix',
         'session_type': 1,
         'session_index': 0,
         'session_type_raw': 3,
@@ -80,6 +81,7 @@ class TelemetrySnapshotTest(unittest.TestCase):
 
         self.assertEqual(snapshot.packet_id, 7)
         self.assertEqual(snapshot.car_count, 1)
+        self.assertEqual(snapshot.track_name, 'Silverstone Grand Prix')
         self.assertEqual(snapshot.cars[0].driver_name, 'Alex Driver')
         self.assertTrue(snapshot.cars[0].is_connected)
 

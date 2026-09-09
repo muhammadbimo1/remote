@@ -136,6 +136,7 @@ def maybe_rotate_session(telem):
     event_log.window_s = EventLog.BUFFER_S
     event_journal.start_session(
         label,
+        track_name=(getattr(telem, 'track_name', '') or '').strip(),
         replay_dir=(getattr(telem, 'replay_temp_dir', '') or '').strip(),
         started_at=started_at,
         letter=SESSION_TYPE_LETTERS.get(telem.session_type_raw, 'O'))
@@ -154,6 +155,9 @@ def maybe_rotate_session(telem):
 # Seconds of lead-in ahead of an event when jumping back to it: contact is
 # only readable with the approach in front of it.
 REPLAY_PREROLL_S = 3.0
+# Saved replay journals use absolute frames, so keep their lead-in separately
+# tunable even though it currently matches instant replay.
+REPLAY_REVIEW_PREROLL_S = 3.0
 # AC clamps very short rewinds oddly; keep a floor.
 REPLAY_MIN_REWIND_S = 5.0
 
@@ -785,6 +789,11 @@ def _review_event_from_record(record, index, default_frame_ms):
         frame = int(round(session_s * 1000.0 / frame_ms))
     if session_s is None and frame is not None and frame_ms:
         session_s = round(frame * frame_ms / 1000.0, 2)
+    seek_frame = frame
+    if frame is not None and frame_ms:
+        lead_in_frames = int(round(
+            REPLAY_REVIEW_PREROLL_S * 1000.0 / frame_ms))
+        seek_frame = max(0, frame - lead_in_frames)
     return {
         'id': index,
         'kind': record.get('kind'),
@@ -794,6 +803,7 @@ def _review_event_from_record(record, index, default_frame_ms):
         't': record.get('t'),
         'age': 0,
         'frame': frame,
+        'seek_frame': seek_frame,
         'seek_s': session_s,
     }
 
@@ -1030,12 +1040,13 @@ def handle_jump_to_event(data):
             return
         with director_lock:
             director.enabled = False
+        target_frame = event.get('seek_frame', event['frame'])
         ok = send_replay_command(
-            REPLAY_SEEK_FRAME, frame=event['frame'],
+            REPLAY_SEEK_FRAME, frame=target_frame,
             driver=event.get('car_id'), camera=1)
         print('[remote_web] replay seek: event={} kind={} frame={}'.format(
-            event_id, event['kind'], event['frame']))
-        emit('replay_status', {'ok': ok, 'frame': event['frame'],
+            event_id, event['kind'], target_frame))
+        emit('replay_status', {'ok': ok, 'frame': target_frame,
                                'event_id': event_id}, broadcast=True)
         return
 
