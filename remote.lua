@@ -123,6 +123,14 @@ local replayBusyUntil = 0
 -- while AC resets the grid.
 local leaderboardSuppressed = false
 
+-- Windows redirected to OBS are temporarily returned to the regular HUD layer
+-- during replay. Keep their original redirect state so it can be restored.
+local LIVE_REPLAY_WINDOW_TITLE = 'Live / Replay'
+local obsHudRedirects = {}
+local obsHudSettings = ac.INIConfig.scriptSettings()
+local hideOtherObsHudAppsInReplay = obsHudSettings:get(
+  'OBS_HUD', 'HIDE_OTHERS_IN_REPLAY', true)
+
 -- ac.tryToToggleReplay's rewindS overshoots on this rig (it converts seconds at
 -- a fixed 60 fps while the recording is ~16.7 fps). So entry uses only a nominal
 -- rewind, and the real position is applied by a precise seek to
@@ -130,9 +138,10 @@ local leaderboardSuppressed = false
 local REPLAY_ENTER_NOMINAL_REWIND_S = 0.5
 local pendingSeek = nil        -- absolute frame to seek to once replay is active
 
--- Stinger timing configuration. A replay mode change is delayed until the
--- stinger has covered the game; the covered hold lasts only as long as AC
--- needs to report the requested replay state, up to the configured timeout.
+-- Stinger timing configuration. The replay toggle is issued as the stinger
+-- is queued so the first stinger frame is already in the requested state.
+-- The hold after the slide-in lasts only as long as AC needs to report that
+-- state, up to the configured timeout.
 local STINGER_TIMING = {
   slideInS = 0.3,
   coveredWaitTimeoutS = 1.5,
@@ -333,6 +342,13 @@ local function exitReplay(reason)
 end
 
 local function queueStinger(action, rewindS, driver, camera, subCam)
+  local targetReplay = action == REPLAY_ENTER
+  local ok
+  if targetReplay then
+    ok = enterReplay(rewindS, driver, camera, subCam)
+  else
+    ok = exitReplay('command')
+  end
   stinger = {
     phase = 'cover',
     phaseStarted = os.preciseClock(),
@@ -341,7 +357,8 @@ local function queueStinger(action, rewindS, driver, camera, subCam)
     driver = driver,
     camera = camera,
     subCam = subCam,
-    targetReplay = action == REPLAY_ENTER,
+    targetReplay = targetReplay,
+    toggleOk = ok == true,
   }
 end
 
@@ -413,15 +430,7 @@ local function processStinger()
   local now = os.preciseClock()
   if stinger.phase == 'cover' then
     if now - stinger.phaseStarted < STINGER_TIMING.slideInS then return end
-
-    local ok
-    if stinger.action == REPLAY_ENTER then
-      ok = enterReplay(stinger.rewindS, stinger.driver, stinger.camera, stinger.subCam)
-    else
-      ok = exitReplay('command')
-    end
-
-    if ok then
+    if stinger.toggleOk then
       stinger.phase = 'wait'
       stinger.deadline = now + STINGER_TIMING.coveredWaitTimeoutS
     else
@@ -489,6 +498,52 @@ local function syncLeaderboard()
     leaderboardSuppressed = hide
   end
 end
+
+local function suppressObsHudWindows()
+  for _, info in ipairs(ac.getAppWindows()) do
+    if info.layer ~= 0 and info.title ~= LIVE_REPLAY_WINDOW_TITLE then
+      local saved = obsHudRedirects[info.name]
+      local window = saved ~= nil and saved.window
+          or ac.accessAppWindow(info.name)
+      if window ~= nil and not window:valid() then
+        window = ac.accessAppWindow(info.name)
+      end
+      if window ~= nil and window:valid() then
+        if saved == nil then
+          saved = {
+            window = window,
+            layer = info.layer,
+            duplicate = info.layerDuplicate == true,
+          }
+          obsHudRedirects[info.name] = saved
+        else
+          saved.window = window
+        end
+        window:setRedirectLayer(0)
+      end
+    end
+  end
+end
+
+local function restoreObsHudWindows()
+  for _, saved in pairs(obsHudRedirects) do
+    if saved.window:valid() then
+      saved.window:setRedirectLayer(saved.layer, saved.duplicate)
+    end
+  end
+  obsHudRedirects = {}
+end
+
+local function syncObsHudForwarding()
+  if hideOtherObsHudAppsInReplay
+      and (sim.isReplayActive or sim.isReplayOnlyMode) then
+    suppressObsHudWindows()
+  else
+    restoreObsHudWindows()
+  end
+end
+
+ac.onRelease(restoreObsHudWindows)
 
 ac.onReplay(function(event)
   ac.log('Replay event: ' .. tostring(event))
@@ -700,6 +755,7 @@ function script.update(dt)
   -- Commands run every frame: they are a sequence compare when idle, and the
   -- deferred replay shot needs to land the frame replay comes up, not up to
   -- 100 ms later.
+  syncObsHudForwarding()
   processReplayCommands()
   processStinger()
   processPendingSeek()
@@ -892,5 +948,12 @@ function script.windowLiveReplaySettings(dt)
     indicatorFontSize = value
     indicatorSettings:set('INDICATOR', 'FONT_SIZE', value)
     indicatorSettings:save()
+  end
+  if ui.checkbox('Hide other OBS HUD apps during replay',
+      hideOtherObsHudAppsInReplay) then
+    hideOtherObsHudAppsInReplay = not hideOtherObsHudAppsInReplay
+    obsHudSettings:set(
+      'OBS_HUD', 'HIDE_OTHERS_IN_REPLAY', hideOtherObsHudAppsInReplay)
+    obsHudSettings:save()
   end
 end

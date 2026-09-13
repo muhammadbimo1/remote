@@ -4,7 +4,7 @@ local function assertEqual(actual, expected, message)
   end
 end
 
-local function loadRemote(isReplayActive)
+local function loadRemote(isReplayActive, hideObsHudInReplay)
   local now = 0
   local replaySeq = 0
   local toggleCalls = {}
@@ -14,6 +14,20 @@ local function loadRemote(isReplayActive)
   local socketParams = nil
   local socketCallback = nil
   local telemetryPayloads = {}
+  local releaseCallbacks = {}
+  local settingsWrites = {}
+  local settingsSaveCount = 0
+  local clickCheckbox = false
+  local windows = {
+    { name = 'IMGUI_LUA_cmrt_main', title = 'CMRT Broadcast',
+      layer = 3, layerDuplicate = true },
+    { name = 'IMGUI_LUA_remote_live_replay', title = 'Live / Replay',
+      layer = 3, layerDuplicate = true },
+    { name = 'IMGUI_LUA_remote_main', title = 'Broadcaster Remote',
+      layer = 2, layerDuplicate = false },
+    { name = 'IMGUI_LUA_local', title = 'Local App',
+      layer = 0, layerDuplicate = false },
+  }
   local sim = {
     isReplayActive = isReplayActive,
     isReplayOnlyMode = false,
@@ -67,6 +81,12 @@ local function loadRemote(isReplayActive)
     ImageFit = { Stretch = 0 },
     windowSize = function() return { x = 1920, y = 1080 } end,
     drawImage = function() end,
+    slider = function(_, value) return value, false end,
+    checkbox = function()
+      local clicked = clickCheckbox
+      clickCheckbox = false
+      return clicked
+    end,
   }
   _G.render = {
     BlendMode = { AlphaBlend = 1 },
@@ -99,9 +119,41 @@ local function loadRemote(isReplayActive)
     FolderID = { ReplaysTemp = 1 },
     INIConfig = {
       scriptSettings = function()
-        return { get = function(_, _, _, fallback) return fallback end }
+        return {
+          get = function(_, section, key, fallback)
+            if section == 'OBS_HUD' and key == 'HIDE_OTHERS_IN_REPLAY'
+                and hideObsHudInReplay ~= nil then
+              return hideObsHudInReplay
+            end
+            return fallback
+          end,
+          set = function(_, section, key, value)
+            settingsWrites[#settingsWrites + 1] = {
+              section = section, key = key, value = value,
+            }
+          end,
+          save = function() settingsSaveCount = settingsSaveCount + 1 end,
+        }
       end,
     },
+    getAppWindows = function() return windows end,
+    accessAppWindow = function(name)
+      for _, window in ipairs(windows) do
+        if window.name == name then
+          return {
+            valid = function() return true end,
+            redirectLayer2 = function()
+              return window.layer, window.layerDuplicate
+            end,
+            setRedirectLayer = function(_, layer, duplicate)
+              window.layer = layer
+              window.layerDuplicate = duplicate == true
+            end,
+          }
+        end
+      end
+      return nil
+    end,
     getSim = function() return sim end,
     getCar = function() return car end,
     getSessionName = function() return 'Race' end,
@@ -113,6 +165,9 @@ local function loadRemote(isReplayActive)
     onSessionStart = function() end,
     onCarCollision = function() end,
     onReplay = function() end,
+    onRelease = function(callback)
+      releaseCallbacks[#releaseCallbacks + 1] = callback
+    end,
     disableExtraHUDElements = function() end,
     tryToToggleReplay = function(active, rewind)
       toggleCalls[#toggleCalls + 1] = { active = active, rewind = rewind }
@@ -135,6 +190,10 @@ local function loadRemote(isReplayActive)
     toggleCalls = toggleCalls,
     seekCalls = seekCalls,
     renderCalls = renderCalls,
+    windows = windows,
+    addWindow = function(window) windows[#windows + 1] = window end,
+    settingsWrites = settingsWrites,
+    settingsSaveCount = function() return settingsSaveCount end,
     nextReplaySeq = function()
       replaySeq = replaySeq + 1
       return replaySeq
@@ -144,11 +203,136 @@ local function loadRemote(isReplayActive)
     telemetryPayloads = telemetryPayloads,
     deliver = function(message) socketCallback(message) end,
     update = function(dt) script.update(dt or 0) end,
+    clickObsSetting = function()
+      clickCheckbox = true
+      script.windowLiveReplaySettings(0)
+    end,
+    release = function()
+      for _, callback in ipairs(releaseCallbacks) do callback() end
+    end,
     setTime = function(value) now = value end,
   }
 end
 
 local requestReplay
+
+local function testReplaySuppressesForwardedAppsExceptIndicator()
+  local ctx = loadRemote(true)
+
+  ctx.update()
+
+  assertEqual(ctx.windows[1].layer, 0,
+    'replay removes the broadcast HUD from its OBS layer')
+  assertEqual(ctx.windows[2].layer, 3,
+    'the Live / Replay indicator stays forwarded to OBS')
+  assertEqual(ctx.windows[3].layer, 0,
+    'replay removes every other redirected app from OBS')
+  assertEqual(ctx.windows[4].layer, 0,
+    'an app that was not forwarded remains untouched')
+end
+
+local function testReplaySuppressesNewlyForwardedApps()
+  local ctx = loadRemote(true)
+  ctx.update()
+  ctx.addWindow({
+    name = 'IMGUI_LUA_late', title = 'Late HUD',
+    layer = 4, layerDuplicate = true,
+  })
+
+  ctx.update()
+
+  assertEqual(ctx.windows[5].layer, 0,
+    'apps forwarded after replay starts are also suppressed')
+end
+
+local function testReplayResuppressesAWindowWithoutLosingOriginalRedirect()
+  local ctx = loadRemote(true)
+  ctx.update()
+  ctx.windows[1].layer = 5
+  ctx.windows[1].layerDuplicate = false
+
+  ctx.update()
+
+  assertEqual(ctx.windows[1].layer, 0,
+    'OBS cannot re-forward a suppressed window during replay')
+  ctx.sim.isReplayActive = false
+  ctx.update()
+  assertEqual(ctx.windows[1].layer, 3,
+    're-suppression keeps the redirect captured before replay')
+  assertEqual(ctx.windows[1].layerDuplicate, true,
+    're-suppression keeps the original duplicate mode')
+end
+
+local function testSavedReplaySuppressesForwardedApps()
+  local ctx = loadRemote(false)
+  ctx.sim.isReplayOnlyMode = true
+
+  ctx.update()
+
+  assertEqual(ctx.windows[1].layer, 0,
+    'saved-replay mode suppresses forwarded OBS apps')
+  assertEqual(ctx.windows[2].layer, 3,
+    'saved-replay mode preserves the Live / Replay indicator')
+end
+
+local function testLeavingReplayRestoresOriginalObsRedirects()
+  local ctx = loadRemote(true)
+  ctx.update()
+
+  ctx.sim.isReplayActive = false
+  ctx.update()
+
+  assertEqual(ctx.windows[1].layer, 3,
+    'leaving replay restores the broadcast HUD layer')
+  assertEqual(ctx.windows[1].layerDuplicate, true,
+    'leaving replay restores duplicate forwarding')
+  assertEqual(ctx.windows[3].layer, 2,
+    'leaving replay restores every suppressed app layer')
+  assertEqual(ctx.windows[3].layerDuplicate, false,
+    'leaving replay preserves move-vs-duplicate mode')
+end
+
+local function testDisabledObsSuppressionLeavesForwardingAlone()
+  local ctx = loadRemote(true, false)
+
+  ctx.update()
+
+  assertEqual(ctx.windows[1].layer, 3,
+    'disabled replay suppression leaves the broadcast HUD forwarded')
+  assertEqual(ctx.windows[3].layer, 2,
+    'disabled replay suppression leaves every OBS app untouched')
+end
+
+local function testSettingsCheckboxDisablesAndRestoresSuppression()
+  local ctx = loadRemote(true)
+  ctx.update()
+
+  ctx.clickObsSetting()
+  ctx.update()
+
+  assertEqual(ctx.windows[1].layer, 3,
+    'disabling suppression in settings restores OBS forwarding immediately')
+  assertEqual(ctx.settingsWrites[1].section, 'OBS_HUD',
+    'the checkbox persists in the OBS HUD settings section')
+  assertEqual(ctx.settingsWrites[1].key, 'HIDE_OTHERS_IN_REPLAY',
+    'the checkbox persists the replay suppression setting')
+  assertEqual(ctx.settingsWrites[1].value, false,
+    'the checkbox saves the disabled value')
+  assertEqual(ctx.settingsSaveCount(), 1,
+    'changing replay suppression saves app settings')
+end
+
+local function testUnloadRestoresSuppressedObsWindows()
+  local ctx = loadRemote(true)
+  ctx.update()
+
+  ctx.release()
+
+  assertEqual(ctx.windows[1].layer, 3,
+    'unloading the app restores the broadcast HUD redirect')
+  assertEqual(ctx.windows[3].layer, 2,
+    'unloading the app restores every suppressed redirect')
+end
 
 local function testStingerRendersInScenePassForCleanOutput()
   local ctx = loadRemote(false)
@@ -260,33 +444,21 @@ local function testNewServerEpochAcceptsAResetSequence()
     'a replacement server can restart its sequence counter')
 end
 
-local function testEnterWaitsUntilScreenIsCovered()
+local function testEnterTogglesOnFirstStingerFrame()
   local ctx = loadRemote(false)
   requestReplay(ctx, 1)
 
   ctx.update()
-  assertEqual(#ctx.toggleCalls, 0, 'replay enter must not toggle before the wipe covers the game')
-
-  ctx.setTime(0.199)
-  ctx.update()
-  assertEqual(#ctx.toggleCalls, 0, 'replay enter must remain queued during the cover phase')
-
-  ctx.setTime(0.200)
-  ctx.update()
-  assertEqual(#ctx.toggleCalls, 1, 'replay enter toggles at full coverage')
+  assertEqual(#ctx.toggleCalls, 1, 'replay enter toggles on the first stinger frame')
   assertEqual(ctx.toggleCalls[1].active, true, 'replay enter uses the enter toggle')
 end
 
-local function testLiveWaitsUntilScreenIsCovered()
+local function testLiveTogglesOnFirstStingerFrame()
   local ctx = loadRemote(true)
   requestReplay(ctx, 2)
 
   ctx.update()
-  assertEqual(#ctx.toggleCalls, 0, 'go-live must not toggle before the wipe covers the game')
-
-  ctx.setTime(0.200)
-  ctx.update()
-  assertEqual(#ctx.toggleCalls, 1, 'go-live toggles at full coverage')
+  assertEqual(#ctx.toggleCalls, 1, 'go-live toggles on the first stinger frame')
   assertEqual(ctx.toggleCalls[1].active, false, 'go-live uses the exit toggle')
 end
 
@@ -322,8 +494,16 @@ local function testSavedReplaySeekAppliesEventShot()
   assertEqual(ctx.sim.cameraMode, 1, 'a saved replay jump selects the requested camera')
 end
 
-testEnterWaitsUntilScreenIsCovered()
-testLiveWaitsUntilScreenIsCovered()
+testReplaySuppressesForwardedAppsExceptIndicator()
+testReplaySuppressesNewlyForwardedApps()
+testReplayResuppressesAWindowWithoutLosingOriginalRedirect()
+testSavedReplaySuppressesForwardedApps()
+testLeavingReplayRestoresOriginalObsRedirects()
+testDisabledObsSuppressionLeavesForwardingAlone()
+testSettingsCheckboxDisablesAndRestoresSuppression()
+testUnloadRestoresSuppressedObsWindows()
+testEnterTogglesOnFirstStingerFrame()
+testLiveTogglesOnFirstStingerFrame()
 testSeekWithinReplayDoesNotRunAStinger()
 testSavedReplaySeekAppliesEventShot()
 testStingerRendersInScenePassForCleanOutput()
