@@ -200,10 +200,14 @@ last_poll_matched = 0
 
 
 def publish_focused_highlight(telem):
-    """Publish the relay/timetable CarID corresponding to CSP's local focus."""
+    """Publish focused CarID and replay-driven timing-tower visibility."""
     if highlight_client is None:
         return False
-    return highlight_client.publish(focused_remote_car_id(telem))
+    replay_visible = bool(telem and (
+        getattr(telem, 'is_replay', 0) or
+        getattr(telem, 'is_replay_only', 0)))
+    return highlight_client.publish(
+        focused_remote_car_id(telem), show_tower=not replay_visible)
 
 
 def get_car_class(team_name):
@@ -805,6 +809,7 @@ def _review_event_from_record(record, index, default_frame_ms):
         'frame': frame,
         'seek_frame': seek_frame,
         'seek_s': session_s,
+        'lap': record.get('leader_lap'),
     }
 
 
@@ -1324,6 +1329,7 @@ def index():
             // Overtakes hidden by default: in a busy race they bury the
             // contact events, which are the ones worth jumping back to.
             var showOvertakes = false;
+            var eventNameQuery = '';
             var lastEvents = [];
 
             // Saved-replay review state: a loaded .acreplay serves journalled
@@ -1417,6 +1423,13 @@ def index():
                 });
             }
 
+            function eventMatchesFilters(ev, includeOvertakes, nameQuery) {
+                var query = (nameQuery || '').trim().toLocaleLowerCase();
+                var name = (ev.name || '').toLocaleLowerCase();
+                return (includeOvertakes || ev.kind !== 'overtake')
+                    && (!query || name.indexOf(query) !== -1);
+            }
+
             function renderEvents(events) {
                 var list = document.getElementById('event-list');
                 events = events || [];
@@ -1425,7 +1438,8 @@ def index():
                 // The tab caption counts what the tab actually shows, so a
                 // silent zero means "nothing worth jumping to".
                 var visible = events.filter(function(ev) {
-                    return showOvertakes || ev.kind !== 'overtake';
+                    return eventMatchesFilters(
+                        ev, showOvertakes, eventNameQuery);
                 });
                 var count = document.getElementById('events-count');
                 if (count) count.textContent = visible.length;
@@ -1434,7 +1448,8 @@ def index():
                     // The two empties are told apart, so a filtered-out log is
                     // never mistaken for a detection failure.
                     list.innerHTML = '<div class="ac-banner ac-banner--dim">'
-                        + (events.length ? 'Only Overtakes — Hidden' : 'No Events Yet')
+                        + (eventNameQuery.trim() ? 'No Matching Events'
+                            : (events.length ? 'Only Overtakes — Hidden' : 'No Events Yet'))
                         + '</div>';
                     return;
                 }
@@ -1451,6 +1466,9 @@ def index():
                         + '" data-event="' + ev.id + '">'
                         + '<span class="ev-age">' + ageHtml + '</span>'
                         + '<span class="ac-badge ev-kind">' + escapeHtml(ev.label) + '</span>'
+                        + (ev.lap != null
+                            ? '<span class="ev-lap">LAP ' + escapeHtml(ev.lap) + '</span>'
+                            : '')
                         + '<span class="ev-car">' + who + '</span>'
                         + '</div>';
                 });
@@ -1569,6 +1587,10 @@ def index():
                     e.preventDefault();
                     showOvertakes = !showOvertakes;
                     setPressed(e.currentTarget, showOvertakes);
+                    renderEvents(lastEvents);
+                });
+                document.getElementById('event-name-filter').addEventListener('input', function(e) {
+                    eventNameQuery = e.currentTarget.value;
                     renderEvents(lastEvents);
                 });
                 document.getElementById('review-picker').addEventListener('pointerdown', function(e) {
@@ -1861,6 +1883,10 @@ def index():
                 <div id="review-picker" class="review-picker"></div>
             </div>
             <div id="event-filter-bar" class="event-filter-bar">
+                <input id="event-name-filter" class="ac-input event-name-filter"
+                       type="search" placeholder="Filter by name"
+                       aria-label="Filter events by driver name"
+                       autocomplete="off" spellcheck="false">
                 <button id="ovt-toggle" class="ac-btn ac-btn--sm" aria-pressed="false" title="Show overtakes in the event list">Overtakes</button>
             </div>
             <div id="event-list" class="event-list"></div>

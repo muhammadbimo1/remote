@@ -18,6 +18,7 @@ def car(car_id, position=1, **kw):
     base = {
         'car_id': car_id,
         'position': position,
+        'lap_count': 0,
         'is_connected': 1,
         'is_in_pit': 0,
         'is_colliding': 0,
@@ -51,6 +52,14 @@ class CollisionTest(unittest.TestCase):
     def test_disconnected_cars_are_ignored(self):
         events = self.log.observe([car(0, 1, is_colliding=1, is_connected=0)])
         self.assertEqual(events, [])
+
+    def test_event_uses_the_leaders_current_lap_number(self):
+        events = self.log.observe([
+            car(0, 1, lap_count=7),
+            car(1, 2, lap_count=6, is_colliding=1),
+        ])
+
+        self.assertEqual(events[0]['lap'], 8)
 
 
 class RolloverTest(unittest.TestCase):
@@ -140,6 +149,16 @@ class MarkTest(unittest.TestCase):
         self.assertIsNone(self.log.mark(3))
         self.clock.advance(EventLog.MARK_COOLDOWN_S)
         self.assertIsNotNone(self.log.mark(3))
+
+    def test_mark_uses_the_latest_leaders_current_lap_number(self):
+        self.log.observe([
+            car(0, 1, lap_count=0),
+            car(3, 2, lap_count=0),
+        ])
+
+        event = self.log.mark(3, name='Alex Driver')
+
+        self.assertEqual(event['lap'], 1)
 
 
 class SnapshotTest(unittest.TestCase):

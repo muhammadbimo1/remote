@@ -82,29 +82,51 @@ class BroadcastHighlightClient(object):
         self.config = config
         self._post = post or requests.post
         self._condition = threading.Condition()
-        self._desired = _UNSET
+        self._desired_car_id = _UNSET
+        self._desired_show_tower = _UNSET
+        self._sent_car_id = _UNSET
+        self._sent_show_tower = _UNSET
         self._version = 0
         self._thread = None
         self._disabled = False
 
-    def publish(self, remote_car_id):
-        """Queue a changed target without blocking the telemetry thread."""
+    def publish(self, remote_car_id=_UNSET, show_tower=_UNSET):
+        """Queue changed broadcast controls without blocking telemetry."""
+        if remote_car_id is _UNSET and show_tower is _UNSET:
+            raise ValueError('remote_car_id or show_tower is required')
         with self._condition:
             if self._disabled:
                 return False
-            if self._desired is not _UNSET and self._desired == remote_car_id:
+            changed = False
+            if (remote_car_id is not _UNSET and
+                    (self._desired_car_id is _UNSET or
+                     self._desired_car_id != remote_car_id)):
+                self._desired_car_id = remote_car_id
+                changed = True
+            if (show_tower is not _UNSET and
+                    (self._desired_show_tower is _UNSET or
+                     self._desired_show_tower != show_tower)):
+                self._desired_show_tower = bool(show_tower)
+                changed = True
+            if not changed:
                 return False
-            self._desired = remote_car_id
             self._version += 1
             self._condition.notify()
             return True
 
-    def send_once(self, remote_car_id):
+    def send_once(self, remote_car_id=_UNSET, show_tower=_UNSET):
         """Send one request and classify it according to the API contract."""
+        payload = {}
+        if remote_car_id is not _UNSET:
+            payload['carId'] = remote_car_id
+        if show_tower is not _UNSET:
+            payload['showTower'] = bool(show_tower)
+        if not payload:
+            raise ValueError('remote_car_id or show_tower is required')
         try:
             response = self._post(
                 self.config['url'],
-                json={'carId': remote_car_id},
+                json=payload,
                 auth=(self.config['username'], self.config['password']),
                 timeout=2.0,
                 allow_redirects=False)
@@ -131,11 +153,20 @@ class BroadcastHighlightClient(object):
                 while self._version == handled_version:
                     self._condition.wait()
                 version = self._version
-                target = self._desired
+                remote_car_id = (self._desired_car_id
+                                 if self._desired_car_id != self._sent_car_id
+                                 else _UNSET)
+                show_tower = (self._desired_show_tower
+                              if self._desired_show_tower != self._sent_show_tower
+                              else _UNSET)
+
+            if remote_car_id is _UNSET and show_tower is _UNSET:
+                handled_version = version
+                continue
 
             retry_index = 0
             while True:
-                outcome = self.send_once(target)
+                outcome = self.send_once(remote_car_id, show_tower)
                 if outcome == AUTH_ERROR:
                     with self._condition:
                         self._disabled = True
@@ -144,8 +175,12 @@ class BroadcastHighlightClient(object):
                     return
                 if outcome != RETRY:
                     if outcome == TERMINAL:
-                        print('[remote_web] broadcast highlight rejected for CarID {}'.format(
-                            target))
+                        print('[remote_web] broadcast control update rejected')
+                    with self._condition:
+                        if remote_car_id is not _UNSET:
+                            self._sent_car_id = remote_car_id
+                        if show_tower is not _UNSET:
+                            self._sent_show_tower = show_tower
                     handled_version = version
                     break
 

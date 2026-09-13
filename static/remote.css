@@ -324,6 +324,15 @@ body {
 
 .event-filter-bar .ac-btn {
     padding: 3px 10px;
+    flex: 0 0 auto;
+}
+
+.event-name-filter {
+    flex: 1 1 18rem;
+    min-width: 0;
+    max-width: 28rem;
+    padding: 3px 10px;
+    font-size: var(--type-small);
 }
 
 .review-bar {
@@ -411,6 +420,14 @@ body {
 
 .event-item .ev-kind {
     flex: 0 0 auto;
+}
+
+.event-item .ev-lap {
+    flex: 0 0 auto;
+    font-family: var(--font-micro);
+    font-size: var(--type-micro);
+    letter-spacing: var(--tracking-micro);
+    color: var(--ink-dim);
 }
 
 .event-item .ev-car {

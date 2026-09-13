@@ -77,6 +77,14 @@ class EventJournalTest(unittest.TestCase):
         self.assertEqual(record['position'], 4)
         self.assertEqual(record['lap'], 12)
 
+    def test_captured_leader_lap_is_distinct_from_driver_context(self):
+        self.journal.append(event(lap=8), {'lap': 7})
+
+        record = self._lines(self.journal.path)[0]
+
+        self.assertEqual(record['leader_lap'], 8)
+        self.assertEqual(record['lap'], 7)
+
     def test_missing_context_keys_are_omitted_not_nulled(self):
         self.journal.append(event(), {'session_s': None, 'position': 3})
         record = self._lines(self.journal.path)[0]

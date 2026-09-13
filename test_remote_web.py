@@ -1,3 +1,6 @@
+import json
+import re
+import subprocess
 import unittest
 from unittest.mock import patch
 from werkzeug.exceptions import Forbidden
@@ -104,6 +107,122 @@ class IncidentNoticeMarkupTest(unittest.TestCase):
         self.assertIn('var INCIDENT_NOTICE_MS = 6000;', html)
         self.assertIn(
             'Date.now() - collisionTimers[d.num] < INCIDENT_NOTICE_MS', html)
+
+
+class EventNameFilterTest(unittest.TestCase):
+    def _matches(self, event, include_overtakes, query):
+        html = remote_web.app.test_client().get('/').get_data(as_text=True)
+        match = re.search(
+            r'function eventMatchesFilters\(ev, includeOvertakes, nameQuery\) '
+            r'\{.*?\n            \}',
+            html,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match, 'event name filter function is missing')
+        script = '{}\nconsole.log(JSON.stringify(eventMatchesFilters({}, {}, {})));'.format(
+            match.group(0),
+            json.dumps(event),
+            json.dumps(include_overtakes),
+            json.dumps(query),
+        )
+        result = subprocess.run(
+            ['node', '-e', script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(result.stdout)
+
+    def test_matches_driver_name_by_case_insensitive_partial_text(self):
+        event = {'kind': 'collision', 'name': '23 | Alex Driver'}
+
+        self.assertTrue(self._matches(event, False, '  aLeX  '))
+        self.assertFalse(self._matches(event, False, 'Morgan'))
+
+    def test_combines_name_and_overtake_filters(self):
+        overtake = {'kind': 'overtake', 'name': 'Alex Driver'}
+
+        self.assertFalse(self._matches(overtake, False, 'Alex'))
+        self.assertTrue(self._matches(overtake, True, 'Alex'))
+
+
+class EventLapMarkupTest(unittest.TestCase):
+    def _function(self, html, name):
+        start = html.index('function {}('.format(name))
+        brace = html.index('{', start)
+        depth = 0
+        for index in range(brace, len(html)):
+            if html[index] == '{':
+                depth += 1
+            elif html[index] == '}':
+                depth -= 1
+                if depth == 0:
+                    return html[start:index + 1]
+        self.fail('{} function is incomplete'.format(name))
+
+    def _render(self, event):
+        html = remote_web.app.test_client().get('/').get_data(as_text=True)
+        script = '''
+var showOvertakes = false;
+var eventNameQuery = '';
+var lastEvents = [];
+var list = {innerHTML: ''};
+var count = {textContent: ''};
+var document = {getElementById: function(id) {
+    return id === 'event-list' ? list : count;
+}};
+function eventAgeClass() { return ''; }
+function formatAge() { return '0s'; }
+function escapeHtml(value) { return String(value); }
+%s
+%s
+renderEvents([%s]);
+console.log(list.innerHTML);
+''' % (
+            self._function(html, 'eventMatchesFilters'),
+            self._function(html, 'renderEvents'),
+            json.dumps(event),
+        )
+        result = subprocess.run(
+            ['node', '-e', script], check=True, capture_output=True, text=True)
+        return result.stdout
+
+    def test_event_row_shows_the_captured_leader_lap(self):
+        markup = self._render({
+            'id': 1, 'kind': 'collision', 'label': 'HIT',
+            'name': 'Alex Driver', 'age': 0, 'lap': 8,
+        })
+
+        self.assertIn('<span class="ev-lap">LAP 8</span>', markup)
+
+    def test_old_event_without_a_lap_still_renders(self):
+        markup = self._render({
+            'id': 1, 'kind': 'collision', 'label': 'HIT',
+            'name': 'Alex Driver', 'age': 0,
+        })
+
+        self.assertNotIn('ev-lap', markup)
+        self.assertIn('Alex Driver', markup)
+
+
+class EventJournalContextTest(unittest.TestCase):
+    def setUp(self):
+        self.previous_cars = remote_web._latest_cars_by_id
+
+    def tearDown(self):
+        remote_web._latest_cars_by_id = self.previous_cars
+
+    def test_context_preserves_the_legacy_incident_completed_lap(self):
+        remote_web._latest_cars_by_id = {
+            0: {'car_id': 0, 'position': 1, 'lap_count': 7,
+                'is_connected': 1},
+            3: {'car_id': 3, 'position': 2, 'lap_count': 6,
+                'is_connected': 1},
+        }
+
+        context = remote_web.journal_context(3)
+
+        self.assertEqual(context['lap'], 6)
 
 
 class AutoDirectorMonitorIntegrationTest(unittest.TestCase):
@@ -303,8 +422,8 @@ class BroadcastHighlightIntegrationTest(unittest.TestCase):
         published = []
 
         class Recorder(object):
-            def publish(self, car_id):
-                published.append(car_id)
+            def publish(self, car_id, show_tower):
+                published.append((car_id, show_tower))
                 return True
 
         telem = TelemetryPage()
@@ -317,20 +436,50 @@ class BroadcastHighlightIntegrationTest(unittest.TestCase):
         remote_web.highlight_client = Recorder()
 
         self.assertTrue(remote_web.publish_focused_highlight(telem))
-        self.assertEqual(published, [18])
+        self.assertEqual(published, [(18, True)])
+
+    def test_instant_replay_hides_tower(self):
+        published = []
+
+        class Recorder(object):
+            def publish(self, car_id, show_tower):
+                published.append((car_id, show_tower))
+                return True
+
+        telem = TelemetryPage()
+        telem.is_replay = 1
+        remote_web.highlight_client = Recorder()
+
+        self.assertTrue(remote_web.publish_focused_highlight(telem))
+        self.assertEqual(published, [(None, False)])
+
+    def test_saved_replay_hides_tower(self):
+        published = []
+
+        class Recorder(object):
+            def publish(self, car_id, show_tower):
+                published.append((car_id, show_tower))
+                return True
+
+        telem = TelemetryPage()
+        telem.is_replay_only = 1
+        remote_web.highlight_client = Recorder()
+
+        self.assertTrue(remote_web.publish_focused_highlight(telem))
+        self.assertEqual(published, [(None, False)])
 
     def test_missing_telemetry_publishes_clear(self):
         published = []
 
         class Recorder(object):
-            def publish(self, car_id):
-                published.append(car_id)
+            def publish(self, car_id, show_tower):
+                published.append((car_id, show_tower))
                 return True
 
         remote_web.highlight_client = Recorder()
 
         self.assertTrue(remote_web.publish_focused_highlight(None))
-        self.assertEqual(published, [None])
+        self.assertEqual(published, [(None, True)])
 
 
 class TimetableUrlTest(unittest.TestCase):
@@ -729,6 +878,18 @@ class ReviewModeTest(unittest.TestCase):
 
         self.assertEqual(ev['frame'], 50)
         self.assertEqual(ev['seek_frame'], 0)
+
+    def test_review_event_keeps_the_recorded_leader_lap(self):
+        ev = remote_web._review_event_from_record(
+            {'replay_frame': 50, 'leader_lap': 8}, 1, 25.0)
+
+        self.assertEqual(ev['lap'], 8)
+
+    def test_review_event_does_not_mislabel_a_legacy_driver_lap(self):
+        ev = remote_web._review_event_from_record(
+            {'replay_frame': 50, 'lap': 7}, 1, 25.0)
+
+        self.assertIsNone(ev['lap'])
 
     def test_enter_review_loads_the_matched_journal(self):
         telem = TelemetryPage()

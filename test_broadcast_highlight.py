@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 
 from broadcast_highlight import (
@@ -144,6 +145,53 @@ class HighlightClientTest(unittest.TestCase):
         self.assertEqual(client.send_once(None), SUCCESS)
         self.assertEqual(payloads, [{'carId': None}])
 
+    def test_visibility_only_request_omits_car_id(self):
+        payloads = []
+
+        def post(url, **kwargs):
+            payloads.append(kwargs['json'])
+            return FakeResponse(200)
+
+        client = BroadcastHighlightClient(self._config(), post=post)
+
+        self.assertEqual(client.send_once(show_tower=False), SUCCESS)
+        self.assertEqual(payloads, [{'showTower': False}])
+
+    def test_focus_and_visibility_can_be_sent_atomically(self):
+        payloads = []
+
+        def post(url, **kwargs):
+            payloads.append(kwargs['json'])
+            return FakeResponse(200)
+
+        client = BroadcastHighlightClient(self._config(), post=post)
+
+        self.assertEqual(client.send_once(18, show_tower=False), SUCCESS)
+        self.assertEqual(payloads, [{'carId': 18, 'showTower': False}])
+
+    def test_background_publisher_sends_only_the_changed_control_field(self):
+        payloads = []
+        posted = threading.Event()
+
+        def post(url, **kwargs):
+            payloads.append(kwargs['json'])
+            posted.set()
+            return FakeResponse(200)
+
+        client = BroadcastHighlightClient(self._config(), post=post)
+        client.start()
+
+        self.assertTrue(client.publish(18, show_tower=True))
+        self.assertTrue(posted.wait(1.0))
+        posted.clear()
+        self.assertTrue(client.publish(18, show_tower=False))
+        self.assertTrue(posted.wait(1.0))
+
+        self.assertEqual(payloads, [
+            {'carId': 18, 'showTower': True},
+            {'showTower': False},
+        ])
+
     def test_only_queues_target_changes(self):
         client = BroadcastHighlightClient(self._config(),
                                           post=lambda *a, **kw: FakeResponse(200))
@@ -153,6 +201,14 @@ class HighlightClientTest(unittest.TestCase):
         self.assertTrue(client.publish(7))
         self.assertTrue(client.publish(None))
         self.assertFalse(client.publish(None))
+
+    def test_only_queues_visibility_changes(self):
+        client = BroadcastHighlightClient(self._config(),
+                                          post=lambda *a, **kw: FakeResponse(200))
+
+        self.assertTrue(client.publish(show_tower=False))
+        self.assertFalse(client.publish(show_tower=False))
+        self.assertTrue(client.publish(show_tower=True))
 
     def test_server_errors_retry_but_client_errors_stop(self):
         statuses = iter([500, 401, 404])

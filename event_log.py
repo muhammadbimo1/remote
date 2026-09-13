@@ -15,6 +15,21 @@ import time
 from collections import deque
 
 
+def leader_lap_number(cars):
+    """Return the race leader's 1-based current lap, or None."""
+    leaders = [c for c in cars
+               if c.get('is_connected') and c.get('position') is not None]
+    if not leaders:
+        return None
+    leader = min(leaders, key=lambda c: c['position'])
+    try:
+        # CSP lap_count is completed laps; operators count the first lap as
+        # Lap 1.
+        return max(1, int(leader['lap_count']) + 1)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 class EventLog:
     MAX_EVENTS = 40
     # Fallback replay window in seconds, used until AC reports how much it has
@@ -51,6 +66,7 @@ class EventLog:
         # Previous-tick state, keyed by car_id
         self._prev_position = {}
         self._prev_rolled = {}
+        self._current_lap = None
 
         # Cooldowns, keyed by (kind, car_id)
         self._last_seen = {}
@@ -70,6 +86,8 @@ class EventLog:
         """
         now = self._clock()
         new_events = []
+
+        self._current_lap = leader_lap_number(cars)
 
         # Who held each position last tick — used to tell a real overtake from
         # a position inherited when the car ahead peeled into the pits.
@@ -137,6 +155,8 @@ class EventLog:
                 'name': car.get('display_name') or car.get('name') or '',
                 't': now,
             }
+            if self._current_lap is not None:
+                event['lap'] = self._current_lap
             self._next_id += 1
             self._events.append(event)
             return event
@@ -179,6 +199,7 @@ class EventLog:
             self._last_seen.clear()
             self._prev_position.clear()
             self._prev_rolled.clear()
+            self._current_lap = None
 
     def set_window(self, seconds):
         """Adopt AC's real recorded replay length as the retention window.

@@ -348,6 +348,8 @@ class EventJournal:
             'car_id': event.get('car_id'),
             'driver': event.get('name'),
         }
+        if event.get('lap') is not None:
+            record['leader_lap'] = event['lap']
         if self._replay_file:
             # Repeated per record: the file may be renamed on its way out of
             # temp, but a record still says which recording it belongs to.
