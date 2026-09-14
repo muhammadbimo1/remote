@@ -25,6 +25,10 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
   local geometryDisposed = 0
   local drawnImages = {}
   local drawnTexts = {}
+  local drawnRects = {}
+  local dwriteTexts = {}
+  local dwriteFonts = {}
+  local driverTeam = 'PRO 7 | Team'
   local cameraSections = {
     CAMERA_0 = {
       POSITION = { x = 1, y = 2, z = 3 },
@@ -105,7 +109,9 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
   _G.vec3 = function(x, y, z) return { x = x or 0, y = y or 0, z = z or 0 } end
   math.normalize = function(value) return value end
   _G.rgbm = setmetatable({ colors = { white = {} } }, {
-    __call = function() return {} end,
+    __call = function(_, r, g, b, a)
+      return { r = r, g = g, b = b, a = a }
+    end,
   })
   _G.ui = {
     Font = { Small = 1 },
@@ -116,11 +122,25 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     availableSpace = function() return { x = 480, y = 270 } end,
     getCursor = function() return { x = 0, y = 0 } end,
     setCursor = function() end,
-    drawRectFilled = function() end,
+    drawRectFilled = function(p1, p2, color)
+      drawnRects[#drawnRects + 1] = { p1 = p1, p2 = p2, color = color }
+    end,
     drawImage = function(image, p1, p2)
       drawnImages[#drawnImages + 1] = { image = image, p1 = p1, p2 = p2 }
     end,
     text = function(value) drawnTexts[#drawnTexts + 1] = value end,
+    pushDWriteFont = function(font)
+      dwriteFonts[#dwriteFonts + 1] = font
+    end,
+    popDWriteFont = function() end,
+    measureDWriteText = function(value, size)
+      return { x = #value * size * 0.6, y = size }
+    end,
+    dwriteText = function(value, size, color)
+      dwriteTexts[#dwriteTexts + 1] = {
+        value = value, size = size, color = color,
+      }
+    end,
     beginTonemapping = function() end,
     endTonemapping = function() end,
     slider = function(_, value) return value, false end,
@@ -241,7 +261,7 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     getFolder = function() return 'C:/AC/replay/temp' end,
     getServerIP = function() return '' end,
     getServerPortHTTP = function() return -1 end,
-    getDriverTeam = function() return 'PRO 7 | Team' end,
+    getDriverTeam = function() return driverTeam end,
     onSessionStart = function() end,
     onCarCollision = function() end,
     onReplay = function() end,
@@ -290,6 +310,11 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     geometryUpdates = geometryUpdates,
     drawnImages = drawnImages,
     drawnTexts = drawnTexts,
+    drawnRects = drawnRects,
+    dwriteTexts = dwriteTexts,
+    dwriteFonts = dwriteFonts,
+    car = car,
+    setDriverTeam = function(value) driverTeam = value end,
     runSceneReady = function()
       for _, callback in ipairs(sceneReadyCallbacks) do callback() end
     end,
@@ -662,6 +687,29 @@ local function testPiPGeometryShotIsDisposedOnRelease()
     'PiP releases its GPU texture when the app unloads')
 end
 
+local function testPiPOverlayUsesPositionParsedNameTeamAndMichroma()
+  local ctx = loadRemote(false)
+  ctx.car.racePosition = 6
+  ctx.car.driverName = function() return ' [GT3] [VIP] Alex Driver ' end
+  ctx.setDriverTeam('Apex Racing')
+  ctx.deliver(pipCommand('server-a', 1, true, 0, 0))
+  ctx.update()
+  ctx.runSceneReady()
+  script.windowPiP(0)
+
+  assertEqual(ctx.dwriteFonts[#ctx.dwriteFonts], 'Michroma-Regular.ttf',
+    'PiP identity plate uses Michroma Regular')
+  assertEqual(ctx.dwriteTexts[1].value, 'P6 | Alex Driver',
+    'PiP first line combines position with a tag-free full name')
+  assertEqual(ctx.dwriteTexts[2].value, 'Apex Racing',
+    'PiP second line shows the complete team name')
+  local plate = ctx.drawnRects[#ctx.drawnRects]
+  assertEqual(plate.color.r, 0, 'PiP identity plate background is black')
+  assertEqual(plate.color.g, 0, 'PiP identity plate background is black')
+  assertEqual(plate.color.b, 0, 'PiP identity plate background is black')
+  assertEqual(plate.color.a, 1, 'PiP identity plate background is opaque')
+end
+
 local function testEnterTogglesOnFirstStingerFrame()
   local ctx = loadRemote(false)
   requestReplay(ctx, 1)
@@ -745,4 +793,5 @@ testEnabledPiPRendersSelectedOnboardCamera()
 testMissingRequestedPiPCameraFallsBackToCameraZero()
 testUnavailablePiPCameraDoesNotDrawAStaleFrame()
 testPiPGeometryShotIsDisposedOnRelease()
+testPiPOverlayUsesPositionParsedNameTeamAndMichroma()
 print('test_remote_lua.lua: all tests passed')

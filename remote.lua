@@ -1073,6 +1073,17 @@ function script.windowMain(dt)
   ui.endChild()
 end
 
+local function parsePiPDriverName(value)
+  local name = tostring(value or '')
+  while true do
+    local stripped, count = name:gsub('^%s*%b[]%s*', '', 1)
+    name = stripped
+    if count == 0 then break end
+  end
+  name = name:match('^%s*(.-)%s*$') or ''
+  return name
+end
+
 function script.windowPiP(dt)
   local available = ui.availableSpace()
   local origin = ui.getCursor()
@@ -1101,9 +1112,32 @@ function script.windowPiP(dt)
   ui.endTonemapping(1, 0, true)
 
   local car = ac.getCar(pipDriver)
-  local name = car ~= nil and car:driverName() or ('Car ' .. tostring(pipDriver))
-  ui.setCursor(vec2(x + 8, y + 8))
-  ui.text(string.format('%s  |  CAM %d', name, pipActualCamera + 1))
+  local name = parsePiPDriverName(car ~= nil and car:driverName() or '')
+  if name == '' then name = 'Car ' .. tostring(pipDriver) end
+  local position = car ~= nil and tonumber(car.racePosition) or 0
+  local team = ac.getDriverTeam(pipDriver) or ''
+  local identity = string.format('P%d | %s', position, name)
+  local identityFontSize = 18
+  local teamFontSize = 13
+  local paddingX = 8
+  local paddingY = 6
+  local lineGap = 3
+
+  ui.pushDWriteFont('Michroma-Regular.ttf')
+  local identitySize = ui.measureDWriteText(identity, identityFontSize)
+  local teamSize = ui.measureDWriteText(team, teamFontSize)
+  local plateP1 = vec2(x + 8, y + 8)
+  local plateP2 = vec2(
+    plateP1.x + math.max(identitySize.x, teamSize.x) + paddingX * 2,
+    plateP1.y + identitySize.y + teamSize.y + paddingY * 2 + lineGap)
+  ui.drawRectFilled(plateP1, plateP2, rgbm(0, 0, 0, 1))
+  ui.setCursor(vec2(plateP1.x + paddingX, plateP1.y + paddingY))
+  ui.dwriteText(identity, identityFontSize, rgbm(1, 1, 1, 1))
+  ui.setCursor(vec2(
+    plateP1.x + paddingX,
+    plateP1.y + paddingY + identitySize.y + lineGap))
+  ui.dwriteText(team, teamFontSize, rgbm(0.78, 0.78, 0.78, 1))
+  ui.popDWriteFont()
 end
 
 local indicatorSettings = ac.INIConfig.scriptSettings()
