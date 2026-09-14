@@ -41,6 +41,8 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     trackLengthM = 5000,
     currentSessionIndex = 0,
     raceSessionType = 3,
+    isTimedRace = true,
+    sessionTimeLeft = 3723000,
     windowWidth = 1920,
     windowHeight = 1080,
   }
@@ -155,6 +157,9 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
       return nil
     end,
     getSim = function() return sim end,
+    getSession = function()
+      return { durationMinutes = 90 }
+    end,
     getCar = function() return car end,
     getSessionName = function() return 'Race' end,
     getReplayFilename = function() return '' end,
@@ -341,7 +346,7 @@ local function testStingerRendersInScenePassForCleanOutput()
 
   assertEqual(type(renderStinger), 'function', 'the app exposes a scene-render stinger callback')
   renderStinger()
-  assertEqual(ctx.renderCalls[1].textures.txStinger, 'static/stinger.png',
+  assertEqual(ctx.renderCalls[1].textures.txStinger, 'stinger.png',
     'the scene pass samples the stinger asset')
   assertEqual(ctx.renderCalls[1].values.gOffsetX, -2,
     'the stinger starts just off the left edge')
@@ -391,6 +396,8 @@ local function testTelemetryUsesVersionedProtocolAtTenHertz()
   assertEqual(payload.car_count, 1, 'telemetry carries the bounded car array')
   assertEqual(payload.cars[1].session_id, 18, 'telemetry includes remote session IDs')
   assertEqual(payload.cars[1].driver_name, 'Alex Driver', 'telemetry includes driver names')
+  assertEqual(payload.is_timed_session, true, 'telemetry identifies timed sessions')
+  assertEqual(payload.session_time_left, 3723000, 'telemetry includes remaining session milliseconds')
 end
 
 local function testCameraCommandsApplyOnceAndMalformedMessagesAreIgnored()
@@ -453,12 +460,20 @@ local function testEnterTogglesOnFirstStingerFrame()
   assertEqual(ctx.toggleCalls[1].active, true, 'replay enter uses the enter toggle')
 end
 
-local function testLiveTogglesOnFirstStingerFrame()
+local function testLiveWaitsUntilScreenIsCovered()
   local ctx = loadRemote(true)
   requestReplay(ctx, 2)
 
   ctx.update()
-  assertEqual(#ctx.toggleCalls, 1, 'go-live toggles on the first stinger frame')
+  assertEqual(#ctx.toggleCalls, 0, 'go-live must not toggle before the wipe covers the game')
+
+  ctx.setTime(0.299)
+  ctx.update()
+  assertEqual(#ctx.toggleCalls, 0, 'go-live must remain queued during the cover phase')
+
+  ctx.setTime(0.300)
+  ctx.update()
+  assertEqual(#ctx.toggleCalls, 1, 'go-live toggles at full coverage')
   assertEqual(ctx.toggleCalls[1].active, false, 'go-live uses the exit toggle')
 end
 
@@ -503,7 +518,7 @@ testDisabledObsSuppressionLeavesForwardingAlone()
 testSettingsCheckboxDisablesAndRestoresSuppression()
 testUnloadRestoresSuppressedObsWindows()
 testEnterTogglesOnFirstStingerFrame()
-testLiveTogglesOnFirstStingerFrame()
+testLiveWaitsUntilScreenIsCovered()
 testSeekWithinReplayDoesNotRunAStinger()
 testSavedReplaySeekAppliesEventShot()
 testStingerRendersInScenePassForCleanOutput()

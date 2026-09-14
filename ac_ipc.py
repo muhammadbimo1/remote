@@ -99,7 +99,8 @@ class TelemetrySnapshot(_FrozenSnapshot):
         'packet_id', 'car_count', 'focused_car', 'current_camera',
         'car_cameras_count', 'current_car_camera', 'track_length', 'track_name',
         'session_type', 'session_index', 'session_type_raw', 'session_gen',
-        'session_name', 'is_replay', 'replay_frame', 'replay_frames',
+        'session_name', 'is_timed_session', 'session_time_left',
+        'is_replay', 'replay_frame', 'replay_frames',
         'replay_frame_ms', 'replay_last_result', 'is_replay_only',
         'replay_file', 'replay_temp_dir', 'timetable_url', 'cars',
     )
@@ -126,9 +127,9 @@ class TelemetrySnapshot(_FrozenSnapshot):
                 'session_index', 'session_type_raw', 'session_gen',
                 'replay_frame', 'replay_frames', 'replay_last_result'):
             setattr(result, name, _integer(message, name))
-        for name in ('track_length', 'replay_frame_ms'):
+        for name in ('track_length', 'session_time_left', 'replay_frame_ms'):
             setattr(result, name, _number(message, name))
-        for name in ('is_replay', 'is_replay_only'):
+        for name in ('is_timed_session', 'is_replay', 'is_replay_only'):
             setattr(result, name, _boolean(message, name))
         for name in ('track_name', 'session_name', 'replay_file', 'replay_temp_dir',
                      'timetable_url'):

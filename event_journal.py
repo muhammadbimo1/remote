@@ -350,6 +350,8 @@ class EventJournal:
         }
         if event.get('lap') is not None:
             record['leader_lap'] = event['lap']
+        if event.get('time_remaining_ms') is not None:
+            record['time_remaining_ms'] = event['time_remaining_ms']
         if self._replay_file:
             # Repeated per record: the file may be renamed on its way out of
             # temp, but a record still says which recording it belongs to.

@@ -138,10 +138,11 @@ local hideOtherObsHudAppsInReplay = obsHudSettings:get(
 local REPLAY_ENTER_NOMINAL_REWIND_S = 0.5
 local pendingSeek = nil        -- absolute frame to seek to once replay is active
 
--- Stinger timing configuration. The replay toggle is issued as the stinger
--- is queued so the first stinger frame is already in the requested state.
--- The hold after the slide-in lasts only as long as AC needs to report that
--- state, up to the configured timeout.
+-- Stinger timing configuration. Entering replay toggles as the stinger is
+-- queued so the first stinger frame is already in replay. Going live waits
+-- until the wipe has covered the game, then toggles. The hold after that
+-- lasts only as long as AC needs to report the requested state, up to the
+-- configured timeout.
 local STINGER_TIMING = {
   slideInS = 0.3,
   coveredWaitTimeoutS = 1.5,
@@ -341,14 +342,15 @@ local function exitReplay(reason)
   return ok
 end
 
+local function fireStingerToggle(state)
+  if state.targetReplay then
+    return enterReplay(state.rewindS, state.driver, state.camera, state.subCam)
+  end
+  return exitReplay('command')
+end
+
 local function queueStinger(action, rewindS, driver, camera, subCam)
   local targetReplay = action == REPLAY_ENTER
-  local ok
-  if targetReplay then
-    ok = enterReplay(rewindS, driver, camera, subCam)
-  else
-    ok = exitReplay('command')
-  end
   stinger = {
     phase = 'cover',
     phaseStarted = os.preciseClock(),
@@ -358,8 +360,15 @@ local function queueStinger(action, rewindS, driver, camera, subCam)
     camera = camera,
     subCam = subCam,
     targetReplay = targetReplay,
-    toggleOk = ok == true,
+    toggled = false,
+    toggleOk = false,
   }
+  -- Instant-replay enter: toggle before the first stinger frame so AC's
+  -- replay-in animation plays under the wipe. Go-live waits for coverage.
+  if targetReplay then
+    stinger.toggleOk = fireStingerToggle(stinger) == true
+    stinger.toggled = true
+  end
 end
 
 local function processReplayCommands()
@@ -430,6 +439,10 @@ local function processStinger()
   local now = os.preciseClock()
   if stinger.phase == 'cover' then
     if now - stinger.phaseStarted < STINGER_TIMING.slideInS then return end
+    if not stinger.toggled then
+      stinger.toggleOk = fireStingerToggle(stinger) == true
+      stinger.toggled = true
+    end
     if stinger.toggleOk then
       stinger.phase = 'wait'
       stinger.deadline = now + STINGER_TIMING.coveredWaitTimeoutS
@@ -651,6 +664,9 @@ local function updateTelemetry()
 
   local sessionIndex = sim.currentSessionIndex
   local sessionTypeRaw = sim.raceSessionType
+  local session = ac.getSession(sessionIndex)
+  local isTimedSession = (session ~= nil and session.durationMinutes > 0)
+    or sim.isTimedRace == true
   if sessionIndex ~= lastSessionIndex or sessionTypeRaw ~= lastSessionTypeRaw then
     -- Covers the session running at script load and anything onSessionStart
     -- misses. A duplicate bump costs an empty rotation, which is free.
@@ -731,6 +747,8 @@ local function updateTelemetry()
     session_type_raw = sessionTypeRaw,
     session_gen = sessionGen,
     session_name = ac.getSessionName(sessionIndex) or '',
+    is_timed_session = isTimedSession,
+    session_time_left = isTimedSession and math.max(0, sim.sessionTimeLeft) or 0,
     is_replay = sim.isReplayActive == true,
     replay_frame = sim.replayCurrentFrame,
     replay_frames = sim.replayFrames,
@@ -783,7 +801,7 @@ end
 local stingerPass = {
   blendMode = render.BlendMode.AlphaBlend,
   depthMode = render.DepthMode.Off,
-  textures = { txStinger = 'static/stinger.png' },
+  textures = { txStinger = 'stinger.png' },
   values = { gOffsetX = -2, gEmissive = 3, gWhiteReference = 1 },
   shader = [[
     float4 main(PS_IN pin) {
@@ -934,9 +952,9 @@ function script.windowLiveReplay(dt)
     color = rgbm(1.0, 0.6, 0.2, 1.0)
   end
 
-  ui.pushDWriteFont('static/Michroma-Regular.ttf')
+  ui.pushDWriteFont('Michroma-Regular.ttf')
   local textSize = ui.measureDWriteText(label, indicatorFontSize)
-  ui.image('static/logo.png', vec2(textSize.y, textSize.y))
+  ui.image('logo.png', vec2(textSize.y, textSize.y))
   ui.sameLine(0, 8)
   ui.dwriteText(label, indicatorFontSize, color)
   ui.popDWriteFont()

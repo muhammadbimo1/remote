@@ -67,6 +67,7 @@ class EventLog:
         self._prev_position = {}
         self._prev_rolled = {}
         self._current_lap = None
+        self._time_remaining_ms = None
 
         # Cooldowns, keyed by (kind, car_id)
         self._last_seen = {}
@@ -75,7 +76,7 @@ class EventLog:
     # Detection
     # ------------------------------------------------------------------
 
-    def observe(self, cars, detect_overtakes=True):
+    def observe(self, cars, detect_overtakes=True, time_remaining_ms=None):
         """Compare this telemetry tick to the previous one. Returns new events.
 
         `cars` is the list of dicts produced by remote_web.compute_gaps().
@@ -83,11 +84,13 @@ class EventLog:
         reshuffle with every lap improvement, so a "position gained" is not a
         pass on track — just timing-screen noise. Collisions, rollovers and
         marks still land.
+        `time_remaining_ms` is captured on each event and retained for marks.
         """
         now = self._clock()
         new_events = []
 
         self._current_lap = leader_lap_number(cars)
+        self._time_remaining_ms = time_remaining_ms
 
         # Who held each position last tick — used to tell a real overtake from
         # a position inherited when the car ahead peeled into the pits.
@@ -157,6 +160,8 @@ class EventLog:
             }
             if self._current_lap is not None:
                 event['lap'] = self._current_lap
+            if self._time_remaining_ms is not None:
+                event['time_remaining_ms'] = self._time_remaining_ms
             self._next_id += 1
             self._events.append(event)
             return event
@@ -200,6 +205,7 @@ class EventLog:
             self._prev_position.clear()
             self._prev_rolled.clear()
             self._current_lap = None
+            self._time_remaining_ms = None
 
     def set_window(self, seconds):
         """Adopt AC's real recorded replay length as the retention window.

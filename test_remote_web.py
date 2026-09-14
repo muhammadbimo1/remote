@@ -47,6 +47,8 @@ class TelemetryPage(object):
         self.session_type_raw = 0
         self.session_gen = 0
         self.session_name = ''
+        self.is_timed_session = False
+        self.session_time_left = 0.0
         self.is_replay = False
         self.replay_frame = 0
         self.replay_frames = 0
@@ -176,10 +178,12 @@ function formatAge() { return '0s'; }
 function escapeHtml(value) { return String(value); }
 %s
 %s
+%s
 renderEvents([%s]);
 console.log(list.innerHTML);
 ''' % (
             self._function(html, 'eventMatchesFilters'),
+            self._function(html, 'formatTimeRemaining'),
             self._function(html, 'renderEvents'),
             json.dumps(event),
         )
@@ -194,6 +198,15 @@ console.log(list.innerHTML);
         })
 
         self.assertIn('<span class="ev-lap">LAP 8</span>', markup)
+
+    def test_event_row_shows_the_captured_time_remaining(self):
+        markup = self._render({
+            'id': 1, 'kind': 'collision', 'label': 'HIT',
+            'name': 'Alex Driver', 'age': 0, 'lap': 8,
+            'time_remaining_ms': 3723000,
+        })
+
+        self.assertIn('<span class="ev-time">TIME 1:02:03</span>', markup)
 
     def test_old_event_without_a_lap_still_renders(self):
         markup = self._render({
@@ -777,6 +790,8 @@ class IPCPeerSecurityTest(unittest.TestCase):
                     'track_name': 'Silverstone Grand Prix', 'session_type': 1,
                     'session_index': 0, 'session_type_raw': 3,
                     'session_gen': 1, 'session_name': 'Race',
+                    'is_timed_session': True,
+                    'session_time_left': 3723000.0,
                     'is_replay': False, 'replay_frame': 0,
                     'replay_frames': 100, 'replay_frame_ms': 60.0,
                     'replay_last_result': 0, 'is_replay_only': False,
@@ -881,9 +896,11 @@ class ReviewModeTest(unittest.TestCase):
 
     def test_review_event_keeps_the_recorded_leader_lap(self):
         ev = remote_web._review_event_from_record(
-            {'replay_frame': 50, 'leader_lap': 8}, 1, 25.0)
+            {'replay_frame': 50, 'leader_lap': 8,
+             'time_remaining_ms': 3723000}, 1, 25.0)
 
         self.assertEqual(ev['lap'], 8)
+        self.assertEqual(ev['time_remaining_ms'], 3723000)
 
     def test_review_event_does_not_mislabel_a_legacy_driver_lap(self):
         ev = remote_web._review_event_from_record(

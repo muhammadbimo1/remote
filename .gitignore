@@ -10,6 +10,9 @@ remote_config.json
 # Local isolated development worktrees.
 .worktrees/
 
+# Disposable staging and PyInstaller output created by build.bat.
+.build/
+
 dist/
 croco_broadcast_remote_v0.8.zip
 __pycache__/remote_web.cpython-314.pyc

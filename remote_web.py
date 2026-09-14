@@ -810,6 +810,7 @@ def _review_event_from_record(record, index, default_frame_ms):
         'seek_frame': seek_frame,
         'seek_s': session_s,
         'lap': record.get('leader_lap'),
+        'time_remaining_ms': record.get('time_remaining_ms'),
     }
 
 
@@ -988,7 +989,10 @@ def monitor_telemetry():
                     # detected during this telemetry tick.
                     race = telem.session_type == 1
                     for event in event_log.observe(
-                            cars_with_gaps, detect_overtakes=race):
+                            cars_with_gaps, detect_overtakes=race,
+                            time_remaining_ms=(
+                                telem.session_time_left
+                                if telem.is_timed_session else None)):
                         record_event(event)
                     data = build_update_data(telem, cars_with_gaps)
                     _last_live_payload = data
@@ -1430,6 +1434,16 @@ def index():
                     && (!query || name.indexOf(query) !== -1);
             }
 
+            function formatTimeRemaining(milliseconds) {
+                var totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+                var hours = Math.floor(totalSeconds / 3600);
+                var minutes = Math.floor((totalSeconds % 3600) / 60);
+                var seconds = totalSeconds % 60;
+                var mm = hours > 0 ? String(minutes).padStart(2, '0') : String(minutes);
+                var hh = hours > 0 ? hours + ':' : '';
+                return hh + mm + ':' + String(seconds).padStart(2, '0');
+            }
+
             function renderEvents(events) {
                 var list = document.getElementById('event-list');
                 events = events || [];
@@ -1468,6 +1482,10 @@ def index():
                         + '<span class="ac-badge ev-kind">' + escapeHtml(ev.label) + '</span>'
                         + (ev.lap != null
                             ? '<span class="ev-lap">LAP ' + escapeHtml(ev.lap) + '</span>'
+                            : '')
+                        + (ev.time_remaining_ms != null
+                            ? '<span class="ev-time">TIME '
+                                + formatTimeRemaining(ev.time_remaining_ms) + '</span>'
                             : '')
                         + '<span class="ev-car">' + who + '</span>'
                         + '</div>';

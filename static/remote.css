@@ -422,7 +422,8 @@ body {
     flex: 0 0 auto;
 }
 
-.event-item .ev-lap {
+.event-item .ev-lap,
+.event-item .ev-time {
     flex: 0 0 auto;
     font-family: var(--font-micro);
     font-size: var(--type-micro);
@@ -483,6 +484,14 @@ body {
 #drivers-list::-webkit-scrollbar-thumb {
     background: var(--amber-70);
     border: 2px solid var(--screen-well);
+}
+
+/* Leave a narrow, non-interactive gutter for touch-scrolling on tablets. */
+@media (hover: none) and (pointer: coarse) and (min-width: 601px) {
+    #drivers-list,
+    .event-list {
+        padding-right: 8px;
+    }
 }
 
 .drivers-grid {

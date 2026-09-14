@@ -57,9 +57,10 @@ class CollisionTest(unittest.TestCase):
         events = self.log.observe([
             car(0, 1, lap_count=7),
             car(1, 2, lap_count=6, is_colliding=1),
-        ])
+        ], time_remaining_ms=3723000)
 
         self.assertEqual(events[0]['lap'], 8)
+        self.assertEqual(events[0]['time_remaining_ms'], 3723000)
 
 
 class RolloverTest(unittest.TestCase):
@@ -154,11 +155,19 @@ class MarkTest(unittest.TestCase):
         self.log.observe([
             car(0, 1, lap_count=0),
             car(3, 2, lap_count=0),
-        ])
+        ], time_remaining_ms=754000)
 
         event = self.log.mark(3, name='Alex Driver')
 
         self.assertEqual(event['lap'], 1)
+        self.assertEqual(event['time_remaining_ms'], 754000)
+
+    def test_untimed_session_omits_time_remaining(self):
+        self.log.observe([car(3, 1)], time_remaining_ms=None)
+
+        event = self.log.mark(3, name='Alex Driver')
+
+        self.assertNotIn('time_remaining_ms', event)
 
 
 class SnapshotTest(unittest.TestCase):

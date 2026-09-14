@@ -44,6 +44,8 @@ def telemetry_message(cars=None, **overrides):
         'session_type_raw': 3,
         'session_gen': 1,
         'session_name': 'Race',
+        'is_timed_session': True,
+        'session_time_left': 3723000.0,
         'is_replay': False,
         'replay_frame': 0,
         'replay_frames': 1000,
@@ -82,6 +84,8 @@ class TelemetrySnapshotTest(unittest.TestCase):
         self.assertEqual(snapshot.packet_id, 7)
         self.assertEqual(snapshot.car_count, 1)
         self.assertEqual(snapshot.track_name, 'Silverstone Grand Prix')
+        self.assertTrue(snapshot.is_timed_session)
+        self.assertEqual(snapshot.session_time_left, 3723000.0)
         self.assertEqual(snapshot.cars[0].driver_name, 'Alex Driver')
         self.assertTrue(snapshot.cars[0].is_connected)
 
