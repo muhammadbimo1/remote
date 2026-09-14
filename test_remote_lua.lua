@@ -18,6 +18,7 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
   local settingsWrites = {}
   local settingsSaveCount = 0
   local clickCheckbox = false
+  local windowOpenCalls = {}
   local windows = {
     { name = 'IMGUI_LUA_cmrt_main', title = 'CMRT Broadcast',
       layer = 3, layerDuplicate = true },
@@ -184,6 +185,9 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     focusCar = function(car) sim.focusedCar = car end,
     setCurrentCamera = function(camera) sim.cameraMode = camera end,
     setCurrentCarCamera = function(camera) sim.carCameraIndex = camera end,
+    setWindowOpen = function(id, opened)
+      windowOpenCalls[#windowOpenCalls + 1] = { id = id, opened = opened }
+    end,
     log = function() end,
   }
   os.preciseClock = function() return now end
@@ -206,6 +210,7 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     socketURL = function() return socketURL end,
     socketParams = function() return socketParams end,
     telemetryPayloads = telemetryPayloads,
+    windowOpenCalls = windowOpenCalls,
     deliver = function(message) socketCallback(message) end,
     update = function(dt) script.update(dt or 0) end,
     clickObsSetting = function()
@@ -453,6 +458,66 @@ local function testNewServerEpochAcceptsAResetSequence()
     'a replacement server can restart its sequence counter')
 end
 
+local function pipCommand(connectionID, sequence, enabled, driver, camera)
+  return {
+    version = 1,
+    connection_id = connectionID,
+    type = 'pip',
+    pip_seq = sequence,
+    pip_enabled = enabled,
+    target_driver = driver,
+    target_car_camera = camera,
+  }
+end
+
+local function testPiPCommandDoesNotChangeMainShot()
+  local ctx = loadRemote(false)
+  ctx.sim.focusedCar = 2
+  ctx.sim.cameraMode = ac.CameraMode.Track
+  ctx.sim.carCameraIndex = 2
+
+  ctx.deliver(pipCommand('server-a', 1, true, 4, 1))
+  ctx.update()
+
+  assertEqual(ctx.sim.focusedCar, 2, 'PiP keeps main focus')
+  assertEqual(ctx.sim.cameraMode, ac.CameraMode.Track, 'PiP keeps main camera')
+  assertEqual(ctx.sim.carCameraIndex, 2, 'PiP keeps main onboard camera')
+  assertEqual(#ctx.windowOpenCalls, 1, 'PiP updates only its own window once')
+  assertEqual(ctx.windowOpenCalls[1].id, 'pip', 'PiP targets its own window')
+  assertEqual(ctx.windowOpenCalls[1].opened, true, 'enabled PiP opens its window')
+end
+
+local function testDuplicateAndMalformedPiPCommandsAreIgnored()
+  local ctx = loadRemote(false)
+  ctx.deliver(pipCommand('server-a', 1, true, 0, 0))
+  ctx.update()
+  ctx.deliver(pipCommand('server-a', 1, false, 0, 0))
+  ctx.update()
+  ctx.deliver(pipCommand('server-a', 2, 1, 0, 0))
+  ctx.update()
+  ctx.deliver({
+    version = 1, connection_id = 'server-a', type = 'pip', pip_seq = 3,
+    pip_enabled = false, target_driver = 0,
+  })
+  ctx.update()
+
+  assertEqual(#ctx.windowOpenCalls, 1,
+    'duplicate and malformed PiP commands do not mutate window state')
+end
+
+local function testPiPDisableAndNewServerEpochAreAccepted()
+  local ctx = loadRemote(false)
+  ctx.deliver(pipCommand('server-a', 1, true, 0, 0))
+  ctx.update()
+  ctx.deliver(pipCommand('server-b', 1, false, 0, 0))
+  ctx.update()
+
+  assertEqual(#ctx.windowOpenCalls, 2,
+    'a replacement server can restart the PiP sequence counter')
+  assertEqual(ctx.windowOpenCalls[2].opened, false,
+    'disabled PiP closes its window')
+end
+
 local function testEnterTogglesOnFirstStingerFrame()
   local ctx = loadRemote(false)
   requestReplay(ctx, 1)
@@ -528,4 +593,7 @@ testWebSocketConnectsToLoopbackWithReconnect()
 testTelemetryUsesVersionedProtocolAtTenHertz()
 testCameraCommandsApplyOnceAndMalformedMessagesAreIgnored()
 testNewServerEpochAcceptsAResetSequence()
+testPiPCommandDoesNotChangeMainShot()
+testDuplicateAndMalformedPiPCommandsAreIgnored()
+testPiPDisableAndNewServerEpochAreAccepted()
 print('test_remote_lua.lua: all tests passed')

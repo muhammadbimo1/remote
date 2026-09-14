@@ -20,12 +20,18 @@ local REPLAY_RESULT_REFUSED = 2
 ---------------------------------------------------------------------
 local lastCommandSeq = 0
 local lastReplaySeq = 0
+local lastPiPSeq = 0
 local lastConnectionID = nil
 local pendingCommand = nil
 local pendingReplay = nil
+local pendingPiP = nil
 local packetID = 0
 local updateAccum = 0
 local UPDATE_INTERVAL = 0.1 -- 100 ms
+
+local pipEnabled = false
+local pipDriver = -1
+local pipCamera = 0
 
 local function validNumber(value)
   return type(value) == 'number'
@@ -47,8 +53,10 @@ local function onIPCMessage(raw)
       lastConnectionID = message.connection_id
       lastCommandSeq = 0
       lastReplaySeq = 0
+      lastPiPSeq = 0
       pendingCommand = nil
       pendingReplay = nil
+      pendingPiP = nil
     end
   end
 
@@ -75,6 +83,16 @@ local function onIPCMessage(raw)
     end
     acceptConnection()
     pendingReplay = message
+  elseif message.type == 'pip' then
+    if type(message.connection_id) ~= 'string' or message.connection_id == ''
+        or not validNumber(message.pip_seq)
+        or type(message.pip_enabled) ~= 'boolean'
+        or not validNumber(message.target_driver)
+        or not validNumber(message.target_car_camera) then
+      return
+    end
+    acceptConnection()
+    pendingPiP = message
   else
     ac.log('Broadcaster IPC ignored unknown message type')
   end
@@ -596,6 +614,20 @@ local function processCommands()
   applyFocus(command.target_driver, command.target_camera, command.target_car_camera)
 end
 
+local function processPiPCommands()
+  local command = pendingPiP
+  if command == nil then return end
+  pendingPiP = nil
+
+  local seq = command.pip_seq
+  if seq == lastPiPSeq then return end
+  lastPiPSeq = seq
+  pipEnabled = command.pip_enabled
+  pipDriver = command.target_driver
+  pipCamera = command.target_car_camera
+  ac.setWindowOpen('pip', pipEnabled)
+end
+
 ---------------------------------------------------------------------
 -- Gap / interval computation (ported from remote_web.py)
 ---------------------------------------------------------------------
@@ -781,6 +813,7 @@ function script.update(dt)
   processShotHold()
   processReplayResultExpiry()
   processCommands()
+  processPiPCommands()
   syncLeaderboard()
 
   updateAccum = updateAccum + dt
