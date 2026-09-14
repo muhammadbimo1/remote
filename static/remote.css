@@ -174,6 +174,45 @@ body {
     opacity: 0.75;
 }
 
+/* Independent onboard PiP. The selected driver is picked from each card; this
+   compact strip owns visibility and onboard-camera cycling. */
+.pip-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-shrink: 0;
+}
+
+.pip-bar .ac-btn {
+    flex: 0 0 auto;
+    min-width: 68px;
+    padding: 5px 8px 7px;
+    border-radius: var(--radius-sm);
+    text-align: center;
+}
+
+#pip-toggle[aria-pressed="true"],
+.pip-target[aria-pressed="true"] {
+    background: var(--fill);
+    color: var(--on-fill);
+    text-shadow: none;
+}
+
+#pip-toggle[aria-pressed="true"] .cam-cap {
+    color: var(--on-fill);
+    opacity: 0.75;
+}
+
+#pip-readout {
+    margin-left: auto;
+    color: var(--ink-dim);
+    font-size: var(--type-small);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 /* ---------------------------------------------------------------------------
    Subcam bar / class filter bar
    --------------------------------------------------------------------------- */
@@ -748,6 +787,14 @@ body {
     text-shadow: var(--glow-text);
 }
 
+.driver-gaps .pip-target {
+    margin-left: auto;
+    padding: 1px 7px;
+    font-family: var(--font-micro);
+    font-size: var(--type-micro);
+    line-height: 1.25;
+}
+
 /* --- Empty states --- */
 #drivers-list .ac-banner {
     margin: auto;
@@ -816,6 +863,21 @@ body {
        frame readout keeps its right anchor on whichever line it lands. */
     .replay-bar {
         flex-wrap: wrap;
+    }
+
+    .pip-bar {
+        flex-wrap: wrap;
+    }
+
+    .pip-bar .ac-btn {
+        min-width: 56px;
+        padding: 4px 7px 5px;
+        font-size: var(--type-small);
+    }
+
+    #pip-readout {
+        flex: 1 1 150px;
+        text-align: right;
     }
 
     .replay-bar .ac-tab {

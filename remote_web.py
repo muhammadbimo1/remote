@@ -1365,6 +1365,8 @@ def index():
             var INCIDENT_NOTICE_MS = 6000;
             var activeClassFilter = 'ALL';
             var ttStatus = 'idle';
+            var pipState = { enabled: false, driver: -1, camera: 0, camera_count: 0 };
+            var lastDrivers = [];
 
             // Class name -> ramp step 1-4 (a .cls-N class, see remote.css).
             // Amber Console is single-hue, so a class is told apart by its badge
@@ -1405,6 +1407,39 @@ def index():
 
             function setPressed(el, on) {
                 if (el) el.setAttribute('aria-pressed', on ? 'true' : 'false');
+            }
+
+            function renderPiPState(state, drivers) {
+                pipState = state || { enabled: false, driver: -1, camera: 0, camera_count: 0 };
+                lastDrivers = drivers || lastDrivers || [];
+
+                var target = null;
+                for (var i = 0; i < lastDrivers.length; i++) {
+                    if (lastDrivers[i].num - 1 === pipState.driver) {
+                        target = lastDrivers[i];
+                        break;
+                    }
+                }
+
+                var toggle = document.getElementById('pip-toggle');
+                var prev = document.getElementById('pip-camera-prev');
+                var next = document.getElementById('pip-camera-next');
+                var readout = document.getElementById('pip-readout');
+                var usable = !!target && Number(pipState.camera_count || target.camera_count || 0) > 0;
+
+                setPressed(toggle, !!pipState.enabled);
+                if (toggle) toggle.firstChild.nodeValue = pipState.enabled ? 'PiP On' : 'PiP Off';
+                if (prev) prev.disabled = !pipState.enabled || !usable;
+                if (next) next.disabled = !pipState.enabled || !usable;
+                if (readout) {
+                    readout.textContent = target
+                        ? (pipState.enabled ? 'PIP ' : 'PIP OFF · ') + target.name + ' · CAM ' + (Number(pipState.camera || 0) + 1)
+                        : 'PIP --';
+                }
+
+                document.querySelectorAll('button[data-pip-driver]').forEach(function(btn) {
+                    setPressed(btn, parseInt(btn.dataset.pipDriver) === pipState.driver);
+                });
             }
 
             // Timetable sync had a colour-coded dot. With one hue available the
@@ -1649,12 +1684,37 @@ def index():
             // Delegated listener on the stable container — survives innerHTML rebuilds
             document.addEventListener('DOMContentLoaded', function() {
                 document.getElementById('drivers-list').addEventListener('pointerdown', function(e) {
+                    var pipButton = e.target.closest('button[data-pip-driver]');
+                    if (pipButton) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (!pipButton.disabled) {
+                            socket.emit('pip_control', {
+                                action: 'select',
+                                driver: parseInt(pipButton.dataset.pipDriver)
+                            });
+                        }
+                        return;
+                    }
                     var card = e.target.closest('.driver-item');
                     if (card && !card.classList.contains('disabled')) {
                         var fd = new FormData();
                         fd.append('action', 'select_driver');
                         fd.append('driver_num', card.dataset.num);
                         fetch('/', { method: 'POST', body: fd });
+                    }
+                });
+
+                document.getElementById('pip-bar').addEventListener('pointerdown', function(e) {
+                    var btn = e.target.closest('button');
+                    if (!btn || btn.disabled) return;
+                    e.preventDefault();
+                    if (btn.id === 'pip-toggle') {
+                        socket.emit('pip_control', { action: 'enable', enabled: !pipState.enabled });
+                    } else if (btn.id === 'pip-camera-prev') {
+                        socket.emit('pip_control', { action: 'camera', delta: -1 });
+                    } else if (btn.id === 'pip-camera-next') {
+                        socket.emit('pip_control', { action: 'camera', delta: 1 });
                     }
                 });
 
@@ -1748,6 +1808,11 @@ def index():
                 }
             });
 
+            socket.on('pip_status', function(data) {
+                if (data.pip) renderPiPState(data.pip, lastDrivers);
+                if (data.ok === false && data.error) console.log('[pip] ' + data.error);
+            });
+
             socket.on('director_status', function(data) {
                 setPressed(document.getElementById('auto-dir-btn'), data.enabled);
             });
@@ -1763,6 +1828,8 @@ def index():
 
             socket.on('update', function(data) {
                 var statusEl = document.getElementById('ac-status');
+                lastDrivers = data.drivers || [];
+                if (data.pip) pipState = data.pip;
 
                 // Timetable state is rendered inside the status bar, so it has to
                 // be current before the bar is rebuilt.
@@ -1794,6 +1861,7 @@ def index():
                     renderEvents([]);
                     document.getElementById('drivers-list').innerHTML =
                         '<div class="ac-banner" role="alert">No Telemetry</div>';
+                    renderPiPState({ enabled: false, driver: -1, camera: 0, camera_count: 0 }, []);
                     return;
                 }
 
@@ -1934,6 +2002,11 @@ def index():
                             if (mc) { var vc = parseFloat(mc[1]); if (vc < 0.4) clsIntCls = ' tight'; else if (vc < 1.0) clsIntCls = ' warn'; }
                             grid += '<span class="cell cell-cls"><span class="label">Cls</span><span class="value' + clsIntCls + '">' + escapeHtml(d.class_interval) + '</span></span>';
                         }
+                        var isPipTarget = pipState.driver === d.num - 1;
+                        var pipUnavailable = isOffline || Number(d.camera_count || 0) < 1;
+                        grid += '<button type="button" class="ac-btn ac-btn--sm pip-target"'
+                            + ' data-pip-driver="' + (d.num - 1) + '" aria-pressed="' + isPipTarget + '"'
+                            + (pipUnavailable ? ' disabled' : '') + '>PiP</button>';
                         grid += '</div>';
                         grid += '</div>';
                     });
@@ -1942,6 +2015,7 @@ def index():
                 } else {
                     driversList.innerHTML = '<div class="ac-banner ac-banner--dim">No Drivers In Class</div>';
                 }
+                renderPiPState(pipState, lastDrivers);
             });
         </script>
     </head>
@@ -1977,6 +2051,13 @@ def index():
                 <button id="auto-dir-btn" class="ac-btn" aria-pressed="false" onclick="socket.emit('toggle_director')">Auto<span class="cam-cap">AI</span></button>
                 <button id="auto-dir-dbg-btn" class="ac-btn" aria-pressed="false" onclick="socket.emit('toggle_director_debug')" title="Verbose director scoring logs to server stdout">Dbg<span class="cam-cap">DG</span></button>
             </div>
+        </div>
+
+        <div id="pip-bar" class="pip-bar" aria-label="Independent picture in picture controls">
+            <button id="pip-toggle" class="ac-btn" aria-pressed="false">PiP Off<span class="cam-cap">PP</span></button>
+            <button id="pip-camera-prev" class="ac-btn" disabled>Cam -<span class="cam-cap">&lt;</span></button>
+            <button id="pip-camera-next" class="ac-btn" disabled>Cam +<span class="cam-cap">&gt;</span></button>
+            <span id="pip-readout" class="ac-readout ac-readout--inline">PIP --</span>
         </div>
 
         <div id="replay-bar" class="replay-bar">

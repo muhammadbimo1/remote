@@ -959,6 +959,32 @@ class PiPStateTest(unittest.TestCase):
         self.assertEqual(data['pip'], remote_web.get_pip_state())
 
 
+class PiPMarkupTest(unittest.TestCase):
+    def setUp(self):
+        self.html = remote_web.app.test_client().get('/').get_data(as_text=True)
+
+    def test_page_has_independent_pip_controls(self):
+        self.assertIn('id="pip-toggle"', self.html)
+        self.assertIn('id="pip-camera-prev"', self.html)
+        self.assertIn('id="pip-camera-next"', self.html)
+        self.assertIn('id="pip-readout"', self.html)
+        self.assertIn("socket.emit('pip_control'", self.html)
+
+    def test_driver_rows_have_a_dedicated_pip_action(self):
+        self.assertIn('data-pip-driver', self.html)
+        self.assertIn("e.target.closest('button[data-pip-driver]')", self.html)
+
+    def test_pip_action_cannot_fall_through_to_main_selection(self):
+        handler = re.search(
+            r"var pipButton = e\.target\.closest\('button\[data-pip-driver\]'\);"
+            r"(.*?)var card = e\.target\.closest\('\.driver-item'\);",
+            self.html, re.S)
+        self.assertIsNotNone(handler)
+        self.assertIn('e.preventDefault();', handler.group(1))
+        self.assertIn('e.stopPropagation();', handler.group(1))
+        self.assertIn('return;', handler.group(1))
+
+
 class DisconnectStateResetTest(unittest.TestCase):
     def test_reset_clears_all_state_that_belongs_to_the_old_ac_run(self):
         remote_web._current_session = (1, 0, 3)
