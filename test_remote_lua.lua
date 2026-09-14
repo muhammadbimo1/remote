@@ -396,6 +396,8 @@ local function testTelemetryUsesVersionedProtocolAtTenHertz()
   assertEqual(payload.car_count, 1, 'telemetry carries the bounded car array')
   assertEqual(payload.cars[1].session_id, 18, 'telemetry includes remote session IDs')
   assertEqual(payload.cars[1].driver_name, 'Alex Driver', 'telemetry includes driver names')
+  assertEqual(payload.cars[1].car_cameras_count, 3,
+    'telemetry includes each drivers onboard camera count')
   assertEqual(payload.is_timed_session, true, 'telemetry identifies timed sessions')
   assertEqual(payload.session_time_left, 3723000, 'telemetry includes remaining session milliseconds')
 end

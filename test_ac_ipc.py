@@ -17,6 +17,7 @@ def car_message(car_id=0):
         'best_lap': 100000,
         'last_lap': 101000,
         'lap_count': 3,
+        'car_cameras_count': 3,
         'is_in_pit': False,
         'is_connected': True,
         'is_colliding': False,
@@ -112,6 +113,23 @@ class TelemetrySnapshotTest(unittest.TestCase):
         del car['session_id']
         with self.assertRaises(ProtocolError):
             TelemetrySnapshot.from_message(telemetry_message([car]))
+
+    def test_car_camera_count_is_required_and_published(self):
+        car = car_message()
+        del car['car_cameras_count']
+        with self.assertRaises(ProtocolError):
+            TelemetrySnapshot.from_message(telemetry_message([car]))
+
+        snapshot = TelemetrySnapshot.from_message(
+            telemetry_message([car_message()]))
+        self.assertEqual(snapshot.cars[0].car_cameras_count, 3)
+
+        for invalid in (-1, 65):
+            with self.subTest(invalid=invalid):
+                car = car_message()
+                car['car_cameras_count'] = invalid
+                with self.assertRaises(ProtocolError):
+                    TelemetrySnapshot.from_message(telemetry_message([car]))
 
     def test_published_snapshots_cannot_be_mutated(self):
         snapshot = TelemetrySnapshot.from_message(
@@ -281,6 +299,35 @@ class ACIPCTransportTest(unittest.TestCase):
             'replay_action': 3, 'replay_rewind_s': 0.0,
             'replay_frame': 200, 'target_driver': -1,
             'target_camera': -1, 'target_car_camera': -1,
+        })
+
+    def test_pip_sequence_is_independent(self):
+        transport = ACIPCTransport(connection_id='server-a')
+        socket = FakeSocket()
+        transport.attach(socket)
+
+        self.assertTrue(transport.send_command(1, 2, -1))
+        self.assertTrue(transport.send_pip_command(True, 4, 0))
+        self.assertTrue(transport.send_replay_command(2))
+
+        self.assertEqual(socket.sent[0]['command_seq'], 1)
+        self.assertEqual(socket.sent[1]['pip_seq'], 1)
+        self.assertEqual(socket.sent[2]['replay_seq'], 1)
+        self.assertNotIn('pip_seq', socket.sent[0])
+        self.assertNotIn('command_seq', socket.sent[1])
+        self.assertNotIn('replay_seq', socket.sent[1])
+
+    def test_pip_message_carries_complete_state_and_epoch(self):
+        transport = ACIPCTransport(connection_id='server-a')
+        socket = FakeSocket()
+        transport.attach(socket)
+
+        self.assertTrue(transport.send_pip_command(False, 7, 2))
+
+        self.assertEqual(socket.sent[-1], {
+            'version': 1, 'connection_id': 'server-a', 'type': 'pip',
+            'pip_seq': 1, 'pip_enabled': False,
+            'target_driver': 7, 'target_car_camera': 2,
         })
 
     def test_failed_send_disconnects_only_the_failed_socket(self):

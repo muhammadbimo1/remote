@@ -721,6 +721,7 @@ local function updateTelemetry()
       best_lap = car.bestLapTimeMs,
       last_lap = car.previousLapTimeMs,
       lap_count = car.lapCount,
+      car_cameras_count = car.carCamerasCount,
       is_in_pit = car.isInPitlane == true,
       is_connected = car.isConnected == true,
       is_colliding = isColliding,
