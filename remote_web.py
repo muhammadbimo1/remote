@@ -178,6 +178,14 @@ latest_current_camera = 0
 latest_current_car_camera = 0
 latest_replay_file = ''
 
+pip_lock = threading.RLock()
+_pip_state = {
+    'enabled': False,
+    'driver': -1,
+    'camera': 0,
+    'camera_count': 0,
+}
+
 # --- Class colors ---
 CLASS_COLORS = {
     'PRO': '#34a853',
@@ -367,6 +375,7 @@ def compute_gaps(telem):
             'best_lap': c.best_lap,
             'last_lap': c.last_lap,
             'lap_count': c.lap_count,
+            'car_cameras_count': c.car_cameras_count,
             'is_in_pit': c.is_in_pit,
             'is_connected': c.is_connected,
             'is_colliding': c.is_colliding,
@@ -642,6 +651,9 @@ def reset_ac_run_state():
     latest_current_camera = 0
     latest_current_car_camera = 0
     latest_replay_file = ''
+    with pip_lock:
+        _pip_state.update(
+            enabled=False, driver=-1, camera=0, camera_count=0)
     return dropped
 
 
@@ -679,6 +691,7 @@ def build_update_data(telem, cars_with_gaps=None):
             'interval': c['interval'],
             'colliding': c['is_colliding'],
             'rolled_over': bool(c.get('is_rolled_over')),
+            'camera_count': c.get('car_cameras_count', 0),
         })
 
     with _resync_lock:
@@ -701,6 +714,7 @@ def build_update_data(telem, cars_with_gaps=None):
         'timetable_last_error': last_poll_error,
         'timetable_matched': last_poll_matched,
         'session_type': telem.session_type,
+        'pip': get_pip_state(),
         'replay': {
             'active': bool(telem.is_replay),
             'frame': telem.replay_frame,
@@ -759,6 +773,7 @@ def build_replay_update_data(telem):
     data['current_car_camera'] = telem.current_car_camera
     data['auto_director'] = director.enabled
     data['auto_director_debug'] = director.debug
+    data['pip'] = get_pip_state()
     data['timetable_status'] = last_poll_status
     data['replay'] = {
         'active': True,
@@ -858,6 +873,94 @@ def send_command(target_driver, target_camera, target_car_camera=-1,
         expected_generation=expected_generation)
 
 
+def get_pip_state():
+    with pip_lock:
+        return dict(_pip_state)
+
+
+def _pip_car(telem, driver):
+    if telem is None:
+        return None
+    for car in telem.cars[:telem.car_count]:
+        if car.car_id == driver:
+            return car
+    return None
+
+
+def apply_pip_action(data):
+    """Validate one browser PiP action and send the complete desired state."""
+    if not isinstance(data, dict):
+        return False, get_pip_state(), 'bad PiP action'
+
+    action = data.get('action')
+    expected_generation = None
+    with pip_lock:
+        current = dict(_pip_state)
+        candidate = dict(current)
+
+        if action == 'select':
+            driver = data.get('driver')
+            if isinstance(driver, bool) or not isinstance(driver, int):
+                return False, current, 'bad PiP driver'
+            telem, expected_generation = ac_transport.latest_with_generation()
+            if telem is None:
+                return False, current, 'AC telemetry is disconnected'
+            car = _pip_car(telem, driver)
+            if car is None or not car.is_connected:
+                return False, current, 'PiP driver is unavailable'
+            camera_count = car.car_cameras_count
+            if camera_count <= 0:
+                return False, current, 'PiP driver has no onboard cameras'
+            candidate.update(
+                enabled=True, driver=driver, camera=0,
+                camera_count=camera_count)
+        elif action == 'camera':
+            delta = data.get('delta')
+            if isinstance(delta, bool) or not isinstance(delta, int) \
+                    or delta not in (-1, 1):
+                return False, current, 'bad PiP camera step'
+            if current['driver'] < 0 or current['camera_count'] <= 0:
+                return False, current, 'select a PiP driver first'
+            candidate['camera'] = (
+                current['camera'] + delta) % current['camera_count']
+        elif action == 'enable':
+            enabled = data.get('enabled')
+            if not isinstance(enabled, bool):
+                return False, current, 'bad PiP enabled state'
+            if enabled and (current['driver'] < 0 or
+                            current['camera_count'] <= 0):
+                return False, current, 'select a PiP driver first'
+            candidate['enabled'] = enabled
+        else:
+            return False, current, 'unknown PiP action'
+
+        sent = ac_transport.send_pip_command(
+            candidate['enabled'], candidate['driver'], candidate['camera'],
+            expected_generation=expected_generation)
+        if not sent:
+            return False, current, 'AC command connection is unavailable'
+        _pip_state.update(candidate)
+        return True, dict(_pip_state), None
+
+
+def sync_pip_state(telem, connection_generation):
+    """Send safe PiP state once a new AC connection has fresh telemetry."""
+    with pip_lock:
+        candidate = dict(_pip_state)
+        car = _pip_car(telem, candidate['driver'])
+        if candidate['enabled'] and (
+                car is None or not car.is_connected or
+                car.car_cameras_count <= 0):
+            candidate = {
+                'enabled': False, 'driver': -1,
+                'camera': 0, 'camera_count': 0,
+            }
+            _pip_state.update(candidate)
+        return ac_transport.send_pip_command(
+            candidate['enabled'], candidate['driver'], candidate['camera'],
+            expected_generation=connection_generation)
+
+
 def send_replay_command(action, rewind_s=0.0, frame=0, driver=None, camera=None):
     """Send a replay command without synthesizing a camera command.
 
@@ -921,6 +1024,7 @@ def monitor_telemetry():
                       '({} events dropped)'.format(dropped))
             last_connection_generation = connection_generation
             last_packet_id = -1
+            sync_pip_state(telem, connection_generation)
 
         if not ac_connected:
             ac_connected = True
@@ -1016,6 +1120,13 @@ def handle_toggle_director():
     with director_lock:
         director.enabled = not director.enabled
     emit('director_status', {'enabled': director.enabled}, broadcast=True)
+
+
+@socketio.on('pip_control')
+def handle_pip_control(data):
+    ok, state, error = apply_pip_action(data or {})
+    emit('pip_status', {'ok': ok, 'pip': state, 'error': error},
+         broadcast=True)
 
 
 @socketio.on('toggle_director_debug')

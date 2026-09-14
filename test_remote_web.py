@@ -22,6 +22,7 @@ class CarFixture(object):
         self.best_lap = 0
         self.last_lap = 0
         self.lap_count = 0
+        self.car_cameras_count = 0
         self.is_in_pit = False
         self.is_connected = False
         self.is_colliding = False
@@ -818,6 +819,146 @@ class IPCPeerSecurityTest(unittest.TestCase):
         self.assertEqual(observed_packet_ids, [9])
 
 
+class PiPStateTest(unittest.TestCase):
+    def setUp(self):
+        remote_web._pip_state = {
+            'enabled': False,
+            'driver': -1,
+            'camera': 0,
+            'camera_count': 0,
+        }
+        self.telem = TelemetryPage()
+        self.telem.car_count = 5
+        target = self.telem.cars[4]
+        target.car_id = 4
+        target.is_connected = True
+        target.car_cameras_count = 3
+
+    def test_selecting_driver_enables_camera_zero_without_main_command(self):
+        with patch.object(remote_web.ac_transport, 'latest_with_generation',
+                          return_value=(self.telem, 8)), \
+                patch.object(remote_web.ac_transport, 'send_pip_command',
+                             return_value=True) as send_pip, \
+                patch.object(remote_web, 'send_command') as send_main:
+            ok, state, error = remote_web.apply_pip_action({
+                'action': 'select', 'driver': 4,
+            })
+
+        self.assertTrue(ok, error)
+        self.assertEqual(state, {
+            'enabled': True, 'driver': 4, 'camera': 0, 'camera_count': 3,
+        })
+        send_pip.assert_called_once_with(
+            True, 4, 0, expected_generation=8)
+        send_main.assert_not_called()
+
+    def test_camera_delta_wraps_with_selected_drivers_count(self):
+        remote_web._pip_state.update(
+            enabled=True, driver=4, camera=2, camera_count=3)
+        with patch.object(remote_web.ac_transport, 'send_pip_command',
+                          return_value=True) as send_pip:
+            ok, state, error = remote_web.apply_pip_action({
+                'action': 'camera', 'delta': 1,
+            })
+
+        self.assertTrue(ok, error)
+        self.assertEqual(state['camera'], 0)
+        send_pip.assert_called_once_with(
+            True, 4, 0, expected_generation=None)
+
+    def test_disable_sends_full_state_without_fresh_telemetry(self):
+        remote_web._pip_state.update(
+            enabled=True, driver=4, camera=1, camera_count=3)
+        with patch.object(remote_web.ac_transport, 'send_pip_command',
+                          return_value=True) as send_pip:
+            ok, state, error = remote_web.apply_pip_action({
+                'action': 'enable', 'enabled': False,
+            })
+
+        self.assertTrue(ok, error)
+        self.assertFalse(state['enabled'])
+        self.assertEqual(state['driver'], 4)
+        send_pip.assert_called_once_with(
+            False, 4, 1, expected_generation=None)
+
+    def test_invalid_or_unavailable_targets_are_rejected(self):
+        cases = [
+            ({'action': 'select', 'driver': True}, self.telem),
+            ({'action': 'select', 'driver': 7}, self.telem),
+            ({'action': 'select', 'driver': 4}, None),
+        ]
+        self.telem.cars[4].is_connected = False
+        cases.append(({'action': 'select', 'driver': 4}, self.telem))
+
+        for action, telem in cases:
+            with self.subTest(action=action, telemetry=telem is not None), \
+                    patch.object(remote_web.ac_transport,
+                                 'latest_with_generation',
+                                 return_value=(telem, 8)), \
+                    patch.object(remote_web.ac_transport,
+                                 'send_pip_command') as send_pip:
+                ok, state, error = remote_web.apply_pip_action(action)
+                self.assertFalse(ok)
+                self.assertTrue(error)
+                self.assertFalse(state['enabled'])
+                send_pip.assert_not_called()
+
+    def test_zero_camera_target_and_invalid_actions_are_rejected(self):
+        self.telem.cars[4].car_cameras_count = 0
+        with patch.object(remote_web.ac_transport, 'latest_with_generation',
+                          return_value=(self.telem, 8)), \
+                patch.object(remote_web.ac_transport,
+                             'send_pip_command') as send_pip:
+            ok, _, _ = remote_web.apply_pip_action({
+                'action': 'select', 'driver': 4,
+            })
+            self.assertFalse(ok)
+            ok, _, _ = remote_web.apply_pip_action({
+                'action': 'enable', 'enabled': 'false',
+            })
+            self.assertFalse(ok)
+            ok, _, _ = remote_web.apply_pip_action({
+                'action': 'camera', 'delta': 2,
+            })
+            self.assertFalse(ok)
+            send_pip.assert_not_called()
+
+    def test_handler_broadcasts_confirmed_state(self):
+        confirmed = {
+            'enabled': True, 'driver': 4, 'camera': 0, 'camera_count': 3,
+        }
+        with remote_web.app.test_request_context('/'), \
+                patch.object(remote_web, 'apply_pip_action',
+                             return_value=(True, confirmed, None)), \
+                patch.object(remote_web, 'emit') as emit:
+            remote_web.handle_pip_control({'action': 'select', 'driver': 4})
+
+        emit.assert_called_once_with(
+            'pip_status', {'ok': True, 'pip': confirmed, 'error': None},
+            broadcast=True)
+
+    def test_new_generation_synchronizes_complete_state(self):
+        remote_web._pip_state.update(
+            enabled=True, driver=4, camera=2, camera_count=3)
+        with patch.object(remote_web.ac_transport, 'send_pip_command',
+                          return_value=True) as send_pip:
+            self.assertTrue(remote_web.sync_pip_state(self.telem, 11))
+
+        send_pip.assert_called_once_with(
+            True, 4, 2, expected_generation=11)
+
+    def test_update_payload_contains_pip_and_per_driver_camera_count(self):
+        self.telem.track_length = 5000.0
+        car = self.telem.cars[4]
+        car.position = 1
+        car.driver_name = 'PiP Driver'
+        data = remote_web.build_update_data(self.telem)
+
+        driver = next(d for d in data['drivers'] if d['num'] == 5)
+        self.assertEqual(driver['camera_count'], 3)
+        self.assertEqual(data['pip'], remote_web.get_pip_state())
+
+
 class DisconnectStateResetTest(unittest.TestCase):
     def test_reset_clears_all_state_that_belongs_to_the_old_ac_run(self):
         remote_web._current_session = (1, 0, 3)
@@ -829,6 +970,9 @@ class DisconnectStateResetTest(unittest.TestCase):
         remote_web.latest_current_camera = 4
         remote_web.latest_current_car_camera = 2
         remote_web.latest_replay_file = 'old.acreplay'
+        remote_web._pip_state = {
+            'enabled': True, 'driver': 7, 'camera': 2, 'camera_count': 3,
+        }
         remote_web._prev_rollover_state[0] = True
         remote_web.event_log.mark(0, name='Old Driver')
         with remote_web._resync_lock:
@@ -845,6 +989,9 @@ class DisconnectStateResetTest(unittest.TestCase):
         self.assertEqual(remote_web.latest_current_camera, 0)
         self.assertEqual(remote_web.latest_current_car_camera, 0)
         self.assertEqual(remote_web.latest_replay_file, '')
+        self.assertEqual(remote_web.get_pip_state(), {
+            'enabled': False, 'driver': -1, 'camera': 0, 'camera_count': 0,
+        })
         self.assertEqual(remote_web._prev_rollover_state, {})
         self.assertEqual(remote_web.event_log.snapshot(), [])
         with remote_web._resync_lock:
