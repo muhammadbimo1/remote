@@ -19,6 +19,18 @@ from other devices on the same network at `http://<race-rig-ip>:5000`.
 The Lua WebSocket reconnects automatically if the Python server is restarted.
 The Python server accepts a replacement connection if the Lua app is reloaded.
 
+## Independent PiP
+
+Each eligible driver card in the web panel has a **PiP** button. Selecting it
+opens Assetto Corsa's movable **Driver PiP** app window with that driver's
+onboard camera. **Cam -** and **Cam +** cycle only that driver's available
+onboard cameras, and **PiP Off** closes the window.
+
+PiP is independent from the program shot: selecting its driver, changing its
+camera, moving or resizing its window, and hiding it do not change the main
+broadcast driver or camera. The rendered picture stays at a centered 16:9
+aspect ratio when the app window is resized.
+
 ## Broadcast highlight relay
 
 Copy `remote_config.example.json` to `remote_config.json` (a disabled local

@@ -125,3 +125,37 @@ These already existed before the polling API was added. Listed here for complete
 - Route table: `relay/server.js`
 - Payload builders: `relay/state-cache.js` (`getConnectedDriversPayload`, `getCollisionCountsPayload`, `parseTeamName`)
 - Cloudflare Worker mirror: `worker/relay-do.js` — the polling endpoint is **not yet** mirrored there; only the Node relay serves `/api/connected_drivers`.
+
+---
+
+## Broadcaster Remote PiP IPC
+
+The local Broadcaster Remote Python server sends PiP state to the CSP Lua app
+over the loopback-only `/ac-ipc` WebSocket. This is separate from the relay HTTP
+API above and uses the existing IPC envelope (`version = 1`).
+
+```json
+{
+  "version": 1,
+  "connection_id": "server-process-epoch",
+  "type": "pip",
+  "pip_seq": 4,
+  "pip_enabled": true,
+  "target_driver": 7,
+  "target_car_camera": 1
+}
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `connection_id` | string | New for each Python process. Lua resets its last received PiP sequence when this epoch changes. |
+| `type` | string | Always `"pip"`. |
+| `pip_seq` | integer | Monotonically increasing PiP sequence. It is independent of `command_seq` and `replay_seq`, so PiP never changes or delays the program shot. |
+| `pip_enabled` | boolean | Strict boolean. `false` closes the PiP app window and stops its off-screen render updates. |
+| `target_driver` | integer | Zero-based AC car index. `-1` means no selected target while disabled. |
+| `target_car_camera` | integer | Zero-based index into the target car's onboard cameras. |
+
+Telemetry car entries include `car_cameras_count`; the server uses it to reject
+unavailable targets and wrap camera cycling. A complete PiP state is resent
+after an AC connection-generation change. Malformed messages, stale
+`pip_seq` values, and unsupported targets do not modify the current PiP state.
