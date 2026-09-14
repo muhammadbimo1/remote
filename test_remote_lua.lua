@@ -19,6 +19,26 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
   local settingsSaveCount = 0
   local clickCheckbox = false
   local windowOpenCalls = {}
+  local windowOpenState = { pip = false }
+  local sceneReadyCallbacks = {}
+  local geometryUpdates = {}
+  local geometryDisposed = 0
+  local drawnImages = {}
+  local drawnTexts = {}
+  local cameraSections = {
+    CAMERA_0 = {
+      POSITION = { x = 1, y = 2, z = 3 },
+      FORWARD = { x = 0, y = 0, z = 1 },
+      UP = { x = 0, y = 1, z = 0 },
+      FOV = 60,
+    },
+    CAMERA_1 = {
+      POSITION = { x = 4, y = 5, z = 6 },
+      FORWARD = { x = 1, y = 0, z = 0 },
+      UP = { x = 0, y = 1, z = 0 },
+      FOV = 72,
+    },
+  }
   local windows = {
     { name = 'IMGUI_LUA_cmrt_main', title = 'CMRT Broadcast',
       layer = 3, layerDuplicate = true },
@@ -61,6 +81,14 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     damage = { [0] = 0, 0, 0, 0, 0 },
     up = { y = 1 },
     carCamerasCount = 3,
+    bodyTransform = {
+      transformPoint = function(_, value)
+        return { x = value.x + 100, y = value.y + 200, z = value.z + 300 }
+      end,
+      transformVector = function(_, value)
+        return { x = value.x, y = value.y, z = value.z }
+      end,
+    },
     driverName = function() return 'Alex Driver' end,
   }
 
@@ -74,6 +102,8 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
 
   _G.script = {}
   _G.vec2 = function(x, y) return { x = x, y = y } end
+  _G.vec3 = function(x, y, z) return { x = x or 0, y = y or 0, z = z or 0 } end
+  math.normalize = function(value) return value end
   _G.rgbm = setmetatable({ colors = { white = {} } }, {
     __call = function() return {} end,
   })
@@ -83,7 +113,16 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     WindowFlags = { None = 0 },
     ImageFit = { Stretch = 0 },
     windowSize = function() return { x = 1920, y = 1080 } end,
-    drawImage = function() end,
+    availableSpace = function() return { x = 480, y = 270 } end,
+    getCursor = function() return { x = 0, y = 0 } end,
+    setCursor = function() end,
+    drawRectFilled = function() end,
+    drawImage = function(image, p1, p2)
+      drawnImages[#drawnImages + 1] = { image = image, p1 = p1, p2 = p2 }
+    end,
+    text = function(value) drawnTexts[#drawnTexts + 1] = value end,
+    beginTonemapping = function() end,
+    endTonemapping = function() end,
     slider = function(_, value) return value, false end,
     checkbox = function()
       local clicked = clickCheckbox
@@ -94,6 +133,12 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
   _G.render = {
     BlendMode = { AlphaBlend = 1 },
     DepthMode = { Off = 2 },
+    AntialiasingMode = { FXAA = 3 },
+    TextureFormat = { R8G8B8A8 = { UNorm = 4 } },
+    ShadersType = { Main = 5 },
+    onSceneReady = function(callback)
+      sceneReadyCallbacks[#sceneReadyCallbacks + 1] = callback
+    end,
     fullscreenPass = function(params)
       renderCalls[#renderCalls + 1] = params
     end,
@@ -138,7 +183,36 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
           save = function() settingsSaveCount = settingsSaveCount + 1 end,
         }
       end,
+      carData = function()
+        return {
+          get = function(_, section, key, fallback)
+            local values = cameraSections[section]
+            if values == nil or values[key] == nil then return fallback end
+            return values[key]
+          end,
+        }
+      end,
     },
+    GeometryShot = function()
+      local shot = {}
+      local function chain() return shot end
+      shot.setName = chain
+      shot.setSky = chain
+      shot.setOriginalLighting = chain
+      shot.setShadersType = chain
+      shot.setFakeCarShadows = chain
+      shot.setMaxLayer = chain
+      shot.setOpaqueAlphaFix = chain
+      shot.setTransparentPass = chain
+      shot.update = function(_, pos, look, up, fov)
+        geometryUpdates[#geometryUpdates + 1] = {
+          pos = pos, look = look, up = up, fov = fov,
+        }
+      end
+      shot.dispose = function() geometryDisposed = geometryDisposed + 1 end
+      return shot
+    end,
+    findNodes = function() return {} end,
     getAppWindows = function() return windows end,
     accessAppWindow = function(name)
       for _, window in ipairs(windows) do
@@ -187,7 +261,9 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     setCurrentCarCamera = function(camera) sim.carCameraIndex = camera end,
     setWindowOpen = function(id, opened)
       windowOpenCalls[#windowOpenCalls + 1] = { id = id, opened = opened }
+      windowOpenState[id] = opened
     end,
+    isWindowOpen = function(id) return windowOpenState[id] == true end,
     log = function() end,
   }
   os.preciseClock = function() return now end
@@ -211,6 +287,14 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     socketParams = function() return socketParams end,
     telemetryPayloads = telemetryPayloads,
     windowOpenCalls = windowOpenCalls,
+    geometryUpdates = geometryUpdates,
+    drawnImages = drawnImages,
+    drawnTexts = drawnTexts,
+    runSceneReady = function()
+      for _, callback in ipairs(sceneReadyCallbacks) do callback() end
+    end,
+    setCameraSections = function(value) cameraSections = value end,
+    geometryDisposed = function() return geometryDisposed end,
     deliver = function(message) socketCallback(message) end,
     update = function(dt) script.update(dt or 0) end,
     clickObsSetting = function()
@@ -518,6 +602,66 @@ local function testPiPDisableAndNewServerEpochAreAccepted()
     'disabled PiP closes its window')
 end
 
+local function testDisabledPiPDoesNotRender()
+  local ctx = loadRemote(false)
+  ctx.runSceneReady()
+  assertEqual(#ctx.geometryUpdates, 0,
+    'disabled PiP skips its scene render')
+end
+
+local function testEnabledPiPRendersSelectedOnboardCamera()
+  local ctx = loadRemote(false)
+  ctx.sim.focusedCar = 2
+  ctx.sim.cameraMode = ac.CameraMode.Track
+  ctx.deliver(pipCommand('server-a', 1, true, 0, 1))
+  ctx.update()
+  ctx.runSceneReady()
+
+  local update = ctx.geometryUpdates[1]
+  assertEqual(update.fov, 72, 'selected cameras.ini FOV is used')
+  assertEqual(update.pos.x, 104,
+    'camera position is transformed by the target car')
+  assertEqual(ctx.sim.focusedCar, 2, 'PiP render keeps main focus')
+  assertEqual(ctx.sim.cameraMode, ac.CameraMode.Track,
+    'PiP render keeps main camera')
+end
+
+local function testMissingRequestedPiPCameraFallsBackToCameraZero()
+  local ctx = loadRemote(false)
+  ctx.deliver(pipCommand('server-a', 1, true, 0, 2))
+  ctx.update()
+  ctx.runSceneReady()
+
+  assertEqual(ctx.geometryUpdates[1].fov, 60,
+    'missing requested camera falls back to camera zero')
+end
+
+local function testUnavailablePiPCameraDoesNotDrawAStaleFrame()
+  local ctx = loadRemote(false)
+  ctx.setCameraSections({})
+  ctx.deliver(pipCommand('server-a', 1, true, 0, 0))
+  ctx.update()
+  ctx.runSceneReady()
+  script.windowPiP(0)
+
+  assertEqual(#ctx.geometryUpdates, 0,
+    'missing camera data does not update the geometry shot')
+  assertEqual(#ctx.drawnImages, 0,
+    'missing camera data does not draw a stale image')
+  assertEqual(ctx.drawnTexts[#ctx.drawnTexts], 'PiP unavailable',
+    'missing camera data reports an unavailable view')
+end
+
+local function testPiPGeometryShotIsDisposedOnRelease()
+  local ctx = loadRemote(false)
+  ctx.deliver(pipCommand('server-a', 1, true, 0, 0))
+  ctx.update()
+  ctx.runSceneReady()
+  ctx.release()
+  assertEqual(ctx.geometryDisposed(), 1,
+    'PiP releases its GPU texture when the app unloads')
+end
+
 local function testEnterTogglesOnFirstStingerFrame()
   local ctx = loadRemote(false)
   requestReplay(ctx, 1)
@@ -596,4 +740,9 @@ testNewServerEpochAcceptsAResetSequence()
 testPiPCommandDoesNotChangeMainShot()
 testDuplicateAndMalformedPiPCommandsAreIgnored()
 testPiPDisableAndNewServerEpochAreAccepted()
+testDisabledPiPDoesNotRender()
+testEnabledPiPRendersSelectedOnboardCamera()
+testMissingRequestedPiPCameraFallsBackToCameraZero()
+testUnavailablePiPCameraDoesNotDrawAStaleFrame()
+testPiPGeometryShotIsDisposedOnRelease()
 print('test_remote_lua.lua: all tests passed')

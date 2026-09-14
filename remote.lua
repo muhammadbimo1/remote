@@ -32,6 +32,9 @@ local UPDATE_INTERVAL = 0.1 -- 100 ms
 local pipEnabled = false
 local pipDriver = -1
 local pipCamera = 0
+local pipActualCamera = 0
+local pipFrameReady = false
+local pipShot = nil
 
 local function validNumber(value)
   return type(value) == 'number'
@@ -625,8 +628,100 @@ local function processPiPCommands()
   pipEnabled = command.pip_enabled
   pipDriver = command.target_driver
   pipCamera = command.target_car_camera
+  pipFrameReady = false
   ac.setWindowOpen('pip', pipEnabled)
 end
+
+local function validPiPVector(value, allowZero)
+  if value == nil or not validNumber(value.x)
+      or not validNumber(value.y) or not validNumber(value.z) then
+    return false
+  end
+  return allowZero or value.x * value.x + value.y * value.y
+      + value.z * value.z > 1e-8
+end
+
+local function readPiPCamera(config, cameraIndex)
+  local section = string.format('CAMERA_%d', cameraIndex)
+  local position = config:get(section, 'POSITION', vec3())
+  local forward = config:get(section, 'FORWARD', vec3())
+  local up = config:get(section, 'UP', vec3())
+  local fov = config:get(section, 'FOV', 0)
+  if not validPiPVector(position, true)
+      or not validPiPVector(forward, false)
+      or not validPiPVector(up, false)
+      or not validNumber(fov) or fov <= 0 then
+    return nil
+  end
+  return position, forward, up, fov
+end
+
+local function resolvePiPCamera(driver, requestedCamera)
+  if driver < 0 or driver >= sim.carsCount then return nil end
+  local car = ac.getCar(driver)
+  if car == nil or car.isConnected ~= true or car.carCamerasCount <= 0
+      or car.bodyTransform == nil then
+    return nil
+  end
+
+  local config = ac.INIConfig.carData(driver, 'cameras.ini')
+  if config == nil then return nil end
+  local cameraIndex = math.floor(requestedCamera)
+  if cameraIndex < 0 or cameraIndex >= car.carCamerasCount then
+    cameraIndex = 0
+  end
+  local position, forward, up, fov = readPiPCamera(config, cameraIndex)
+  if position == nil and cameraIndex ~= 0 then
+    cameraIndex = 0
+    position, forward, up, fov = readPiPCamera(config, cameraIndex)
+  end
+  if position == nil then return nil end
+
+  local transform = car.bodyTransform
+  return transform:transformPoint(position),
+      math.normalize(transform:transformVector(forward)),
+      math.normalize(transform:transformVector(up)), fov, cameraIndex
+end
+
+local function ensurePiPShot()
+  if pipShot ~= nil then return pipShot end
+  pipShot = ac.GeometryShot(
+    ac.findNodes('sceneRoot:yes'), vec2(640, 360), 1, false,
+    render.AntialiasingMode.FXAA,
+    render.TextureFormat.R8G8B8A8.UNorm, 0)
+  pipShot:setName('Broadcaster Remote PiP')
+  pipShot:setSky(true)
+  pipShot:setOriginalLighting(true)
+  pipShot:setShadersType(render.ShadersType.Main)
+  pipShot:setFakeCarShadows(true)
+  pipShot:setMaxLayer(5)
+  pipShot:setOpaqueAlphaFix(true)
+  pipShot:setTransparentPass(true)
+  return pipShot
+end
+
+render.onSceneReady(function()
+  if not pipEnabled or not ac.isWindowOpen('pip') then
+    pipFrameReady = false
+    return
+  end
+  local position, forward, up, fov, actualCamera =
+      resolvePiPCamera(pipDriver, pipCamera)
+  if position == nil then
+    pipFrameReady = false
+    return
+  end
+  ensurePiPShot():update(position, forward, up, fov)
+  pipActualCamera = actualCamera
+  pipFrameReady = true
+end)
+
+ac.onRelease(function()
+  if pipShot ~= nil then
+    pipShot:dispose()
+    pipShot = nil
+  end
+end)
 
 ---------------------------------------------------------------------
 -- Gap / interval computation (ported from remote_web.py)
@@ -814,6 +909,9 @@ function script.update(dt)
   processReplayResultExpiry()
   processCommands()
   processPiPCommands()
+  if not pipEnabled and ac.isWindowOpen('pip') then
+    ac.setWindowOpen('pip', false)
+  end
   syncLeaderboard()
 
   updateAccum = updateAccum + dt
@@ -973,6 +1071,39 @@ function script.windowMain(dt)
   end
 
   ui.endChild()
+end
+
+function script.windowPiP(dt)
+  local available = ui.availableSpace()
+  local origin = ui.getCursor()
+  ui.drawRectFilled(origin,
+    vec2(origin.x + available.x, origin.y + available.y),
+    rgbm(0, 0, 0, 1))
+
+  if not pipFrameReady or pipShot == nil then
+    ui.setCursor(vec2(origin.x + 12, origin.y + 12))
+    ui.text('PiP unavailable')
+    return
+  end
+
+  local width = available.x
+  local height = width * 9 / 16
+  if height > available.y then
+    height = available.y
+    width = height * 16 / 9
+  end
+  local x = origin.x + (available.x - width) * 0.5
+  local y = origin.y + (available.y - height) * 0.5
+  local p1 = vec2(x, y)
+  local p2 = vec2(x + width, y + height)
+  ui.beginTonemapping()
+  ui.drawImage(pipShot, p1, p2)
+  ui.endTonemapping(1, 0, true)
+
+  local car = ac.getCar(pipDriver)
+  local name = car ~= nil and car:driverName() or ('Car ' .. tostring(pipDriver))
+  ui.setCursor(vec2(x + 8, y + 8))
+  ui.text(string.format('%s  |  CAM %d', name, pipActualCamera + 1))
 end
 
 local indicatorSettings = ac.INIConfig.scriptSettings()
