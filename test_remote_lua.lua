@@ -31,6 +31,7 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
   local tonemappingCalls = {}
   local geometryCreations = {}
   local sliderResults = {}
+  local sliderCalls = {}
   local buttonClicks = {}
   local driverTeam = 'PRO 7 | Team'
   local cameraSections = {
@@ -153,7 +154,11 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
         gamma = gamma, whitePoint = whitePoint, lcsAware = lcsAware,
       }
     end,
-    slider = function(label, value)
+    slider = function(label, value, minimum, maximum, format, power)
+      sliderCalls[#sliderCalls + 1] = {
+        label = label, value = value, minimum = minimum, maximum = maximum,
+        format = format, power = power,
+      }
       local result = sliderResults[label]
       sliderResults[label] = nil
       if result ~= nil then return result.value, result.changed end
@@ -344,6 +349,7 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     dwriteFonts = dwriteFonts,
     tonemappingCalls = tonemappingCalls,
     geometryCreations = geometryCreations,
+    sliderCalls = sliderCalls,
     car = car,
     setDriverTeam = function(value) driverTeam = value end,
     setSlider = function(label, value)
@@ -813,6 +819,19 @@ local function testPiPColorResetRestoresDefaults()
     'PiP reset restores white point')
 end
 
+local function testPiPColorSlidersUseFractionalMode()
+  local ctx = loadRemote(false)
+  script.windowPiPSettings(0)
+
+  assertEqual(#ctx.sliderCalls, 6, 'PiP settings exposes all color sliders')
+  for _, call in ipairs(ctx.sliderCalls) do
+    assertEqual(call.format, '%.2f',
+      call.label .. ' displays fractional precision')
+    assertEqual(call.power, nil,
+      call.label .. ' does not enable CSP integer slider mode')
+  end
+end
+
 local function testEnterTogglesOnFirstStingerFrame()
   local ctx = loadRemote(false)
   requestReplay(ctx, 1)
@@ -900,4 +919,5 @@ testPiPOverlayUsesPositionParsedNameTeamAndMichroma()
 testPiPUsesHdrTextureAndTonemappingDefaults()
 testPiPColorSettingsApplyLiveAndPersist()
 testPiPColorResetRestoresDefaults()
+testPiPColorSlidersUseFractionalMode()
 print('test_remote_lua.lua: all tests passed')

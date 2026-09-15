@@ -1150,7 +1150,7 @@ end
 
 local function pipColorSlider(label, key, value, minimum, maximum)
   local updated, changed = ui.slider(
-    label, value, minimum, maximum, '%.2f', true)
+    label, value, minimum, maximum, '%.2f')
   if changed then
     pipColorSettings:set('PIP_COLOR', key, updated)
     pipColorSettings:save()
