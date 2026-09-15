@@ -35,6 +35,13 @@ local pipCamera = 0
 local pipActualCamera = 0
 local pipFrameReady = false
 local pipShot = nil
+local pipColorSettings = ac.INIConfig.scriptSettings()
+local pipBrightness = pipColorSettings:get('PIP_COLOR', 'BRIGHTNESS', 1.0)
+local pipGamma = pipColorSettings:get('PIP_COLOR', 'GAMMA', 1.0)
+local pipWhitePoint = pipColorSettings:get('PIP_COLOR', 'WHITE_POINT', 0.45)
+local pipRedGain = pipColorSettings:get('PIP_COLOR', 'RED_GAIN', 1.0)
+local pipGreenGain = pipColorSettings:get('PIP_COLOR', 'GREEN_GAIN', 1.0)
+local pipBlueGain = pipColorSettings:get('PIP_COLOR', 'BLUE_GAIN', 1.0)
 
 local function validNumber(value)
   return type(value) == 'number'
@@ -688,7 +695,7 @@ local function ensurePiPShot()
   pipShot = ac.GeometryShot(
     ac.findNodes('sceneRoot:yes'), vec2(640, 360), 1, false,
     render.AntialiasingMode.FXAA,
-    render.TextureFormat.R8G8B8A8.UNorm, 0)
+    render.TextureFormat.R32G32B32A32.Float, 0)
   pipShot:setName('Broadcaster Remote PiP')
   pipShot:setSky(true)
   pipShot:setOriginalLighting(true)
@@ -1108,8 +1115,9 @@ function script.windowPiP(dt)
   local p1 = vec2(x, y)
   local p2 = vec2(x + width, y + height)
   ui.beginTonemapping()
-  ui.drawImage(pipShot, p1, p2)
-  ui.endTonemapping(1, 0, true)
+  ui.drawImage(pipShot, p1, p2,
+    rgbm(pipRedGain, pipGreenGain, pipBlueGain, pipBrightness))
+  ui.endTonemapping(pipGamma, pipWhitePoint, false)
 
   local car = ac.getCar(pipDriver)
   local name = parsePiPDriverName(car ~= nil and car:driverName() or '')
@@ -1138,6 +1146,45 @@ function script.windowPiP(dt)
     plateP1.y + paddingY + identitySize.y + lineGap))
   ui.dwriteText(team, teamFontSize, rgbm(0.78, 0.78, 0.78, 1))
   ui.popDWriteFont()
+end
+
+local function pipColorSlider(label, key, value, minimum, maximum)
+  local updated, changed = ui.slider(
+    label, value, minimum, maximum, '%.2f', true)
+  if changed then
+    pipColorSettings:set('PIP_COLOR', key, updated)
+    pipColorSettings:save()
+  end
+  return updated
+end
+
+function script.windowPiPSettings(dt)
+  pipBrightness = pipColorSlider(
+    'Brightness', 'BRIGHTNESS', pipBrightness, 0.1, 2.0)
+  pipGamma = pipColorSlider('Gamma', 'GAMMA', pipGamma, 0.4, 2.5)
+  pipWhitePoint = pipColorSlider(
+    'White point', 'WHITE_POINT', pipWhitePoint, 0.0, 2.5)
+  pipRedGain = pipColorSlider('Red gain', 'RED_GAIN', pipRedGain, 0.0, 2.0)
+  pipGreenGain = pipColorSlider(
+    'Green gain', 'GREEN_GAIN', pipGreenGain, 0.0, 2.0)
+  pipBlueGain = pipColorSlider(
+    'Blue gain', 'BLUE_GAIN', pipBlueGain, 0.0, 2.0)
+
+  if ui.button('Reset color') then
+    pipBrightness = 1.0
+    pipGamma = 1.0
+    pipWhitePoint = 0.45
+    pipRedGain = 1.0
+    pipGreenGain = 1.0
+    pipBlueGain = 1.0
+    pipColorSettings:set('PIP_COLOR', 'BRIGHTNESS', pipBrightness)
+    pipColorSettings:set('PIP_COLOR', 'GAMMA', pipGamma)
+    pipColorSettings:set('PIP_COLOR', 'WHITE_POINT', pipWhitePoint)
+    pipColorSettings:set('PIP_COLOR', 'RED_GAIN', pipRedGain)
+    pipColorSettings:set('PIP_COLOR', 'GREEN_GAIN', pipGreenGain)
+    pipColorSettings:set('PIP_COLOR', 'BLUE_GAIN', pipBlueGain)
+    pipColorSettings:save()
+  end
 end
 
 local indicatorSettings = ac.INIConfig.scriptSettings()

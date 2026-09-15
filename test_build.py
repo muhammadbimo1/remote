@@ -7,6 +7,13 @@ ROOT = Path(__file__).resolve().parent
 
 
 class BuildBatchTests(unittest.TestCase):
+    def test_pip_window_exposes_native_settings_panel(self):
+        manifest = (ROOT / "manifest.ini").read_text(encoding="utf-8")
+        pip_section = manifest.split("ID = pip", 1)[1]
+
+        self.assertIn("FUNCTION_SETTINGS = windowPiPSettings", pip_section)
+        self.assertIn("SETTINGS", pip_section.split("[WINDOW_...]", 1)[0])
+
     def test_keeps_server_and_lua_assets_in_separate_runtime_folders(self):
         build_script = (ROOT / "build.bat").read_text(encoding="utf-8")
 

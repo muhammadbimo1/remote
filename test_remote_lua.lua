@@ -28,6 +28,10 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
   local drawnRects = {}
   local dwriteTexts = {}
   local dwriteFonts = {}
+  local tonemappingCalls = {}
+  local geometryCreations = {}
+  local sliderResults = {}
+  local buttonClicks = {}
   local driverTeam = 'PRO 7 | Team'
   local cameraSections = {
     CAMERA_0 = {
@@ -125,8 +129,10 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     drawRectFilled = function(p1, p2, color)
       drawnRects[#drawnRects + 1] = { p1 = p1, p2 = p2, color = color }
     end,
-    drawImage = function(image, p1, p2)
-      drawnImages[#drawnImages + 1] = { image = image, p1 = p1, p2 = p2 }
+    drawImage = function(image, p1, p2, color)
+      drawnImages[#drawnImages + 1] = {
+        image = image, p1 = p1, p2 = p2, color = color,
+      }
     end,
     text = function(value) drawnTexts[#drawnTexts + 1] = value end,
     pushDWriteFont = function(font)
@@ -142,8 +148,22 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
       }
     end,
     beginTonemapping = function() end,
-    endTonemapping = function() end,
-    slider = function(_, value) return value, false end,
+    endTonemapping = function(gamma, whitePoint, lcsAware)
+      tonemappingCalls[#tonemappingCalls + 1] = {
+        gamma = gamma, whitePoint = whitePoint, lcsAware = lcsAware,
+      }
+    end,
+    slider = function(label, value)
+      local result = sliderResults[label]
+      sliderResults[label] = nil
+      if result ~= nil then return result.value, result.changed end
+      return value, false
+    end,
+    button = function(label)
+      local clicked = buttonClicks[label] == true
+      buttonClicks[label] = nil
+      return clicked
+    end,
     checkbox = function()
       local clicked = clickCheckbox
       clickCheckbox = false
@@ -154,7 +174,10 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     BlendMode = { AlphaBlend = 1 },
     DepthMode = { Off = 2 },
     AntialiasingMode = { FXAA = 3 },
-    TextureFormat = { R8G8B8A8 = { UNorm = 4 } },
+    TextureFormat = {
+      R8G8B8A8 = { UNorm = 4 },
+      R32G32B32A32 = { Float = 6 },
+    },
     ShadersType = { Main = 5 },
     onSceneReady = function(callback)
       sceneReadyCallbacks[#sceneReadyCallbacks + 1] = callback
@@ -213,7 +236,13 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
         }
       end,
     },
-    GeometryShot = function()
+    GeometryShot = function(scene, resolution, mips, withDepth,
+        antialiasing, textureFormat, flags)
+      geometryCreations[#geometryCreations + 1] = {
+        scene = scene, resolution = resolution, mips = mips,
+        withDepth = withDepth, antialiasing = antialiasing,
+        textureFormat = textureFormat, flags = flags,
+      }
       local shot = {}
       local function chain() return shot end
       shot.setName = chain
@@ -313,8 +342,14 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     drawnRects = drawnRects,
     dwriteTexts = dwriteTexts,
     dwriteFonts = dwriteFonts,
+    tonemappingCalls = tonemappingCalls,
+    geometryCreations = geometryCreations,
     car = car,
     setDriverTeam = function(value) driverTeam = value end,
+    setSlider = function(label, value)
+      sliderResults[label] = { value = value, changed = true }
+    end,
+    clickButton = function(label) buttonClicks[label] = true end,
     runSceneReady = function()
       for _, callback in ipairs(sceneReadyCallbacks) do callback() end
     end,
@@ -710,6 +745,74 @@ local function testPiPOverlayUsesPositionParsedNameTeamAndMichroma()
   assertEqual(plate.color.a, 1, 'PiP identity plate background is opaque')
 end
 
+local function preparePiPFrame(ctx)
+  ctx.deliver(pipCommand('server-a', 1, true, 0, 0))
+  ctx.update()
+  ctx.runSceneReady()
+  script.windowPiP(0)
+end
+
+local function testPiPUsesHdrTextureAndTonemappingDefaults()
+  local ctx = loadRemote(false)
+  preparePiPFrame(ctx)
+
+  assertEqual(ctx.geometryCreations[1].textureFormat, 6,
+    'PiP preserves HDR highlights in a floating-point render target')
+  local tint = ctx.drawnImages[1].color
+  assertEqual(tint.r, 1, 'PiP default red gain is neutral')
+  assertEqual(tint.g, 1, 'PiP default green gain is neutral')
+  assertEqual(tint.b, 1, 'PiP default blue gain is neutral')
+  assertEqual(tint.a, 1, 'PiP default brightness is neutral')
+  local tone = ctx.tonemappingCalls[1]
+  assertEqual(tone.gamma, 1, 'PiP default gamma is neutral')
+  assertEqual(tone.whitePoint, 0.45,
+    'PiP default white point prevents clipped-looking highlights')
+  assertEqual(tone.lcsAware, false,
+    'PiP applies explicit HDR tonemapping instead of LCS conversion')
+end
+
+local function testPiPColorSettingsApplyLiveAndPersist()
+  local ctx = loadRemote(false)
+  ctx.setSlider('Brightness', 0.7)
+  ctx.setSlider('Gamma', 1.2)
+  ctx.setSlider('White point', 0.8)
+  ctx.setSlider('Red gain', 0.9)
+  ctx.setSlider('Green gain', 0.85)
+  ctx.setSlider('Blue gain', 0.75)
+  script.windowPiPSettings(0)
+  preparePiPFrame(ctx)
+
+  local tint = ctx.drawnImages[1].color
+  assertEqual(tint.r, 0.9, 'PiP applies configured red gain')
+  assertEqual(tint.g, 0.85, 'PiP applies configured green gain')
+  assertEqual(tint.b, 0.75, 'PiP applies configured blue gain')
+  assertEqual(tint.a, 0.7, 'PiP applies configured brightness')
+  local tone = ctx.tonemappingCalls[1]
+  assertEqual(tone.gamma, 1.2, 'PiP applies configured gamma')
+  assertEqual(tone.whitePoint, 0.8, 'PiP applies configured white point')
+  assertEqual(ctx.settingsSaveCount(), 6,
+    'each changed PiP control is persisted')
+end
+
+local function testPiPColorResetRestoresDefaults()
+  local ctx = loadRemote(false)
+  ctx.setSlider('Brightness', 0.5)
+  script.windowPiPSettings(0)
+  ctx.clickButton('Reset color')
+  script.windowPiPSettings(0)
+  preparePiPFrame(ctx)
+
+  local tint = ctx.drawnImages[1].color
+  assertEqual(tint.r, 1, 'PiP reset restores red gain')
+  assertEqual(tint.g, 1, 'PiP reset restores green gain')
+  assertEqual(tint.b, 1, 'PiP reset restores blue gain')
+  assertEqual(tint.a, 1, 'PiP reset restores brightness')
+  assertEqual(ctx.tonemappingCalls[1].gamma, 1,
+    'PiP reset restores gamma')
+  assertEqual(ctx.tonemappingCalls[1].whitePoint, 0.45,
+    'PiP reset restores white point')
+end
+
 local function testEnterTogglesOnFirstStingerFrame()
   local ctx = loadRemote(false)
   requestReplay(ctx, 1)
@@ -794,4 +897,7 @@ testMissingRequestedPiPCameraFallsBackToCameraZero()
 testUnavailablePiPCameraDoesNotDrawAStaleFrame()
 testPiPGeometryShotIsDisposedOnRelease()
 testPiPOverlayUsesPositionParsedNameTeamAndMichroma()
+testPiPUsesHdrTextureAndTonemappingDefaults()
+testPiPColorSettingsApplyLiveAndPersist()
+testPiPColorResetRestoresDefaults()
 print('test_remote_lua.lua: all tests passed')

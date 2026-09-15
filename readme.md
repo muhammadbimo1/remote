@@ -31,6 +31,10 @@ camera, moving or resizing its window, and hiding it do not change the main
 broadcast driver or camera. The rendered picture stays at a centered 16:9
 aspect ratio when the app window is resized.
 
+Use the settings button on the **Driver PiP** window to adjust brightness,
+gamma, white point, and individual red, green, and blue gains. Changes apply
+live and persist across app reloads; **Reset color** restores the defaults.
+
 ## Broadcast highlight relay
 
 Copy `remote_config.example.json` to `remote_config.json` (a disabled local
