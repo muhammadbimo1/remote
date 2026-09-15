@@ -745,6 +745,9 @@ local function testPiPOverlayUsesPositionParsedNameTeamAndMichroma()
   assertEqual(ctx.dwriteTexts[2].value, 'Apex Racing',
     'PiP second line shows the complete team name')
   local plate = ctx.drawnRects[#ctx.drawnRects]
+  local image = ctx.drawnImages[1]
+  assertEqual(plate.p2.y, image.p1.y,
+    'PiP identity plate sits directly above the onboard image')
   assertEqual(plate.color.r, 0, 'PiP identity plate background is black')
   assertEqual(plate.color.g, 0, 'PiP identity plate background is black')
   assertEqual(plate.color.b, 0, 'PiP identity plate background is black')

@@ -1104,21 +1104,6 @@ function script.windowPiP(dt)
     return
   end
 
-  local width = available.x
-  local height = width * 9 / 16
-  if height > available.y then
-    height = available.y
-    width = height * 16 / 9
-  end
-  local x = origin.x + (available.x - width) * 0.5
-  local y = origin.y + (available.y - height) * 0.5
-  local p1 = vec2(x, y)
-  local p2 = vec2(x + width, y + height)
-  ui.beginTonemapping()
-  ui.drawImage(pipShot, p1, p2,
-    rgbm(pipRedGain, pipGreenGain, pipBlueGain, pipBrightness))
-  ui.endTonemapping(pipGamma, pipWhitePoint, false)
-
   local car = ac.getCar(pipDriver)
   local name = parsePiPDriverName(car ~= nil and car:driverName() or '')
   if name == '' then name = 'Car ' .. tostring(pipDriver) end
@@ -1134,10 +1119,26 @@ function script.windowPiP(dt)
   ui.pushDWriteFont('Michroma-Regular.ttf')
   local identitySize = ui.measureDWriteText(identity, identityFontSize)
   local teamSize = ui.measureDWriteText(team, teamFontSize)
-  local plateP1 = vec2(x + 8, y + 8)
-  local plateP2 = vec2(
-    plateP1.x + math.max(identitySize.x, teamSize.x) + paddingX * 2,
-    plateP1.y + identitySize.y + teamSize.y + paddingY * 2 + lineGap)
+  local headerHeight =
+    identitySize.y + teamSize.y + paddingY * 2 + lineGap
+  local videoHeight = math.max(available.y - headerHeight, 0)
+  local width = available.x
+  local height = width * 9 / 16
+  if height > videoHeight then
+    height = videoHeight
+    width = height * 16 / 9
+  end
+  local x = origin.x + (available.x - width) * 0.5
+  local y = origin.y + headerHeight
+  local p1 = vec2(x, y)
+  local p2 = vec2(x + width, y + height)
+  ui.beginTonemapping()
+  ui.drawImage(pipShot, p1, p2,
+    rgbm(pipRedGain, pipGreenGain, pipBlueGain, pipBrightness))
+  ui.endTonemapping(pipGamma, pipWhitePoint, false)
+
+  local plateP1 = origin
+  local plateP2 = vec2(origin.x + available.x, y)
   ui.drawRectFilled(plateP1, plateP2, rgbm(0, 0, 0, 1))
   ui.setCursor(vec2(plateP1.x + paddingX, plateP1.y + paddingY))
   ui.dwriteText(identity, identityFontSize, rgbm(1, 1, 1, 1))
