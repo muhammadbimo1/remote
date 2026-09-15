@@ -36,6 +36,7 @@ local pipActualCamera = 0
 local pipFrameReady = false
 local pipShot = nil
 local pipColorSettings = ac.INIConfig.scriptSettings()
+local pipExposureEV = pipColorSettings:get('PIP_COLOR', 'EXPOSURE_EV', 0.0)
 local pipBrightness = pipColorSettings:get('PIP_COLOR', 'BRIGHTNESS', 1.0)
 local pipGamma = pipColorSettings:get('PIP_COLOR', 'GAMMA', 1.0)
 local pipWhitePoint = pipColorSettings:get('PIP_COLOR', 'WHITE_POINT', 0.45)
@@ -1134,7 +1135,8 @@ function script.windowPiP(dt)
   local p2 = vec2(x + width, y + height)
   ui.beginTonemapping()
   ui.drawImage(pipShot, p1, p2,
-    rgbm(pipRedGain, pipGreenGain, pipBlueGain, pipBrightness))
+    rgbm(pipRedGain, pipGreenGain, pipBlueGain,
+      pipBrightness * 2 ^ pipExposureEV))
   ui.endTonemapping(pipGamma, pipWhitePoint, false)
 
   local plateP1 = origin
@@ -1160,6 +1162,8 @@ local function pipColorSlider(label, key, value, minimum, maximum)
 end
 
 function script.windowPiPSettings(dt)
+  pipExposureEV = pipColorSlider(
+    'Exposure (EV)', 'EXPOSURE_EV', pipExposureEV, -5.0, 5.0)
   pipBrightness = pipColorSlider(
     'Brightness', 'BRIGHTNESS', pipBrightness, 0.1, 2.0)
   pipGamma = pipColorSlider('Gamma', 'GAMMA', pipGamma, 0.4, 5.0)
@@ -1172,12 +1176,14 @@ function script.windowPiPSettings(dt)
     'Blue gain', 'BLUE_GAIN', pipBlueGain, 0.0, 2.0)
 
   if ui.button('Reset color') then
+    pipExposureEV = 0.0
     pipBrightness = 1.0
     pipGamma = 1.0
     pipWhitePoint = 0.45
     pipRedGain = 1.0
     pipGreenGain = 1.0
     pipBlueGain = 1.0
+    pipColorSettings:set('PIP_COLOR', 'EXPOSURE_EV', pipExposureEV)
     pipColorSettings:set('PIP_COLOR', 'BRIGHTNESS', pipBrightness)
     pipColorSettings:set('PIP_COLOR', 'GAMMA', pipGamma)
     pipColorSettings:set('PIP_COLOR', 'WHITE_POINT', pipWhitePoint)

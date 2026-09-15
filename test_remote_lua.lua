@@ -803,9 +803,30 @@ local function testPiPColorSettingsApplyLiveAndPersist()
     'each changed PiP control is persisted')
 end
 
+local function testPiPExposureUsesPhotographicStopsAndPersists()
+  local ctx = loadRemote(false)
+  ctx.setSlider('Exposure (EV)', 1.0)
+  script.windowPiPSettings(0)
+  preparePiPFrame(ctx)
+
+  assertEqual(ctx.drawnImages[1].color.a, 2,
+    'PiP plus one EV doubles image brightness')
+  assertEqual(ctx.settingsWrites[1].key, 'EXPOSURE_EV',
+    'PiP exposure persists under its own setting')
+  assertEqual(ctx.settingsWrites[1].value, 1.0,
+    'PiP persists the selected exposure')
+
+  ctx.setSlider('Exposure (EV)', -1.0)
+  script.windowPiPSettings(0)
+  script.windowPiP(0)
+  assertEqual(ctx.drawnImages[2].color.a, 0.5,
+    'PiP minus one EV halves image brightness')
+end
+
 local function testPiPColorResetRestoresDefaults()
   local ctx = loadRemote(false)
   ctx.setSlider('Brightness', 0.5)
+  ctx.setSlider('Exposure (EV)', 2.0)
   script.windowPiPSettings(0)
   ctx.clickButton('Reset color')
   script.windowPiPSettings(0)
@@ -826,7 +847,7 @@ local function testPiPColorSlidersUseFractionalMode()
   local ctx = loadRemote(false)
   script.windowPiPSettings(0)
 
-  assertEqual(#ctx.sliderCalls, 6, 'PiP settings exposes all color sliders')
+  assertEqual(#ctx.sliderCalls, 7, 'PiP settings exposes all color sliders')
   local callsByLabel = {}
   for _, call in ipairs(ctx.sliderCalls) do
     callsByLabel[call.label] = call
@@ -839,6 +860,10 @@ local function testPiPColorSlidersUseFractionalMode()
     'PiP gamma can be raised to 5')
   assertEqual(callsByLabel['White point'].maximum, 5.0,
     'PiP white point can be raised to 5')
+  assertEqual(callsByLabel['Exposure (EV)'].minimum, -5.0,
+    'PiP exposure supports five stops below neutral')
+  assertEqual(callsByLabel['Exposure (EV)'].maximum, 5.0,
+    'PiP exposure supports five stops above neutral')
 end
 
 local function testEnterTogglesOnFirstStingerFrame()
@@ -927,6 +952,7 @@ testPiPGeometryShotIsDisposedOnRelease()
 testPiPOverlayUsesPositionParsedNameTeamAndMichroma()
 testPiPUsesHdrTextureAndTonemappingDefaults()
 testPiPColorSettingsApplyLiveAndPersist()
+testPiPExposureUsesPhotographicStopsAndPersists()
 testPiPColorResetRestoresDefaults()
 testPiPColorSlidersUseFractionalMode()
 print('test_remote_lua.lua: all tests passed')
