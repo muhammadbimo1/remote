@@ -1161,9 +1161,9 @@ end
 function script.windowPiPSettings(dt)
   pipBrightness = pipColorSlider(
     'Brightness', 'BRIGHTNESS', pipBrightness, 0.1, 2.0)
-  pipGamma = pipColorSlider('Gamma', 'GAMMA', pipGamma, 0.4, 2.5)
+  pipGamma = pipColorSlider('Gamma', 'GAMMA', pipGamma, 0.4, 5.0)
   pipWhitePoint = pipColorSlider(
-    'White point', 'WHITE_POINT', pipWhitePoint, 0.0, 2.5)
+    'White point', 'WHITE_POINT', pipWhitePoint, 0.0, 5.0)
   pipRedGain = pipColorSlider('Red gain', 'RED_GAIN', pipRedGain, 0.0, 2.0)
   pipGreenGain = pipColorSlider(
     'Green gain', 'GREEN_GAIN', pipGreenGain, 0.0, 2.0)

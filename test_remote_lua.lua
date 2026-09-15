@@ -824,12 +824,18 @@ local function testPiPColorSlidersUseFractionalMode()
   script.windowPiPSettings(0)
 
   assertEqual(#ctx.sliderCalls, 6, 'PiP settings exposes all color sliders')
+  local callsByLabel = {}
   for _, call in ipairs(ctx.sliderCalls) do
+    callsByLabel[call.label] = call
     assertEqual(call.format, '%.2f',
       call.label .. ' displays fractional precision')
     assertEqual(call.power, nil,
       call.label .. ' does not enable CSP integer slider mode')
   end
+  assertEqual(callsByLabel.Gamma.maximum, 5.0,
+    'PiP gamma can be raised to 5')
+  assertEqual(callsByLabel['White point'].maximum, 5.0,
+    'PiP white point can be raised to 5')
 end
 
 local function testEnterTogglesOnFirstStingerFrame()
