@@ -109,7 +109,7 @@ class TelemetrySnapshot(_FrozenSnapshot):
         'session_name', 'is_timed_session', 'session_time_left',
         'is_replay', 'replay_frame', 'replay_frames',
         'replay_frame_ms', 'replay_last_result', 'is_replay_only',
-        'replay_file', 'replay_temp_dir', 'timetable_url', 'cars',
+        'replay_file', 'replay_temp_dir', 'cars',
     )
 
     @classmethod
@@ -138,8 +138,8 @@ class TelemetrySnapshot(_FrozenSnapshot):
             setattr(result, name, _number(message, name))
         for name in ('is_timed_session', 'is_replay', 'is_replay_only'):
             setattr(result, name, _boolean(message, name))
-        for name in ('track_name', 'session_name', 'replay_file', 'replay_temp_dir',
-                     'timetable_url'):
+        for name in ('track_name', 'session_name', 'replay_file',
+                     'replay_temp_dir'):
             setattr(result, name, _string(message, name))
 
         if result.car_count != len(cars_message):

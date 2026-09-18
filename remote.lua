@@ -29,6 +29,14 @@ local packetID = 0
 local updateAccum = 0
 local UPDATE_INTERVAL = 0.1 -- 100 ms
 
+-- AC server standings are more reliable online than CSP's per-car lap and
+-- position fields. Poll them here so both this app and the Python panel consume
+-- one corrected telemetry stream.
+local TIMETABLE_POLL_INTERVAL_S = 2.0
+local timetableNextPoll = 0
+local timetableRequestActive = false
+local timetableStandings = {}
+
 local pipEnabled = false
 local pipDriver = -1
 local pipCamera = 0
@@ -44,6 +52,74 @@ local pipBlueGain = pipColorSettings:get('PIP_COLOR', 'BLUE_GAIN', 1.0)
 
 local function validNumber(value)
   return type(value) == 'number'
+end
+
+local function pollTimetable()
+  local now = os.preciseClock()
+  if sim.raceSessionType ~= ac.SessionType.Race
+      or sim.isReplayActive or sim.isReplayOnlyMode
+      or timetableRequestActive or now < timetableNextPoll then return end
+  local serverIP, httpPort = ac.getServerIP(), ac.getServerPortHTTP()
+  if serverIP == nil or serverIP == '' or httpPort == nil or httpPort < 0 then return end
+
+  local url = 'http://' .. serverIP .. ':' .. tostring(httpPort) .. '/timetable.json'
+  timetableRequestActive = true
+  timetableNextPoll = now + TIMETABLE_POLL_INTERVAL_S
+  local requestedSessionIndex = sim.currentSessionIndex
+  web.get(url, function(err, response)
+    timetableRequestActive = false
+    if err ~= nil or response == nil or response.status ~= 200
+        or sim.currentSessionIndex ~= requestedSessionIndex
+        or sim.isReplayActive or sim.isReplayOnlyMode then return end
+    local ok, data = pcall(JSON.parse, response.body)
+    if not ok or type(data) ~= 'table' or type(data.EntryList) ~= 'table' then return end
+
+    local bySessionID, connected = {}, 0
+    for i = 0, math.min(sim.carsCount, 128) - 1 do
+      local car = ac.getCar(i)
+      if car ~= nil and car.isConnected then
+        bySessionID[tonumber(car.sessionID)] = i
+        connected = connected + 1
+      end
+    end
+
+    local nextStandings, ordered = {}, {}
+    for _, entry in pairs(data.EntryList) do
+      local carID = bySessionID[tonumber(entry.CarID)]
+      local laps, trackPosition = tonumber(entry.Laps), tonumber(entry.Position)
+      if carID ~= nil and (tonumber(entry.Ping) or 0) > 0 and laps ~= nil then
+        local standing = {
+          carID = carID,
+          lapCount = math.max(0, math.floor(laps)),
+          trackPosition = trackPosition and math.floor(trackPosition) or nil,
+        }
+        nextStandings[carID] = standing
+        if standing.trackPosition ~= nil and standing.trackPosition > 0 then
+          ordered[#ordered + 1] = standing
+        end
+      end
+    end
+
+    if #ordered == connected then
+      table.sort(ordered, function(a, b)
+        if a.lapCount ~= b.lapCount then return a.lapCount > b.lapCount end
+        if a.trackPosition ~= b.trackPosition then
+          return a.trackPosition < b.trackPosition
+        end
+        return a.carID < b.carID
+      end)
+      for position, standing in ipairs(ordered) do standing.position = position end
+    end
+    timetableStandings = nextStandings
+  end)
+end
+
+local function correctedStandings(carID, car)
+  local corrected = timetableStandings[carID]
+  if corrected == nil or sim.isReplayActive or sim.isReplayOnlyMode then
+    return car.racePosition, car.lapCount
+  end
+  return corrected.position or car.racePosition, corrected.lapCount
 end
 
 local function onIPCMessage(raw)
@@ -635,7 +711,13 @@ local function processPiPCommands()
   pipDriver = command.target_driver
   pipCamera = command.target_car_camera
   pipFrameReady = false
-  ac.setWindowOpen('pip', pipEnabled)
+end
+
+local function syncPiPWindow()
+  local shouldOpen = pipEnabled and not sim.isReplayActive
+  if ac.isWindowOpen('pip') ~= shouldOpen then
+    ac.setWindowOpen('pip', shouldOpen)
+  end
 end
 
 local function validPiPVector(value, allowZero)
@@ -756,19 +838,20 @@ local function buildDriverRows()
   for i = 0, carCount - 1 do
     local car = ac.getCar(i)
     if car.isConnected then
+      local position, lapCount = correctedStandings(i, car)
       rows[#rows + 1] = {
         carId       = i,
-        position    = car.racePosition,
+        position    = position,
         spline      = car.splinePosition,
         speedKmh    = car.speedKmh,
         lapTimeMs   = car.lapTimeMs,
         bestLapMs   = car.bestLapTimeMs,
         lastLapMs   = car.previousLapTimeMs,
-        lapCount    = car.lapCount,
+        lapCount    = lapCount,
         isInPit     = car.isInPitlane,
         isConnected = car.isConnected,
         name        = car:driverName(),
-        totalProgress = car.lapCount + car.splinePosition,
+        totalProgress = lapCount + car.splinePosition,
       }
     end
   end
@@ -810,19 +893,15 @@ local function updateTelemetry()
     end
     lastSessionIndex = sessionIndex
     lastSessionTypeRaw = sessionTypeRaw
-  end
-
-  local serverIP = ac.getServerIP()
-  local httpPort = ac.getServerPortHTTP()
-  local timetableURL = ''
-  if serverIP ~= nil and serverIP ~= '' and httpPort ~= nil and httpPort >= 0 then
-    timetableURL = 'http://' .. serverIP .. ':' .. tostring(httpPort) .. '/timetable.json'
+    table.clear(timetableStandings)
+    timetableNextPoll = 0
   end
 
   local cars = {}
 
   for i = 0, carCount - 1 do
     local car = ac.getCar(i)
+    local position, lapCount = correctedStandings(i, car)
     local dmgSum = car.damage[0] + car.damage[1] + car.damage[2] + car.damage[3] + car.damage[4]
     local dmgJumped = prevDamageSum[i] ~= nil and dmgSum > prevDamageSum[i] + 0.01
     prevDamageSum[i] = dmgSum
@@ -847,13 +926,13 @@ local function updateTelemetry()
     cars[#cars + 1] = {
       car_id = i,
       session_id = car.sessionID,
-      position = car.racePosition,
+      position = position,
       normalized_spline_pos = car.splinePosition,
       speed_kmh = car.speedKmh,
       lap_time = car.lapTimeMs,
       best_lap = car.bestLapTimeMs,
       last_lap = car.previousLapTimeMs,
-      lap_count = car.lapCount,
+      lap_count = lapCount,
       car_cameras_count = car.carCamerasCount,
       is_in_pit = car.isInPitlane == true,
       is_connected = car.isConnected == true,
@@ -893,7 +972,6 @@ local function updateTelemetry()
     -- Where AC keeps the per-session .acreplay it is recording right now. The
     -- web server pairs its event journal to that file by name.
     replay_temp_dir = ac.getFolder(ac.FolderID.ReplaysTemp) or '',
-    timetable_url = timetableURL,
     cars = cars,
   }
   local ok, encoded = pcall(JSON.stringify, payload)
@@ -915,10 +993,9 @@ function script.update(dt)
   processReplayResultExpiry()
   processCommands()
   processPiPCommands()
-  if not pipEnabled and ac.isWindowOpen('pip') then
-    ac.setWindowOpen('pip', false)
-  end
+  syncPiPWindow()
   syncLeaderboard()
+  pollTimetable()
 
   updateAccum = updateAccum + dt
   if updateAccum < UPDATE_INTERVAL then return end
@@ -1106,7 +1183,8 @@ function script.windowPiP(dt)
   local car = ac.getCar(pipDriver)
   local name = parsePiPDriverName(car ~= nil and car:driverName() or '')
   if name == '' then name = 'Car ' .. tostring(pipDriver) end
-  local position = car ~= nil and tonumber(car.racePosition) or 0
+  local position = 0
+  if car ~= nil then position = correctedStandings(pipDriver, car) end
   local team = ac.getDriverTeam(pipDriver) or ''
   local identity = string.format('P%d | %s', position, name)
   local identityFontSize = 18

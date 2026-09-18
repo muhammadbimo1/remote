@@ -2,13 +2,14 @@ import json
 import re
 import subprocess
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from werkzeug.exceptions import Forbidden
 
 from ac_ipc import ACIPCTransport
 from test_ac_ipc import FakeSocket
 import remote_web
-from remote_web import apply_timetable_offsets, build_update_data
+from remote_web import build_update_data
 
 
 class CarFixture(object):
@@ -58,7 +59,6 @@ class TelemetryPage(object):
         self.is_replay_only = False
         self.replay_file = ''
         self.replay_temp_dir = ''
-        self.timetable_url = ''
         self.cars = [CarFixture() for _ in range(remote_web.MAX_CARS)]
 
 
@@ -110,6 +110,36 @@ class IncidentNoticeMarkupTest(unittest.TestCase):
         self.assertIn('var INCIDENT_NOTICE_MS = 6000;', html)
         self.assertIn(
             'Date.now() - collisionTimers[d.num] < INCIDENT_NOTICE_MS', html)
+
+
+class TimetableStatusMarkupTest(unittest.TestCase):
+    def test_page_does_not_display_timetable_status(self):
+        html = remote_web.app.test_client().get('/').get_data(as_text=True)
+
+        self.assertNotIn('timetable-badge', html)
+
+
+class ControlLayoutMarkupTest(unittest.TestCase):
+    def setUp(self):
+        self.html = remote_web.app.test_client().get('/').get_data(as_text=True)
+
+    def test_f6_subcamera_controls_follow_camera_mode_controls(self):
+        camera_modes = self.html.index('class="control-bar"')
+        subcameras = self.html.index('<div id="subcam-bar"')
+        pip_controls = self.html.index('<div id="pip-bar"')
+
+        self.assertLess(camera_modes, subcameras)
+        self.assertLess(subcameras, pip_controls)
+
+    def test_control_buttons_have_no_secondary_captions(self):
+        self.assertNotIn('class="cam-cap"', self.html)
+
+    def test_class_picker_is_separated_from_driver_grid(self):
+        css = (Path(__file__).parent / 'static' / 'remote.css').read_text(encoding='utf-8')
+        rule = re.search(r'\.class-filter-bar\s*\{([^}]*)\}', css)
+
+        self.assertIsNotNone(rule)
+        self.assertIn('padding-bottom: var(--space-2)', rule.group(1))
 
 
 class EventNameFilterTest(unittest.TestCase):
@@ -392,37 +422,47 @@ class StandingsOrderTest(unittest.TestCase):
         self.assertGreater(cars[1]['battle_gap_ahead_seconds'], 2.0)
 
 
-class TimetableOffsetTest(unittest.TestCase):
-    def tearDown(self):
-        with remote_web._resync_lock:
-            remote_web.progress_offsets.clear()
-
-    def test_timetable_car_id_matches_connected_session_id_not_local_car_id(self):
+class LuaTimetableAuthorityTest(unittest.TestCase):
+    def test_corrected_lap_count_drives_gap_without_python_offset(self):
         telem = TelemetryPage()
-        telem.car_count = 3
+        telem.car_count = 2
+        telem.track_length = 5000.0
+        for car in telem.cars[:2]:
+            car.is_connected = True
+            car.speed_kmh = 180.0
+        leader, behind = telem.cars[:2]
+        leader.car_id = 0
+        leader.position = 1
+        leader.lap_count = 7
+        leader.normalized_spline_pos = 0.4
+        behind.car_id = 1
+        behind.position = 2
+        behind.lap_count = 5
+        behind.normalized_spline_pos = 0.9
 
-        stale_same_slot = telem.cars[1]
-        stale_same_slot.car_id = 1
-        stale_same_slot.session_id = 1
-        stale_same_slot.lap_count = 99
-        stale_same_slot.is_connected = 0
+        cars = remote_web.compute_gaps(telem)
 
-        local_car = telem.cars[2]
-        local_car.car_id = 2
-        local_car.session_id = 18
-        local_car.lap_count = 4
-        local_car.is_connected = 1
+        self.assertEqual(cars[1]['gap'], '+1 Lap')
+        self.assertEqual(cars[0]['total_progress'], 7.4)
 
-        matched = apply_timetable_offsets({
-            "EntryList": [
-                {"CarID": 18, "Ping": 24, "Laps": 7},
-                {"CarID": 1, "Ping": 24, "Laps": 1},
-            ],
-        }, telem)
+    def test_corrected_position_controls_output_order(self):
+        telem = TelemetryPage()
+        telem.car_count = 2
+        telem.track_length = 5000.0
+        for car in telem.cars[:2]:
+            car.is_connected = True
+            car.speed_kmh = 100.0
+            car.lap_count = 3
+        telem.cars[0].car_id = 0
+        telem.cars[0].position = 2
+        telem.cars[0].normalized_spline_pos = 0.4
+        telem.cars[1].car_id = 1
+        telem.cars[1].position = 1
+        telem.cars[1].normalized_spline_pos = 0.6
 
-        self.assertEqual(matched, 1)
-        with remote_web._resync_lock:
-            self.assertEqual(remote_web.progress_offsets, {2: 3.0})
+        cars = remote_web.compute_gaps(telem)
+
+        self.assertEqual([car['car_id'] for car in cars], [1, 0])
 
 
 class BroadcastHighlightIntegrationTest(unittest.TestCase):
@@ -494,58 +534,6 @@ class BroadcastHighlightIntegrationTest(unittest.TestCase):
 
         self.assertTrue(remote_web.publish_focused_highlight(None))
         self.assertEqual(published, [(None, True)])
-
-
-class TimetableUrlTest(unittest.TestCase):
-    def test_timetable_url_comes_from_telemetry(self):
-        telem = TelemetryPage()
-        telem.timetable_url = "http://103.129.148.255:14103/timetable.json"
-
-        self.assertEqual(
-            remote_web.get_timetable_url(telem),
-            "http://103.129.148.255:14103/timetable.json")
-
-    def test_blank_timetable_url_disables_polling(self):
-        telem = TelemetryPage()
-        telem.timetable_url = ""
-
-        self.assertEqual(remote_web.get_timetable_url(telem), "")
-
-
-class TimetablePollTest(unittest.TestCase):
-    def setUp(self):
-        self.old_ac_connected = remote_web.ac_connected
-        remote_web.ac_connected = True
-
-    def tearDown(self):
-        remote_web.ac_connected = self.old_ac_connected
-        with remote_web._resync_lock:
-            remote_web.progress_offsets.clear()
-        remote_web.last_poll_status = 'idle'
-        remote_web.last_poll_error = ''
-        remote_web.last_poll_matched = 0
-
-    def test_local_race_applies_timetable_even_if_server_session_type_is_stale(self):
-        telem = TelemetryPage()
-        telem.session_type = 1
-        telem.car_count = 1
-
-        car = telem.cars[0]
-        car.car_id = 0
-        car.session_id = 18
-        car.lap_count = 4
-        car.is_connected = 1
-
-        with patch.object(remote_web, 'fetch_timetable', return_value={
-            'SessionType': 'PRACTICE',
-            'EntryList': [{'CarID': 18, 'Ping': 12, 'Laps': 7}],
-        }):
-            remote_web.poll_timetable_once('http://example.test/timetable.json', telem)
-
-        self.assertEqual(remote_web.last_poll_status, 'ok')
-        self.assertEqual(remote_web.last_poll_matched, 1)
-        with remote_web._resync_lock:
-            self.assertEqual(remote_web.progress_offsets, {0: 3.0})
 
 
 class ReplayPayloadTest(unittest.TestCase):
@@ -628,31 +616,6 @@ class ReplayPayloadTest(unittest.TestCase):
         self.assertEqual(second["drivers"][0]["name"], "23 | Alex Driver")
 
 
-class ReplayPollGuardTest(unittest.TestCase):
-    def setUp(self):
-        self.old_ac_connected = remote_web.ac_connected
-        remote_web.ac_connected = True
-
-    def tearDown(self):
-        remote_web.ac_connected = self.old_ac_connected
-        with remote_web._resync_lock:
-            remote_web.progress_offsets.clear()
-        remote_web.last_poll_status = 'idle'
-
-    def test_timetable_poll_is_skipped_while_replay_is_active(self):
-        telem = TelemetryPage()
-        telem.session_type = 1
-        telem.is_replay = 1
-
-        with patch.object(remote_web, 'fetch_timetable') as fetch:
-            result = remote_web.poll_timetable_once(
-                'http://example.test/timetable.json', telem)
-
-        self.assertFalse(result)
-        self.assertEqual(remote_web.last_poll_status, 'disabled_replay')
-        fetch.assert_not_called()
-
-
 class SessionRotationTest(unittest.TestCase):
     def setUp(self):
         remote_web._current_session = None
@@ -714,17 +677,13 @@ class SessionRotationTest(unittest.TestCase):
         telem = self._telem(type_raw=2, name="")
         self.assertEqual(remote_web.session_label(telem), 'Qualify')
 
-    def test_rotation_drops_events_and_offsets_from_the_previous_session(self):
+    def test_rotation_drops_events_from_the_previous_session(self):
         remote_web.maybe_rotate_session(self._telem(gen=1))
         remote_web.event_log.mark(3, name='Alex Driver')
-        with remote_web._resync_lock:
-            remote_web.progress_offsets[3] = 2.0
 
         remote_web.maybe_rotate_session(self._telem(gen=2))
 
         self.assertEqual(remote_web.event_log.snapshot(), [])
-        with remote_web._resync_lock:
-            self.assertEqual(remote_web.progress_offsets, {})
 
 
 class ReplayCommandTest(unittest.TestCase):
@@ -796,8 +755,7 @@ class IPCPeerSecurityTest(unittest.TestCase):
                     'is_replay': False, 'replay_frame': 0,
                     'replay_frames': 100, 'replay_frame_ms': 60.0,
                     'replay_last_result': 0, 'is_replay_only': False,
-                    'replay_file': '', 'replay_temp_dir': '',
-                    'timetable_url': '', 'cars': [],
+                    'replay_file': '', 'replay_temp_dir': '', 'cars': [],
                 })]
 
             def receive(self, timeout=None):
@@ -1001,8 +959,6 @@ class DisconnectStateResetTest(unittest.TestCase):
         }
         remote_web._prev_rollover_state[0] = True
         remote_web.event_log.mark(0, name='Old Driver')
-        with remote_web._resync_lock:
-            remote_web.progress_offsets[0] = 3.0
 
         remote_web.reset_ac_run_state()
 
@@ -1020,8 +976,6 @@ class DisconnectStateResetTest(unittest.TestCase):
         })
         self.assertEqual(remote_web._prev_rollover_state, {})
         self.assertEqual(remote_web.event_log.snapshot(), [])
-        with remote_web._resync_lock:
-            self.assertEqual(remote_web.progress_offsets, {})
 
     def test_mark_is_rejected_without_fresh_ac_telemetry(self):
         with patch.object(remote_web.ac_transport, 'is_connected',

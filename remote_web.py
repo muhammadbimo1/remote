@@ -6,12 +6,9 @@ import sys
 import re
 import ipaddress
 from collections import defaultdict
-from urllib.parse import urlparse
 from flask import Flask, abort, render_template_string, request
 from flask_socketio import SocketIO, emit
 from simple_websocket import ConnectionClosed, Server
-
-import requests
 
 from ac_ipc import (
     ACIPCTransport,
@@ -143,10 +140,6 @@ def maybe_rotate_session(telem):
     _last_live_payload = None
     _replay_fallback_payload = None
     _latest_cars_by_id = {}
-    # Lap-count corrections belong to the session that produced them.
-    with _resync_lock:
-        progress_offsets.clear()
-
     print('[remote_web] session {}: {} (index={} type={} gen={})'.format(
         'opened' if first else 'changed', label, telem.session_index,
         telem.session_type_raw, telem.session_gen))
@@ -193,18 +186,9 @@ CLASS_COLORS = {
     'AM': '#e69138',
 }
 
-# --- Timetable re-sync (poll AC server /timetable.json) ---
-TIMETABLE_POLL_INTERVAL = 60.0
-TIMETABLE_TIMEOUT = 3.0
+# --- Gap and battle timing ---
 BATTLE_EXIT_S = 2.0
 BATTLE_SPEED_FLOOR_MS = 10.0
-
-_resync_lock = threading.Lock()
-progress_offsets = {}        # { car_id:int -> float lap-count correction }
-last_poll_time = 0.0
-last_poll_status = 'idle'    # 'idle' | 'ok' | 'not_configured' | 'disabled_not_race' | 'http_error' | 'unreachable' | 'bad_response'
-last_poll_error = ''
-last_poll_matched = 0
 
 
 def publish_focused_highlight(telem):
@@ -386,12 +370,8 @@ def compute_gaps(telem):
     cars.sort(key=lambda x: x['position'])
     track_length = telem.track_length
 
-    with _resync_lock:
-        offsets_snapshot = dict(progress_offsets)
-
-    for idx, car in enumerate(cars):
-        offset = offsets_snapshot.get(car['car_id'], 0.0)
-        car['total_progress'] = car['lap_count'] + car['spline'] + offset
+    for car in cars:
+        car['total_progress'] = car['lap_count'] + car['spline']
 
     _apply_physical_battle_context(cars, track_length)
 
@@ -477,150 +457,6 @@ def _compute_gap_seconds(ahead, behind, track_length):
     return gap_meters / speed_ms
 
 
-def get_timetable_url(telem):
-    """Return the AC server timetable URL provided by Lua telemetry."""
-    return (getattr(telem, 'timetable_url', '') or '').strip()
-
-
-def _validate_timetable_url(url):
-    """Return (ok, error). Empty url is valid (clears config)."""
-    if not url:
-        return True, ''
-    parsed = urlparse(url)
-    if parsed.scheme not in ('http', 'https'):
-        return False, 'URL must use http:// or https://'
-    if not parsed.hostname:
-        return False, 'URL missing host'
-    if not parsed.path.endswith('/timetable.json'):
-        return False, "URL path must end with /timetable.json"
-    return True, ''
-
-
-def fetch_timetable(url):
-    """GET the timetable URL. Returns parsed JSON dict, or None on failure.
-    Updates last_poll_status/last_poll_error on failure."""
-    global last_poll_status, last_poll_error
-    ok, err = _validate_timetable_url(url)
-    if not ok:
-        last_poll_status = 'bad_response'
-        last_poll_error = 'invalid url: {}'.format(err)
-        return None
-    try:
-        resp = requests.get(url, timeout=TIMETABLE_TIMEOUT, allow_redirects=False)
-    except requests.RequestException as e:
-        last_poll_status = 'unreachable'
-        last_poll_error = str(e)
-        print('[remote_web] timetable unreachable: {}'.format(e))
-        return None
-    if resp.status_code != 200:
-        last_poll_status = 'http_error'
-        last_poll_error = 'HTTP {}'.format(resp.status_code)
-        print('[remote_web] timetable http {}'.format(resp.status_code))
-        return None
-    try:
-        return resp.json()
-    except ValueError as e:
-        last_poll_status = 'bad_response'
-        last_poll_error = 'JSON parse: {}'.format(e)
-        return None
-
-
-def apply_timetable_offsets(data, telem):
-    """Compute per-car offset = timetable.Laps - local.lap_count from the
-    EntryList. Timetable CarID is the online server slot, so match it to
-    connected local cars by session_id, not by local car_id. The poller
-    skips rows with Ping == 0 because offline rows can report zero laps.
-    Atomically replace the offsets dict. Returns the number of matched offsets."""
-    global last_poll_matched
-    entries = data.get('EntryList') or []
-    local_by_session_id = {}
-    for i in range(telem.car_count):
-        c = telem.cars[i]
-        if not c.is_connected:
-            continue
-        local_by_session_id[int(c.session_id)] = (int(c.car_id), int(c.lap_count))
-
-    new_offsets = {}
-    matched = 0
-    for entry in entries:
-        try:
-            car_id = int(entry.get('CarID'))
-        except (TypeError, ValueError):
-            continue
-        if int(entry.get('Ping') or 0) == 0:
-            continue
-        local_match = local_by_session_id.get(car_id)
-        if local_match is None:
-            continue
-        try:
-            server_laps = int(entry.get('Laps') or 0)
-        except (TypeError, ValueError):
-            continue
-        local_car_id, local_lap_count = local_match
-        new_offsets[local_car_id] = float(server_laps - local_lap_count)
-        matched += 1
-
-    with _resync_lock:
-        progress_offsets.clear()
-        progress_offsets.update(new_offsets)
-    last_poll_matched = matched
-    return matched
-
-
-def poll_timetable_once(url, telem):
-    """Fetch and apply one timetable snapshot. Local AC telemetry is the
-    source of truth for race/non-race state; some server timetable endpoints
-    can lag and report a stale SessionType."""
-    global last_poll_time, last_poll_status, last_poll_error
-    if telem is None or not ac_connected:
-        last_poll_status = 'not_configured'
-        last_poll_error = 'no telemetry'
-        return False
-    if telem.session_type != 1:
-        last_poll_status = 'disabled_not_race'
-        last_poll_error = ''
-        return False
-    if telem.is_replay:
-        # lap_count here comes from the replay frame on screen, so the
-        # server-vs-local diff would be nonsense and would stick in
-        # progress_offsets long after the operator returns to live.
-        last_poll_status = 'disabled_replay'
-        last_poll_error = ''
-        return False
-
-    data = fetch_timetable(url)
-    if data is None:
-        return False
-
-    matched = apply_timetable_offsets(data, telem)
-    last_poll_time = time.time()
-    last_poll_status = 'ok'
-    last_poll_error = ''
-    print('[remote_web] timetable poll ok: matched={}'.format(matched))
-    return True
-
-
-def timetable_poll_loop():
-    """Daemon thread: poll the timetable URL every TIMETABLE_POLL_INTERVAL
-    seconds during race sessions only."""
-    global last_poll_time, last_poll_status, last_poll_error
-    while True:
-        try:
-            telem = read_telemetry()
-            url = get_timetable_url(telem) if telem is not None else ''
-            if not url:
-                last_poll_status = 'not_configured'
-                last_poll_error = 'no server HTTP endpoint'
-            else:
-                poll_timetable_once(url, telem)
-        except Exception as e:
-            last_poll_status = 'bad_response'
-            last_poll_error = 'internal: {}'.format(e)
-            print('[remote_web] poll loop error: {}'.format(e))
-
-        time.sleep(TIMETABLE_POLL_INTERVAL)
-
-
 _prev_rollover_state = {}
 
 
@@ -636,8 +472,6 @@ def reset_ac_run_state():
     event_log.clear()
     event_log.window_s = EventLog.BUFFER_S
     event_journal.end_session()
-    with _resync_lock:
-        progress_offsets.clear()
     with director_lock:
         director.reset_run_state()
     _prev_rollover_state.clear()
@@ -694,10 +528,6 @@ def build_update_data(telem, cars_with_gaps=None):
             'camera_count': c.get('car_cameras_count', 0),
         })
 
-    with _resync_lock:
-        offsets_active = any(abs(v) > 1e-6 for v in progress_offsets.values())
-    url = get_timetable_url(telem)
-
     return {
         'current_driver': telem.focused_car,
         'current_camera': telem.current_camera,
@@ -707,12 +537,6 @@ def build_update_data(telem, cars_with_gaps=None):
         'ac_connected': True,
         'auto_director': director.enabled,
         'auto_director_debug': director.debug,
-        'gap_offsets_active': offsets_active,
-        'timetable_url': url,
-        'timetable_status': last_poll_status,
-        'timetable_last_poll': last_poll_time,
-        'timetable_last_error': last_poll_error,
-        'timetable_matched': last_poll_matched,
         'session_type': telem.session_type,
         'pip': get_pip_state(),
         'replay': {
@@ -774,7 +598,6 @@ def build_replay_update_data(telem):
     data['auto_director'] = director.enabled
     data['auto_director_debug'] = director.debug
     data['pip'] = get_pip_state()
-    data['timetable_status'] = last_poll_status
     data['replay'] = {
         'active': True,
         'frame': telem.replay_frame,
@@ -1248,16 +1071,6 @@ def handle_mark_event():
         print('[remote_web] mark on car {} ({})'.format(latest_focused_car, name))
 
 
-@socketio.on('get_timetable_url')
-def handle_get_timetable_url():
-    emit('timetable_url', {
-        'ok': True,
-        'status': last_poll_status,
-        'last_poll': last_poll_time,
-        'error': last_poll_error,
-    })
-
-
 @socketio.on('connect')
 def handle_connect():
     if not ac_connected:
@@ -1364,7 +1177,6 @@ def index():
             var collisionTimers = {};
             var INCIDENT_NOTICE_MS = 6000;
             var activeClassFilter = 'ALL';
-            var ttStatus = 'idle';
             var pipState = { enabled: false, driver: -1, camera: 0, camera_count: 0 };
             var lastDrivers = [];
 
@@ -1440,30 +1252,6 @@ def index():
                 document.querySelectorAll('button[data-pip-driver]').forEach(function(btn) {
                     setPressed(btn, parseInt(btn.dataset.pipDriver) === pipState.driver);
                 });
-            }
-
-            // Timetable sync had a colour-coded dot. With one hue available the
-            // state has to be spelled out, so it becomes a badge; an error is the
-            // only alarm here and gets inverse video + blink.
-            function ttBadgeHtml() {
-                var label, cls = 'ac-badge';
-                switch (ttStatus) {
-                    case 'ok': label = 'TT:OK'; break;
-                    case 'disabled_not_race': label = 'TT:IDLE'; cls += ' ac-badge--dim'; break;
-                    case 'not_configured': label = 'TT:OFF'; cls += ' ac-badge--dim'; break;
-                    case 'unreachable':
-                    case 'http_error':
-                    case 'bad_response': label = 'TT:ERR'; cls += ' ac-badge--filled ac-blink'; break;
-                    default: label = 'TT:' + String(ttStatus || 'IDLE').toUpperCase(); cls += ' ac-badge--dim';
-                }
-                return '<span id="timetable-badge" class="' + cls + '" title="Timetable sync: '
-                    + escapeHtml(ttStatus) + '">' + escapeHtml(label) + '</span>';
-            }
-
-            function setTimetableStatus(status) {
-                ttStatus = status || 'idle';
-                var el = document.getElementById('timetable-badge');
-                if (el) el.outerHTML = ttBadgeHtml();
             }
 
             // Replay state. The panel never scrubs frames itself — a jump is
@@ -1543,7 +1331,6 @@ def index():
                     + '<span class="ac-readout__value">' + focusLabel + '</span>'
                     + '</span>'
                     + replayBadgeHtml()
-                    + ttBadgeHtml()
                     + '</div>';
             }
 
@@ -1790,7 +1577,6 @@ def index():
                     }
                 });
 
-                socket.emit('get_timetable_url');
             });
 
             socket.on('events', function(data) {
@@ -1821,19 +1607,10 @@ def index():
                 setPressed(document.getElementById('auto-dir-dbg-btn'), data.enabled);
             });
 
-            socket.on('timetable_url', function(data) {
-                if (data.status) setTimetableStatus(data.status);
-                if (data.error) console.log('[timetable] ' + data.error);
-            });
-
             socket.on('update', function(data) {
                 var statusEl = document.getElementById('ac-status');
                 lastDrivers = data.drivers || [];
                 if (data.pip) pipState = data.pip;
-
-                // Timetable state is rendered inside the status bar, so it has to
-                // be current before the bar is rebuilt.
-                if (data.timetable_status) ttStatus = data.timetable_status;
 
                 // Replay state gates the status bar label and the frozen grid,
                 // so it also has to be current before anything is rebuilt.
@@ -2035,34 +1812,35 @@ def index():
                     <span class="ac-readout__label">Focus</span>
                     <span class="ac-readout__value">--</span>
                 </span>
-                <span id="timetable-badge" class="ac-badge ac-badge--dim" title="Timetable sync: idle">TT:IDLE</span>
             </div>
         </div>
 
         <div class="control-bar">
             <div class="camera-buttons ac-tabs" role="tablist">
-                <button class="ac-tab" role="tab" aria-selected="false" data-cam="1">Track<span class="cam-cap">01</span></button>
-                <button class="ac-tab" role="tab" aria-selected="false" data-cam="2">Cockpit<span class="cam-cap">02</span></button>
-                <button class="ac-tab" role="tab" aria-selected="false" data-cam="3">Heli<span class="cam-cap">03</span></button>
-                <button class="ac-tab" role="tab" aria-selected="false" data-cam="4">F6<span class="cam-cap">04</span></button>
-                <button class="ac-tab" role="tab" aria-selected="false" data-cam="5">Orbit<span class="cam-cap">05</span></button>
+                <button class="ac-tab" role="tab" aria-selected="false" data-cam="1">Track</button>
+                <button class="ac-tab" role="tab" aria-selected="false" data-cam="2">Cockpit</button>
+                <button class="ac-tab" role="tab" aria-selected="false" data-cam="3">Heli</button>
+                <button class="ac-tab" role="tab" aria-selected="false" data-cam="4">F6</button>
+                <button class="ac-tab" role="tab" aria-selected="false" data-cam="5">Orbit</button>
             </div>
             <div class="dir-group">
-                <button id="auto-dir-btn" class="ac-btn" aria-pressed="false" onclick="socket.emit('toggle_director')">Auto<span class="cam-cap">AI</span></button>
-                <button id="auto-dir-dbg-btn" class="ac-btn" aria-pressed="false" onclick="socket.emit('toggle_director_debug')" title="Verbose director scoring logs to server stdout">Dbg<span class="cam-cap">DG</span></button>
+                <button id="auto-dir-btn" class="ac-btn" aria-pressed="false" onclick="socket.emit('toggle_director')">Auto</button>
+                <button id="auto-dir-dbg-btn" class="ac-btn" aria-pressed="false" onclick="socket.emit('toggle_director_debug')" title="Verbose director scoring logs to server stdout">Dbg</button>
             </div>
         </div>
 
+        <div id="subcam-bar" class="subcam-bar" style="display:none"></div>
+
         <div id="pip-bar" class="pip-bar" aria-label="Independent picture in picture controls">
-            <button id="pip-toggle" class="ac-btn" aria-pressed="false">PiP Off<span class="cam-cap">PP</span></button>
-            <button id="pip-camera-prev" class="ac-btn" disabled>Cam -<span class="cam-cap">&lt;</span></button>
-            <button id="pip-camera-next" class="ac-btn" disabled>Cam +<span class="cam-cap">&gt;</span></button>
+            <button id="pip-toggle" class="ac-btn" aria-pressed="false">PiP Off</button>
+            <button id="pip-camera-prev" class="ac-btn" disabled>Cam -</button>
+            <button id="pip-camera-next" class="ac-btn" disabled>Cam +</button>
             <span id="pip-readout" class="ac-readout ac-readout--inline">PIP --</span>
         </div>
 
         <div id="replay-bar" class="replay-bar">
-            <button id="live-btn" class="ac-btn" aria-pressed="false">Live<span class="cam-cap">LV</span></button>
-            <button id="mark-btn" class="ac-btn" title="Drop a marker on the focused car">Mark<span class="cam-cap">MK</span></button>
+            <button id="live-btn" class="ac-btn" aria-pressed="false">Live</button>
+            <button id="mark-btn" class="ac-btn" title="Drop a marker on the focused car">Mark</button>
             <span id="replay-readout" class="ac-readout ac-readout--inline" style="display:none">
                 <span class="ac-readout__label">Frame</span>
                 <span class="ac-readout__value" id="replay-frame">--</span>
@@ -2078,7 +1856,6 @@ def index():
         </div>
 
         <div id="grid-view" class="view-pane">
-            <div id="subcam-bar" class="subcam-bar" style="display:none"></div>
             <div id="class-filter-bar" class="class-filter-bar"></div>
 
             <div id="drivers-list">
@@ -2144,5 +1921,4 @@ if __name__ == '__main__':
             highlight_client.start()
             print('[remote_web] broadcast highlight enabled')
     threading.Thread(target=monitor_telemetry, daemon=True).start()
-    threading.Thread(target=timetable_poll_loop, daemon=True).start()
     socketio.run(app, host='0.0.0.0')

@@ -55,7 +55,6 @@ def telemetry_message(cars=None, **overrides):
         'is_replay_only': False,
         'replay_file': '',
         'replay_temp_dir': 'C:/AC/replay/temp',
-        'timetable_url': '',
         'cars': cars,
     }
     message.update(overrides)

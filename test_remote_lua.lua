@@ -668,6 +668,41 @@ local function testPiPDisableAndNewServerEpochAreAccepted()
     'disabled PiP closes its window')
 end
 
+local function testReplayTemporarilyClosesAndRestoresPiP()
+  local ctx = loadRemote(false)
+  ctx.deliver(pipCommand('server-a', 1, true, 0, 0))
+  ctx.update()
+
+  ctx.sim.isReplayActive = true
+  ctx.update()
+  assertEqual(ctx.windowOpenCalls[#ctx.windowOpenCalls].opened, false,
+    'entering replay closes the PiP window')
+
+  ctx.sim.isReplayActive = false
+  ctx.update()
+  assertEqual(ctx.windowOpenCalls[#ctx.windowOpenCalls].opened, true,
+    'returning live restores an enabled PiP window')
+end
+
+local function testPiPDisabledDuringReplayStaysOffWhenLive()
+  local ctx = loadRemote(false)
+  ctx.deliver(pipCommand('server-a', 1, true, 0, 0))
+  ctx.update()
+  ctx.sim.isReplayActive = true
+  ctx.update()
+
+  ctx.deliver(pipCommand('server-a', 2, false, 0, 0))
+  ctx.update()
+  local callsBeforeLive = #ctx.windowOpenCalls
+
+  ctx.sim.isReplayActive = false
+  ctx.update()
+  assertEqual(#ctx.windowOpenCalls, callsBeforeLive,
+    'returning live does not restore PiP after it was disabled in replay')
+  assertEqual(ctx.windowOpenCalls[#ctx.windowOpenCalls].opened, false,
+    'PiP remains closed after returning live')
+end
+
 local function testDisabledPiPDoesNotRender()
   local ctx = loadRemote(false)
   ctx.runSceneReady()
@@ -922,6 +957,8 @@ testNewServerEpochAcceptsAResetSequence()
 testPiPCommandDoesNotChangeMainShot()
 testDuplicateAndMalformedPiPCommandsAreIgnored()
 testPiPDisableAndNewServerEpochAreAccepted()
+testReplayTemporarilyClosesAndRestoresPiP()
+testPiPDisabledDuringReplayStaysOffWhenLive()
 testDisabledPiPDoesNotRender()
 testEnabledPiPRendersSelectedOnboardCamera()
 testMissingRequestedPiPCameraFallsBackToCameraZero()

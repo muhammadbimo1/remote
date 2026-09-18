@@ -158,20 +158,16 @@ Pre-fix Rafid appears 1.376 laps *ahead* of Iga (38.216 > 37.840). Post-fix his 
 
 ## 9. UI / control surface
 
-A single user-triggered button is enough. We considered background polling (every 2–5 s) and rejected it: gap calc is mostly correct mid-race, the bug only matters after a reconnect event, and the broadcaster operator is the human watching for those events anyway. One button click whenever the operator notices a wrong gap is sufficient.
-
-Recommended feedback states on the button:
-- **Idle** ("Sync"): default state, no offsets active.
-- **Synced** (subtle green): offsets non-empty, at least one non-trivial. Pull this from a `gap_offsets_active` flag in the regular update payload.
-- **Flash green / flash red** (3-4 s after click): success/failure feedback. Auto-revert.
+There is no synchronization control or status UI. Lua refreshes the server
+timetable automatically every two seconds during a live race.
 
 ---
 
 ## 10. Verification recipe
 
 1. Run a session, identify a driver whose local gap is visibly wrong (e.g. shows "+1 Lap" but the live timing site shows seconds, or vice versa).
-2. Click Sync.
-3. Within one telemetry tick (~100 ms) the leaderboard's gap-to-leader column should converge to within ~0.5 s of `livetiming.buayabalap.my.id` for that driver.
+2. Wait for the next two-second timetable refresh.
+3. Within one telemetry tick (~100 ms) after that refresh, the leaderboard's gap-to-leader column should converge to within ~0.5 s of `livetiming.buayabalap.my.id` for that driver.
 4. Leave the page open for several minutes; gaps should evolve smoothly (cars closing/extending through corner sequences) and stay aligned with the live site for cars that haven't disconnected since the last sync.
 5. If a *new* disconnect happens, that driver's gap will drift again — click Sync again to re-converge.
 
@@ -179,15 +175,15 @@ Recommended feedback states on the button:
 
 ## 11. Reference implementation (this repo)
 
-All changes are in `remote_web.py`. Key entry points:
+`remote.lua` owns `/timetable.json` synchronization so its in-game list and
+the Python panel consume the same corrected values. `EntryList[*].CarID` is
+mapped through connected cars' `StateCar.sessionID`; it is never treated as a
+local CSP car index. Server `Laps` values replace the unreliable CSP lap count.
 
-- Module state: `LIVE_TIMING_URL`, `progress_offsets`, `_resync_lock`, `last_resync_*`.
-- `_parse_driver_name(raw_name)` — shared "NN | Name" parser. Returns `car_number = None` when the prefix is absent or non-numeric; the car slot index is never used as a race number.
-- `fetch_live_timing_drivers()` — single GET with timeout.
-- `_match_local(api_record, by_number, by_name)` — race-number-first matching.
-- `resync_progress_offsets()` — the work behind the button.
-- `compute_gaps()` — adds `progress_offsets[car_id]` to `total_progress` under the lock.
-- `@socketio.on('resync_gaps')` — UI trigger.
-- WebSocket reconnect path in `monitor_telemetry()` clears the dict.
-
-Lua port note: `SubStandingLua` consumes AC server `/timetable.json` for lap-count sync. Its `EntryList[*].CarID` values must be mapped through local connected cars' `StateCar.sessionID` before applying `Laps`; direct `drivers[entry.CarID]` indexing is wrong whenever local car indices differ from server entry slots.
+Timetable `Position` is physical track order, so it is not copied directly to
+the race-position field. Lua derives classification by sorting matched cars by
+`Laps` descending and then timetable `Position` ascending. It only publishes
+that derived ordering when every connected car has a valid matched row;
+otherwise position falls back to `car.racePosition`. The corrected position and
+lap count are sent as the normal IPC fields. `remote_web.py` no longer polls or
+adds a second lap offset.

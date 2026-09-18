@@ -158,22 +158,6 @@ body {
     min-width: 68px;
 }
 
-.cam-cap {
-    display: block;
-    margin-top: 3px;
-    font-family: var(--font-micro);
-    font-size: var(--type-micro);
-    letter-spacing: var(--tracking-micro);
-    color: var(--ink-dim);
-    text-shadow: none;
-}
-
-.ac-tab--active .cam-cap,
-.ac-btn--filled .cam-cap {
-    color: var(--on-fill);
-    opacity: 0.75;
-}
-
 /* Independent onboard PiP. The selected driver is picked from each card; this
    compact strip owns visibility and onboard-camera cycling. */
 .pip-bar {
@@ -196,11 +180,6 @@ body {
     background: var(--fill);
     color: var(--on-fill);
     text-shadow: none;
-}
-
-#pip-toggle[aria-pressed="true"] .cam-cap {
-    color: var(--on-fill);
-    opacity: 0.75;
 }
 
 #pip-readout {
@@ -232,6 +211,7 @@ body {
     display: flex;
     align-items: center;
     gap: var(--space-2);
+    padding-bottom: var(--space-2);
     overflow-x: auto;
     flex-shrink: 0;
 }
@@ -287,11 +267,6 @@ body {
     background: var(--fill);
     color: var(--on-fill);
     text-shadow: none;
-}
-
-#live-btn[aria-pressed="true"] .cam-cap {
-    color: var(--on-fill);
-    opacity: 0.75;
 }
 
 #replay-readout {
@@ -845,10 +820,6 @@ body {
         font-size: var(--type-small);
         flex: 1 0 auto;
         padding: 4px 10px 5px;
-    }
-
-    .cam-cap {
-        display: none;
     }
 
     .dir-group {

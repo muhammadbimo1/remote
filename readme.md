@@ -55,3 +55,13 @@ The web server posts only when the focused car changes. CSP local car indices
 are translated through `session_id`, so the published `carId` is the same
 remote/server CarID used by `timetable.json` lap-count synchronization. The
 password stays in the git-ignored local config and is never logged.
+
+## Online standings synchronization
+
+`remote.lua` polls the AC server's `/timetable.json` every two seconds during
+live race sessions. Rows are matched to local CSP cars through `sessionID`.
+Server `Laps` values replace unreliable online CSP lap counts, while overall
+race position is derived by sorting completed laps first and timetable track
+position second. Corrected standings drive both the in-game list and the
+telemetry sent to `remote_web.py`. Polling pauses during replay, and unmatched
+cars fall back to CSP values.
