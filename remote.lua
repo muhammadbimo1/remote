@@ -36,10 +36,8 @@ local pipActualCamera = 0
 local pipFrameReady = false
 local pipShot = nil
 local pipColorSettings = ac.INIConfig.scriptSettings()
-local pipExposureEV = pipColorSettings:get('PIP_COLOR', 'EXPOSURE_EV', 0.0)
-local pipBrightness = pipColorSettings:get('PIP_COLOR', 'BRIGHTNESS', 1.0)
 local pipGamma = pipColorSettings:get('PIP_COLOR', 'GAMMA', 1.0)
-local pipWhitePoint = pipColorSettings:get('PIP_COLOR', 'WHITE_POINT', 0.45)
+local pipWhitePoint = pipColorSettings:get('PIP_COLOR', 'WHITE_POINT', 0.0)
 local pipRedGain = pipColorSettings:get('PIP_COLOR', 'RED_GAIN', 1.0)
 local pipGreenGain = pipColorSettings:get('PIP_COLOR', 'GREEN_GAIN', 1.0)
 local pipBlueGain = pipColorSettings:get('PIP_COLOR', 'BLUE_GAIN', 1.0)
@@ -1135,9 +1133,8 @@ function script.windowPiP(dt)
   local p2 = vec2(x + width, y + height)
   ui.beginTonemapping()
   ui.drawImage(pipShot, p1, p2,
-    rgbm(pipRedGain, pipGreenGain, pipBlueGain,
-      pipBrightness * 2 ^ pipExposureEV))
-  ui.endTonemapping(pipGamma, pipWhitePoint, false)
+    rgbm(pipRedGain, pipGreenGain, pipBlueGain, 1))
+  ui.endTonemapping(pipGamma, pipWhitePoint, true)
 
   local plateP1 = origin
   local plateP2 = vec2(origin.x + available.x, y)
@@ -1162,13 +1159,9 @@ local function pipColorSlider(label, key, value, minimum, maximum)
 end
 
 function script.windowPiPSettings(dt)
-  pipExposureEV = pipColorSlider(
-    'Exposure (EV)', 'EXPOSURE_EV', pipExposureEV, -5.0, 5.0)
-  pipBrightness = pipColorSlider(
-    'Brightness', 'BRIGHTNESS', pipBrightness, 0.1, 2.0)
   pipGamma = pipColorSlider('Gamma', 'GAMMA', pipGamma, 0.4, 5.0)
   pipWhitePoint = pipColorSlider(
-    'White point', 'WHITE_POINT', pipWhitePoint, 0.0, 5.0)
+    'White point', 'WHITE_POINT', pipWhitePoint, 0.0, 25.0)
   pipRedGain = pipColorSlider('Red gain', 'RED_GAIN', pipRedGain, 0.0, 2.0)
   pipGreenGain = pipColorSlider(
     'Green gain', 'GREEN_GAIN', pipGreenGain, 0.0, 2.0)
@@ -1176,15 +1169,11 @@ function script.windowPiPSettings(dt)
     'Blue gain', 'BLUE_GAIN', pipBlueGain, 0.0, 2.0)
 
   if ui.button('Reset color') then
-    pipExposureEV = 0.0
-    pipBrightness = 1.0
     pipGamma = 1.0
-    pipWhitePoint = 0.45
+    pipWhitePoint = 0.0
     pipRedGain = 1.0
     pipGreenGain = 1.0
     pipBlueGain = 1.0
-    pipColorSettings:set('PIP_COLOR', 'EXPOSURE_EV', pipExposureEV)
-    pipColorSettings:set('PIP_COLOR', 'BRIGHTNESS', pipBrightness)
     pipColorSettings:set('PIP_COLOR', 'GAMMA', pipGamma)
     pipColorSettings:set('PIP_COLOR', 'WHITE_POINT', pipWhitePoint)
     pipColorSettings:set('PIP_COLOR', 'RED_GAIN', pipRedGain)

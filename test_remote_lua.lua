@@ -771,18 +771,17 @@ local function testPiPUsesHdrTextureAndTonemappingDefaults()
   assertEqual(tint.r, 1, 'PiP default red gain is neutral')
   assertEqual(tint.g, 1, 'PiP default green gain is neutral')
   assertEqual(tint.b, 1, 'PiP default blue gain is neutral')
-  assertEqual(tint.a, 1, 'PiP default brightness is neutral')
+  assertEqual(tint.a, 1, 'PiP image multiplier is neutral')
   local tone = ctx.tonemappingCalls[1]
   assertEqual(tone.gamma, 1, 'PiP default gamma is neutral')
-  assertEqual(tone.whitePoint, 0.45,
-    'PiP default white point prevents clipped-looking highlights')
-  assertEqual(tone.lcsAware, false,
-    'PiP applies explicit HDR tonemapping instead of LCS conversion')
+  assertEqual(tone.whitePoint, 0,
+    'PiP uses the CMRT white point that disables extra tonemapping')
+  assertEqual(tone.lcsAware, true,
+    'PiP converts AC HDR colors to LDR like CMRT')
 end
 
 local function testPiPColorSettingsApplyLiveAndPersist()
   local ctx = loadRemote(false)
-  ctx.setSlider('Brightness', 0.7)
   ctx.setSlider('Gamma', 1.2)
   ctx.setSlider('White point', 0.8)
   ctx.setSlider('Red gain', 0.9)
@@ -795,38 +794,17 @@ local function testPiPColorSettingsApplyLiveAndPersist()
   assertEqual(tint.r, 0.9, 'PiP applies configured red gain')
   assertEqual(tint.g, 0.85, 'PiP applies configured green gain')
   assertEqual(tint.b, 0.75, 'PiP applies configured blue gain')
-  assertEqual(tint.a, 0.7, 'PiP applies configured brightness')
+  assertEqual(tint.a, 1, 'PiP does not apply a brightness multiplier')
   local tone = ctx.tonemappingCalls[1]
   assertEqual(tone.gamma, 1.2, 'PiP applies configured gamma')
   assertEqual(tone.whitePoint, 0.8, 'PiP applies configured white point')
-  assertEqual(ctx.settingsSaveCount(), 6,
+  assertEqual(ctx.settingsSaveCount(), 5,
     'each changed PiP control is persisted')
-end
-
-local function testPiPExposureUsesPhotographicStopsAndPersists()
-  local ctx = loadRemote(false)
-  ctx.setSlider('Exposure (EV)', 1.0)
-  script.windowPiPSettings(0)
-  preparePiPFrame(ctx)
-
-  assertEqual(ctx.drawnImages[1].color.a, 2,
-    'PiP plus one EV doubles image brightness')
-  assertEqual(ctx.settingsWrites[1].key, 'EXPOSURE_EV',
-    'PiP exposure persists under its own setting')
-  assertEqual(ctx.settingsWrites[1].value, 1.0,
-    'PiP persists the selected exposure')
-
-  ctx.setSlider('Exposure (EV)', -1.0)
-  script.windowPiPSettings(0)
-  script.windowPiP(0)
-  assertEqual(ctx.drawnImages[2].color.a, 0.5,
-    'PiP minus one EV halves image brightness')
 end
 
 local function testPiPColorResetRestoresDefaults()
   local ctx = loadRemote(false)
-  ctx.setSlider('Brightness', 0.5)
-  ctx.setSlider('Exposure (EV)', 2.0)
+  ctx.setSlider('White point', 0.8)
   script.windowPiPSettings(0)
   ctx.clickButton('Reset color')
   script.windowPiPSettings(0)
@@ -836,10 +814,10 @@ local function testPiPColorResetRestoresDefaults()
   assertEqual(tint.r, 1, 'PiP reset restores red gain')
   assertEqual(tint.g, 1, 'PiP reset restores green gain')
   assertEqual(tint.b, 1, 'PiP reset restores blue gain')
-  assertEqual(tint.a, 1, 'PiP reset restores brightness')
+  assertEqual(tint.a, 1, 'PiP reset keeps the image multiplier neutral')
   assertEqual(ctx.tonemappingCalls[1].gamma, 1,
     'PiP reset restores gamma')
-  assertEqual(ctx.tonemappingCalls[1].whitePoint, 0.45,
+  assertEqual(ctx.tonemappingCalls[1].whitePoint, 0,
     'PiP reset restores white point')
 end
 
@@ -847,7 +825,7 @@ local function testPiPColorSlidersUseFractionalMode()
   local ctx = loadRemote(false)
   script.windowPiPSettings(0)
 
-  assertEqual(#ctx.sliderCalls, 7, 'PiP settings exposes all color sliders')
+  assertEqual(#ctx.sliderCalls, 5, 'PiP settings exposes all color sliders')
   local callsByLabel = {}
   for _, call in ipairs(ctx.sliderCalls) do
     callsByLabel[call.label] = call
@@ -858,12 +836,12 @@ local function testPiPColorSlidersUseFractionalMode()
   end
   assertEqual(callsByLabel.Gamma.maximum, 5.0,
     'PiP gamma can be raised to 5')
-  assertEqual(callsByLabel['White point'].maximum, 5.0,
-    'PiP white point can be raised to 5')
-  assertEqual(callsByLabel['Exposure (EV)'].minimum, -5.0,
-    'PiP exposure supports five stops below neutral')
-  assertEqual(callsByLabel['Exposure (EV)'].maximum, 5.0,
-    'PiP exposure supports five stops above neutral')
+  assertEqual(callsByLabel['White point'].maximum, 25.0,
+    'PiP preserves the configured white point range')
+  assertEqual(callsByLabel.Brightness, nil,
+    'PiP settings omits the brightness multiplier')
+  assertEqual(callsByLabel['Exposure (EV)'], nil,
+    'PiP settings omits the exposure multiplier')
 end
 
 local function testEnterTogglesOnFirstStingerFrame()
@@ -952,7 +930,6 @@ testPiPGeometryShotIsDisposedOnRelease()
 testPiPOverlayUsesPositionParsedNameTeamAndMichroma()
 testPiPUsesHdrTextureAndTonemappingDefaults()
 testPiPColorSettingsApplyLiveAndPersist()
-testPiPExposureUsesPhotographicStopsAndPersists()
 testPiPColorResetRestoresDefaults()
 testPiPColorSlidersUseFractionalMode()
 print('test_remote_lua.lua: all tests passed')
