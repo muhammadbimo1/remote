@@ -393,6 +393,18 @@ class StandingsOrderTest(unittest.TestCase):
         self.assertEqual([d['position'] for d in drivers], [1, 2])
         self.assertEqual(drivers[0]['gap'], 'Leader')
 
+    def test_race_class_order_survives_delayed_lap_count_at_finish_line(self):
+        drivers = build_update_data(self._telem(3, [
+            {'name': 'Just Crossed', 'position': 1, 'best_lap': 95000,
+             'lap_count': 10, 'spline': 0.01},
+            {'name': 'Still Approaching', 'position': 2, 'best_lap': 96000,
+             'lap_count': 10, 'spline': 0.99},
+        ]))['drivers']
+
+        self.assertEqual([d['name'] for d in drivers],
+                         ['Just Crossed', 'Still Approaching'])
+        self.assertEqual([d['class_position'] for d in drivers], [1, 2])
+
     def test_physical_battle_context_is_symmetric(self):
         cars = remote_web.compute_gaps(self._telem(3, [
             {'name': 'Defender', 'position': 1, 'best_lap': 95000,
@@ -1057,6 +1069,49 @@ class ReviewModeTest(unittest.TestCase):
         self.assertFalse(remote_web.review_journal['manual'])
         self.assertEqual(len(remote_web.review_journal['events']), 1)
         self.assertEqual(remote_web.review_journal['events'][0]['frame'], 400)
+
+    def test_enter_review_merges_fragments_and_remaps_a_wrapped_replay(self):
+        telem = TelemetryPage()
+        telem.replay_frames = 4000
+        telem.replay_frame_ms = 25.0
+        session = {
+            'file': 'part-2.jsonl',
+            'files': ['part-1.jsonl', 'part-2.jsonl'],
+            'replay_frame_ms': 25.0,
+        }
+        records = {
+            'part-1.jsonl': [
+                {'t': 10.0, 'kind': 'collision', 'replay_frame': 900,
+                 'time_remaining_ms': 200000.0},
+                {'t': 20.0, 'kind': 'collision', 'replay_frame': 1100,
+                 'time_remaining_ms': 195000.0},
+            ],
+            'part-2.jsonl': [
+                {'t': 25.0, 'kind': 'mark', 'replay_frame': 3990,
+                 'time_remaining_ms': 100000.0},
+                {'t': 30.0, 'kind': 'overtake', 'replay_frame': 4000,
+                 'time_remaining_ms': 99750.0},
+                {'t': 35.0, 'kind': 'overtake', 'replay_frame': 4000,
+                 'time_remaining_ms': 74750.0},
+            ],
+        }
+
+        with patch.object(remote_web.event_journal, 'list_sessions',
+                          return_value=[session]), \
+                patch.object(remote_web.event_journal, 'load',
+                             side_effect=lambda name: records[name]), \
+                patch.object(remote_web, 'match_replay',
+                             return_value=(session, 'timeline')), \
+                patch.object(remote_web, 'read_replay_header', return_value={
+                    'version': 16, 'frame_ms': 25.0,
+                    'recording_index': 1000, 'frames': 4000,
+                }):
+            remote_web.enter_review('C:/saved.acreplay', telem)
+
+        events = remote_web.review_journal['events']
+        self.assertEqual([event['frame'] for event in events],
+                         [100, 2990, 3000])
+        self.assertEqual([event['id'] for event in events], [1, 2, 3])
 
     def test_enter_review_without_a_match_has_empty_events(self):
         telem = TelemetryPage()

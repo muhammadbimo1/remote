@@ -21,14 +21,15 @@ first and always.
 
 AC records one .acreplay per session under replay/temp, created at session
 start and grown live, named `AC_DDMMYY-HHMMSS_<S>_<car>_<track>.acreplay` with
-S being O (practice/other), Q or R. That timestamp is the session start, so a
-journal can name itself after the replay it annotates — same stem, .jsonl
-extension — and each record carries the replay filename too, in case the file
-is later renamed on the way out of temp.
+S being O (practice/other), Q or R. The temp filename timestamp is the session
+start, so a journal can initially take the same stem. When AC saves the replay
+out of temp it gives the copy a new timestamp for the save time; review pairs
+that name against journal end time and replay frame count.
 """
 import json
 import os
 import re
+import struct
 import threading
 import time
 import unicodedata
@@ -49,12 +50,104 @@ REPLAY_MATCH_TOLERANCE_S = 300.0
 # after being saved, so its stem no longer matches the journal's.
 REPLAY_FINGERPRINT_TOLERANCE_S = 5.0
 
+# AC renames an autosaved replay when it is moved out of `replay/temp`: the
+# timestamp in the saved filename is the save time, not the temp recording's
+# start time. Event journals can also be split across server reconnects. A
+# saved replay is therefore allowed to end a few minutes after its last event,
+# and adjacent journal fragments can be joined across a short logging gap.
+REPLAY_TIMELINE_TOLERANCE_S = 300.0
+REPLAY_FRAGMENT_GAP_S = 600.0
+
+
+def read_replay_header(path):
+    """Read the small fixed prefix needed to understand replay wrapping.
+
+    AC stores a circular recording cursor immediately before the total frame
+    count. Reading only the prefix keeps this safe for multi-gigabyte replay
+    files. Returns None for an unavailable or unrecognised file.
+    """
+    try:
+        with open(path, 'rb') as fh:
+            version, frame_ms = struct.unpack('<Id', fh.read(12))
+            for _ in range(3):
+                length = struct.unpack('<I', fh.read(4))[0]
+                if length > 4096:
+                    return None
+                if len(fh.read(length)) != length:
+                    return None
+            cars, recording_index, frames, _ = struct.unpack(
+                '<IIII', fh.read(16))
+    except (OSError, struct.error):
+        return None
+    if version <= 0 or frame_ms <= 0 or cars > 256 or frames <= 0 or \
+            recording_index > frames:
+        return None
+    return {
+        'version': version,
+        'frame_ms': frame_ms,
+        'recording_index': recording_index,
+        'frames': frames,
+    }
+
+
+def remap_replay_records(records, replay_frames, replay_frame_ms,
+                         recording_index):
+    """Map live journal frame numbers into a loaded replay's final buffer.
+
+    Before AC's circular buffer fills, journal frame numbers are absolute.
+    Once full, `sim.replayFrames` stays pinned at the capacity. For those later
+    records the race countdown supplies the elapsed frames from the final
+    unsaturated record. Records overwritten from the front of the ring, or
+    beyond the saved live edge, are omitted.
+    """
+    if replay_frames <= 0 or replay_frame_ms <= 0:
+        return [dict(record) for record in records]
+    wrapped = 0 <= recording_index < replay_frames
+    anchor = None
+    if wrapped:
+        for record in records:
+            frame = record.get('replay_frame')
+            if frame is not None and frame < replay_frames and \
+                    record.get('time_remaining_ms') is not None:
+                anchor = record
+
+    mapped = []
+    for record in records:
+        frame = record.get('replay_frame')
+        if frame is None and record.get('session_s') is not None:
+            frame = int(round(
+                record['session_s'] * 1000.0 / replay_frame_ms))
+        if frame is None:
+            continue
+
+        absolute_frame = frame
+        if wrapped and frame >= replay_frames:
+            if anchor is None or record.get('time_remaining_ms') is None:
+                continue
+            elapsed_frames = (
+                anchor['time_remaining_ms'] - record['time_remaining_ms']) / \
+                replay_frame_ms
+            absolute_frame = anchor['replay_frame'] + int(round(elapsed_frames))
+
+        target_frame = absolute_frame - recording_index if wrapped \
+            else absolute_frame
+        if target_frame < 0 or target_frame >= replay_frames:
+            continue
+        output = dict(record)
+        output['replay_frame'] = target_frame
+        output['session_s'] = round(
+            target_frame * replay_frame_ms / 1000.0, 2)
+        mapped.append(output)
+    return mapped
+
 
 def parse_replay_name(name):
-    """Return (start_datetime, session_letter) for an AC replay filename.
+    """Return (filename_datetime, session_letter) for an AC replay filename.
 
     Returns None for anything that is not AC's autosave naming — replays saved
-    by hand get arbitrary names and must not be matched by guesswork.
+    by hand get arbitrary names and must not be matched by guesswork. For a
+    temp replay the timestamp is its start; for a saved copy it is its save
+    time.
     """
     match = REPLAY_NAME_RE.match(name)
     if not match:
@@ -110,9 +203,11 @@ def match_replay(replay_file, replay_frames, replay_frame_ms, sessions):
     names itself after the .acreplay it annotates, and each record repeats the
     original replay name in case the file was renamed on its way out of temp.
 
-    Falls back to a duration fingerprint for renamed files. Returns a
-    (session, confidence) tuple, or (None, None) — confidence is 'exact' or
-    'fingerprint'.
+    AC gives an autosaved replay a new timestamp when it is saved out of the
+    temp directory. For that case, adjacent journal fragments are grouped and
+    matched against the save time and loaded frame count. A duration
+    fingerprint remains as the fallback for hand-renamed files. Returns a
+    (session, confidence) tuple, or (None, None).
     """
     if not replay_file or not sessions:
         return None, None
@@ -127,6 +222,23 @@ def match_replay(replay_file, replay_frames, replay_frame_ms, sessions):
                 os.path.splitext(session['replay_file'])[0] == stem:
             return session, 'exact'
 
+    parsed_name = parse_replay_name(os.path.basename(replay_file))
+    if parsed_name and replay_frames and replay_frame_ms:
+        saved_at = parsed_name[0].timestamp()
+        candidates = []
+        for group in _group_session_fragments(sessions):
+            end_delta = saved_at - group['last_t']
+            frame_gap = replay_frames - group['max_replay_frame']
+            frame_gap_s = frame_gap * replay_frame_ms / 1000.0
+            if end_delta < -30.0 or end_delta > REPLAY_TIMELINE_TOLERANCE_S:
+                continue
+            if frame_gap < 0 or frame_gap_s > REPLAY_TIMELINE_TOLERANCE_S:
+                continue
+            candidates.append((end_delta + frame_gap_s, group))
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            return candidates[0][1], 'timeline'
+
     if not replay_frames or not replay_frame_ms:
         return None, None
     duration = replay_frames * replay_frame_ms / 1000.0
@@ -140,6 +252,55 @@ def match_replay(replay_file, replay_frames, replay_frame_ms, sessions):
     if best is not None and best_err <= REPLAY_FINGERPRINT_TOLERANCE_S:
         return best, 'fingerprint'
     return None, None
+
+
+def _group_session_fragments(sessions):
+    """Combine journal files that continue one AC replay frame sequence."""
+    ordered = sorted(
+        (session for session in sessions
+         if session.get('first_t') is not None and
+         session.get('last_t') is not None and
+         session.get('first_replay_frame') is not None and
+         session.get('last_replay_frame') is not None),
+        key=lambda session: session['first_t'])
+    groups = []
+    for session in ordered:
+        previous = groups[-1] if groups else None
+        same_identity = previous is not None and \
+            session.get('session') is not None and \
+            session.get('session') == previous.get('session') and \
+            session.get('session_index') == previous.get('session_index')
+        short_gap = previous is not None and \
+            0 <= session['first_t'] - previous['last_t'] <= \
+            REPLAY_FRAGMENT_GAP_S
+        frame_continues = previous is not None and \
+            session['first_replay_frame'] >= previous['last_replay_frame']
+        frame_ms_matches = previous is not None and \
+            session.get('replay_frame_ms') == previous.get('replay_frame_ms')
+        replay_names_compatible = previous is not None and not (
+            session.get('replay_file') and previous.get('replay_file') and
+            session['replay_file'] != previous['replay_file'])
+
+        if same_identity and short_gap and frame_continues and \
+                frame_ms_matches and replay_names_compatible:
+            previous['files'].append(session['file'])
+            previous['file'] = session['file']
+            previous['count'] += session.get('count', 0)
+            previous['last_t'] = session['last_t']
+            previous['last_replay_frame'] = session['last_replay_frame']
+            previous['max_replay_frame'] = max(
+                previous['max_replay_frame'], session['max_replay_frame'])
+            previous['duration_s'] = max(
+                previous.get('duration_s') or 0,
+                session.get('duration_s') or 0) or None
+            if not previous.get('replay_file'):
+                previous['replay_file'] = session.get('replay_file')
+            continue
+
+        group = dict(session)
+        group['files'] = [session['file']]
+        groups.append(group)
+    return groups
 
 
 class EventJournal:
@@ -200,8 +361,12 @@ class EventJournal:
                 'first_t': None,
                 'last_t': None,
                 'duration_s': None,
+                'first_replay_frame': None,
+                'last_replay_frame': None,
                 'max_replay_frame': None,
                 'replay_frame_ms': None,
+                'session': None,
+                'session_index': None,
             }
             for record in records:
                 if session['replay_file'] is None and record.get('replay_file'):
@@ -216,9 +381,20 @@ class EventJournal:
                 if record.get('session_s') is not None:
                     session['duration_s'] = record['session_s']
                 if record.get('replay_frame') is not None:
-                    session['max_replay_frame'] = record['replay_frame']
+                    frame = record['replay_frame']
+                    if session['first_replay_frame'] is None:
+                        session['first_replay_frame'] = frame
+                    session['last_replay_frame'] = frame
+                    if session['max_replay_frame'] is None or \
+                            frame > session['max_replay_frame']:
+                        session['max_replay_frame'] = frame
                 if record.get('replay_frame_ms') is not None:
                     session['replay_frame_ms'] = record['replay_frame_ms']
+                if session['session'] is None and record.get('session') is not None:
+                    session['session'] = record['session']
+                if session['session_index'] is None and \
+                        record.get('session_index') is not None:
+                    session['session_index'] = record['session_index']
             sessions.append(session)
         return sessions
 

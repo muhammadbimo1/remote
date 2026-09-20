@@ -133,6 +133,12 @@ class AutoDirector:
                 previous_class_holders[(classes_by_id[cid], position)] = cid
         in_pit_now = {car['car_id']: bool(car.get('is_in_pit'))
                       for car in cars}
+        current_positions = {
+            car['car_id']: car.get('position') for car in cars
+        }
+        current_class_positions = {
+            car['car_id']: car.get('class_position') for car in cars
+        }
 
         for car in cars:
             cid = car['car_id']
@@ -153,23 +159,25 @@ class AutoDirector:
             cur_pos = car.get('position')
             prev_cls_pos = self.prev_class_positions.get(cid)
             cur_cls_pos = car.get('class_position')
-            gained_overall = (prev_pos is not None and cur_pos is not None
-                              and cur_pos < prev_pos)
-            gained_class = (prev_cls_pos is not None and cur_cls_pos is not None
-                            and cur_cls_pos < prev_cls_pos)
             eligible_overall = False
             eligible_class = False
             if is_race and not car.get('is_in_pit'):
-                if gained_overall:
-                    displaced = previous_overall_holders.get(cur_pos)
-                    eligible_overall = (displaced is None
-                                        or not in_pit_now.get(displaced, False))
-                if gained_class:
-                    displaced = previous_class_holders.get((
-                        car.get('car_class', 'Unclassed'), cur_cls_pos))
-                    eligible_class = (displaced is None
-                                      or not in_pit_now.get(displaced, False))
-            if eligible_overall or eligible_class:
+                eligible_overall = self._passed_car_on_track(
+                    cid, prev_pos, cur_pos,
+                    previous_overall_holders, current_positions, in_pit_now)
+                cls = car.get('car_class', 'Unclassed')
+                class_holders = {
+                    position: holder
+                    for (holder_class, position), holder
+                    in previous_class_holders.items()
+                    if holder_class == cls
+                }
+                eligible_class = self._passed_car_on_track(
+                    cid, prev_cls_pos, cur_cls_pos,
+                    class_holders, current_class_positions, in_pit_now)
+            if eligible_class:
+                self.class_position_change_seen[cid] = now
+            elif eligible_overall:
                 self.position_change_seen[cid] = now
 
             # Fast lap (personal best)
@@ -236,6 +244,16 @@ class AutoDirector:
                 score = pc_score
             if reason not in ('rollover', 'collision'):
                 reason = 'overtake'
+
+        # --- Class position change ---
+        cpc_time = self.class_position_change_seen.get(cid)
+        if cpc_time and now - cpc_time < 5.0:
+            cpc_score = 70 * (1.0 - (now - cpc_time) / 5.0)
+            parts['class_overtake'] = cpc_score
+            if cpc_score > score:
+                score = cpc_score
+            if reason not in ('rollover', 'collision'):
+                reason = 'class_overtake'
 
         # --- Class battle (same class, tight interval) ---
         cls_int = self._nearest_battle_gap(
@@ -316,7 +334,11 @@ class AutoDirector:
             return None
 
         scores.sort(
-            key=lambda x: (self._incident_priority(x[3]), x[1]),
+            key=lambda x: (
+                self._incident_priority(x[3]),
+                self._interest_priority(x[3]),
+                x[1],
+            ),
             reverse=True,
         )
         best_car, best_score, best_reason, best_parts = scores[0]
@@ -499,9 +521,9 @@ class AutoDirector:
         dwell_map = {
             'rollover': INCIDENT_COVERAGE_S,
             'collision': INCIDENT_COVERAGE_S,
-            'overtake': 5,
-            'class_overtake': 5,
-            'class_battle': 10,    # was 6 — protect battles
+            'overtake': 10,
+            'class_overtake': 10,
+            'class_battle': 15,
             'battle': 10,          # was 6 — protect battles
             'fast_lap': 5,
             'leader': 8,           # rarely reached now (no unconditional bonus)
@@ -520,6 +542,35 @@ class AutoDirector:
         if parts.get('collision', 0) > 0:
             return INCIDENT_PRIORITY['collision']
         return 0
+
+    @staticmethod
+    def _interest_priority(parts):
+        """Keep class racing ahead of cross-class position changes."""
+        if parts.get('class_overtake', 0) > 0:
+            return 3
+        if parts.get('class_battle', 0) > 0:
+            return 2
+        if parts.get('overtake', 0) > 0:
+            return 1
+        return 0
+
+    @staticmethod
+    def _passed_car_on_track(car_id, previous_position, current_position,
+                             previous_holders, current_positions, in_pit_now):
+        """True only when a formerly-ahead car is now behind on track."""
+        if (previous_position is None or current_position is None
+                or current_position >= previous_position):
+            return False
+        for position in range(current_position, previous_position):
+            passed_id = previous_holders.get(position)
+            passed_position = current_positions.get(passed_id)
+            if (passed_id is not None
+                    and passed_id != car_id
+                    and not in_pit_now.get(passed_id, False)
+                    and passed_position is not None
+                    and passed_position > current_position):
+                return True
+        return False
 
     @staticmethod
     def _nearest_battle_gap(car, prefix, legacy_key):

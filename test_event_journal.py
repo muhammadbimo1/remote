@@ -1,12 +1,14 @@
 import json
 import os
 import shutil
+import struct
 import tempfile
 import unittest
 from datetime import datetime
 
 from event_journal import (EventJournal, find_session_replay, parse_replay_name,
-                           match_replay)
+                           match_replay, read_replay_header,
+                           remap_replay_records)
 
 
 def event(**kw):
@@ -170,6 +172,72 @@ class ReplayNameTest(unittest.TestCase):
                 self.assertIsNone(parse_replay_name(name))
 
 
+class ReplayHeaderTest(unittest.TestCase):
+    def test_reads_recording_cursor_and_frame_count_without_loading_file(self):
+        handle, path = tempfile.mkstemp(suffix='.acreplay')
+        os.close(handle)
+        self.addCleanup(os.remove, path)
+        with open(path, 'wb') as fh:
+            fh.write(struct.pack('<Id', 16, 60.0))
+            for value in ('weather', 'track', 'layout'):
+                encoded = value.encode('utf-8')
+                fh.write(struct.pack('<I', len(encoded)))
+                fh.write(encoded)
+            fh.write(struct.pack('<IIII', 48, 115418, 306372, 0))
+
+        header = read_replay_header(path)
+
+        self.assertEqual(header, {
+            'version': 16,
+            'frame_ms': 60.0,
+            'recording_index': 115418,
+            'frames': 306372,
+        })
+
+    def test_invalid_replay_header_returns_none(self):
+        handle, path = tempfile.mkstemp(suffix='.acreplay')
+        os.close(handle)
+        self.addCleanup(os.remove, path)
+        with open(path, 'wb') as fh:
+            fh.write(b'not a replay')
+
+        self.assertIsNone(read_replay_header(path))
+
+
+class ReplayRecordRemapTest(unittest.TestCase):
+    def test_wrapped_replay_drops_overwritten_events_and_maps_both_sides(self):
+        records = [
+            {'t': 1.0, 'replay_frame': 20, 'session_s': 20.0,
+             'time_remaining_ms': 90000.0},
+            {'t': 2.0, 'replay_frame': 40, 'session_s': 40.0,
+             'time_remaining_ms': 70000.0},
+            {'t': 3.0, 'replay_frame': 90, 'session_s': 90.0,
+             'time_remaining_ms': 20000.0},
+            {'t': 4.0, 'replay_frame': 100, 'session_s': 100.0,
+             'time_remaining_ms': 10000.0},
+            {'t': 5.0, 'replay_frame': 100, 'session_s': 100.0,
+             'time_remaining_ms': -10000.0},
+        ]
+
+        mapped = remap_replay_records(records, 100, 1000.0, 30)
+
+        self.assertEqual([record['replay_frame'] for record in mapped],
+                         [10, 60, 70, 90])
+        self.assertEqual([record['session_s'] for record in mapped],
+                         [10.0, 60.0, 70.0, 90.0])
+        self.assertEqual(records[1]['replay_frame'], 40)
+
+    def test_non_wrapped_replay_preserves_valid_frames(self):
+        records = [
+            {'replay_frame': 10, 'session_s': 1.0},
+            {'replay_frame': 100, 'session_s': 10.0},
+        ]
+
+        mapped = remap_replay_records(records, 100, 100.0, 100)
+
+        self.assertEqual([record['replay_frame'] for record in mapped], [10])
+
+
 class FindSessionReplayTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -268,6 +336,7 @@ class JournalReadbackTest(unittest.TestCase):
     def test_list_and_load_round_trip(self):
         self._write_file('AC_080826-212044_R_car_track.jsonl', [
             {'t': 100.0, 'kind': 'collision', 'label': 'HIT', 'driver': 'A',
+             'session': 'Race 2', 'session_index': 1,
              'session_s': 10.0, 'replay_frame': 400, 'replay_frame_ms': 25.0},
             {'t': 200.0, 'kind': 'overtake', 'label': 'OVT', 'driver': 'B',
              'session_s': 60.0, 'replay_frame': 2400, 'replay_frame_ms': 25.0},
@@ -281,8 +350,12 @@ class JournalReadbackTest(unittest.TestCase):
         self.assertEqual(s['first_t'], 100.0)
         self.assertEqual(s['last_t'], 200.0)
         self.assertEqual(s['duration_s'], 60.0)
+        self.assertEqual(s['first_replay_frame'], 400)
+        self.assertEqual(s['last_replay_frame'], 2400)
         self.assertEqual(s['max_replay_frame'], 2400)
         self.assertEqual(s['replay_frame_ms'], 25.0)
+        self.assertEqual(s['session'], 'Race 2')
+        self.assertEqual(s['session_index'], 1)
 
         loaded = self.journal.load('AC_080826-212044_R_car_track.jsonl')
         self.assertEqual(len(loaded), 2)
@@ -358,6 +431,47 @@ class MatchReplayTest(unittest.TestCase):
 
         self.assertEqual(confidence, 'fingerprint')
         self.assertEqual(session['file'], 'events-1.jsonl')
+
+    def test_saved_replay_matches_and_groups_continuous_journal_fragments(self):
+        saved_at = datetime(2026, 9, 19, 21, 0, 36).timestamp()
+        common = {'session': 'Race 2', 'session_index': 1,
+                  'replay_frame_ms': 60.0}
+        self._write_file('events-part-1.jsonl', [
+            dict(common, t=saved_at - 600, replay_frame=100),
+            dict(common, t=saved_at - 400, replay_frame=200),
+        ])
+        self._write_file('events-part-2.jsonl', [
+            dict(common, t=saved_at - 300, replay_frame=250),
+            dict(common, t=saved_at - 4, replay_frame=400),
+        ])
+        self._write_file('events-next-run.jsonl', [
+            dict(common, t=saved_at + 360, replay_frame=10),
+        ])
+
+        session, confidence = match_replay(
+            'C:/replay/AC_190926-210036_R_car_track.acreplay',
+            400, 60.0, self.journal.list_sessions())
+
+        self.assertEqual(confidence, 'timeline')
+        self.assertEqual(session['files'], [
+            'events-part-1.jsonl', 'events-part-2.jsonl'])
+
+    def test_saved_replay_timeline_match_allows_a_late_event_gap(self):
+        saved_at = datetime(2026, 9, 20, 2, 9, 24).timestamp()
+        self._write_file('AC_190926-212612_R_car_track.jsonl', [{
+            't': saved_at - 33, 'session': 'Race 2', 'session_index': 1,
+            'session_s': 16919.22, 'replay_frame': 281987,
+            'replay_frame_ms': 60.0,
+            'replay_file': 'AC_190926-212612_R_car_track.acreplay',
+        }])
+
+        session, confidence = match_replay(
+            'C:/replay/AC_200926-020924_R_car_track.acreplay',
+            282542, 60.0, self.journal.list_sessions())
+
+        self.assertEqual(confidence, 'timeline')
+        self.assertEqual(session['files'], [
+            'AC_190926-212612_R_car_track.jsonl'])
 
     def test_nothing_close_enough_matches_nothing(self):
         self._write_file('events-1.jsonl', [{'t': 1.0, 'session_s': 3600.0}])

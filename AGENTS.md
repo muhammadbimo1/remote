@@ -95,10 +95,12 @@ button. `event_journal.py` is the **permanent record**, one JSONL file per AC se
 AC records one `.acreplay` per session under `replay/temp`, created at session start (its
 `CreationTime` equals the timestamp in the name) and grown live, named
 `AC_DDMMYY-HHMMSS_<S>_<car>_<track>.acreplay` with `S` being `O` (practice/other), `Q` or `R`.
-`find_session_replay()` matches on **that filename timestamp**, never on file mtime — the file is
-still being written, so its mtime tracks now, not the session. The journal then takes the replay's
-stem as its own filename, and each record repeats `replay_file` in case the replay is renamed on
-its way out of `temp`. Hand-saved replays have arbitrary names, don't parse, and are never matched.
+`find_session_replay()` matches the live temp file on **that filename timestamp**, never on file
+mtime — the file is still being written, so its mtime tracks now, not the session. The journal then
+takes the temp replay's stem as its own filename. When AC saves the replay out of `temp`, it gives
+the copy a new timestamp for the save time. Saved-replay review therefore groups continuous
+journal fragments and matches the saved timestamp plus loaded frame count. Hand-saved replays
+have arbitrary names and use exact-name or duration matching only.
 
 Session start is estimated as `now - replay_frames * replay_frame_ms`, so the pairing still works
 when the server is started mid-session. No match within `REPLAY_MATCH_TOLERANCE_S` leaves the
@@ -109,6 +111,13 @@ instant) and `replay_frame`. The latter two are only trustworthy while the insta
 has not wrapped — after a wrap the saved replay no longer starts at frame 0 and both offsets
 shift. Wall clock is the anchor that never moves. Context keys are omitted rather than written as
 `null` when AC reports nothing.
+
+The saved `.acreplay` header carries `currentRecordingIndex` immediately before `numFrames`. When
+`currentRecordingIndex < numFrames`, AC's circular buffer wrapped: frames below that cursor were
+overwritten, retained pre-wrap frames shift left by the cursor, and live `sim.replayFrames` stays
+pinned at `numFrames` for later events. Saved-replay review reconstructs those later positions from
+the last unsaturated frame plus `time_remaining_ms`; do not treat every saturated event as the end
+frame or discard the recording cursor.
 
 While `is_replay` is set, car data comes from the replay frame on screen, not the race: the
 server freezes the driver list at the last live payload, suspends the auto-director, skips event

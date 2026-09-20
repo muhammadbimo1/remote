@@ -91,11 +91,11 @@ class AutoDirectorOvertakeEligibilityTest(unittest.TestCase):
 
         self.assertNotIn(1, self.director.position_change_seen)
 
-    def test_genuine_race_pass_is_an_overtake(self):
+    def test_genuine_class_pass_is_a_class_overtake(self):
         self._tick([make_car(0, 1), make_car(1, 2)], 1.0, is_race=True)
         self._tick([make_car(1, 1), make_car(0, 2)], 2.0, is_race=True)
 
-        self.assertEqual(self.director.position_change_seen.get(1), 2.0)
+        self.assertEqual(self.director.class_position_change_seen.get(1), 2.0)
 
 
 class AutoDirectorIncidentCoverageTest(unittest.TestCase):

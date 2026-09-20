@@ -20,7 +20,8 @@ from ac_ipc import (
 )
 from auto_director import AutoDirector
 from event_log import EventLog
-from event_journal import EventJournal, match_replay
+from event_journal import (EventJournal, match_replay, read_replay_header,
+                           remap_replay_records)
 from broadcast_highlight import (
     BroadcastHighlightClient,
     HighlightConfigError,
@@ -399,8 +400,9 @@ def compute_gaps(telem):
         by_class[car['car_class']].append(car)
 
     for cls_name, cls_cars in by_class.items():
-        # Already sorted by overall position; within a class, sort by total_progress descending
-        cls_cars.sort(key=lambda c: c['total_progress'], reverse=True)
+        # Preserve corrected overall race order. Re-sorting by total progress
+        # creates phantom swaps at the finish line while timetable lap counts
+        # lag behind the live spline position.
         for idx, car in enumerate(cls_cars):
             car['class_position'] = idx + 1
             if idx == 0:
@@ -668,12 +670,26 @@ def enter_review(replay_file, telem):
                                        telem.replay_frame_ms, sessions)
     events = []
     if session is not None:
-        records = event_journal.load(session['file']) or []
+        records = []
+        for filename in session.get('files') or [session['file']]:
+            records.extend(event_journal.load(filename) or [])
+        records.sort(key=lambda record: record.get('t', 0))
         frame_ms = session.get('replay_frame_ms')
-        events = [_review_event_from_record(r, i + 1, frame_ms)
-                  for i, r in enumerate(records)]
+        header = read_replay_header(replay_file)
+        recording_index = telem.replay_frames
+        if header and header['frames'] == telem.replay_frames and \
+                abs(header['frame_ms'] - telem.replay_frame_ms) < 0.001:
+            recording_index = header['recording_index']
+        records = remap_replay_records(
+            records, telem.replay_frames, telem.replay_frame_ms,
+            recording_index)
+        for record in records:
+            event = _review_event_from_record(record, len(events) + 1,
+                                              frame_ms)
+            events.append(event)
         print('[remote_web] replay review: {} ({}) - {} events'.format(
-            session['file'], confidence, len(events)))
+            ', '.join(session.get('files') or [session['file']]),
+            confidence, len(events)))
     else:
         print('[remote_web] replay review: no journal matches {}'.format(
             replay_file))
