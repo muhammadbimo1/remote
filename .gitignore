@@ -18,3 +18,5 @@ croco_broadcast_remote_v0.8.zip
 __pycache__/remote_web.cpython-314.pyc
 __pycache__/test_auto_director.cpython-314.pyc
 __pycache__/test_remote_web.cpython-314.pyc
+vod/
+clips_part2/

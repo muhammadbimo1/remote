@@ -19,6 +19,16 @@ from other devices on the same network at `http://<race-rig-ip>:5000`.
 The Lua WebSocket reconnects automatically if the Python server is restarted.
 The Python server accepts a replacement connection if the Lua app is reloaded.
 
+## Event journal clip exporter
+
+`clip_event_journal.py` creates fixed-length MP4 clips directly from permanent
+event-journal JSONL records. It supports separate video and audio VOD files,
+VOD offsets, pre-event context, exact driver filtering, overtake filtering,
+dry runs, resumable output, and NVENC or `libx264` encoding.
+
+See [Event journal clip exporter](CLIP_EVENT_JOURNAL.md) for setup, timestamp
+alignment, command examples, all options, and troubleshooting.
+
 ## Independent PiP
 
 Each eligible driver card in the web panel has a **PiP** button. Selecting it
