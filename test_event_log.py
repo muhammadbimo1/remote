@@ -41,12 +41,24 @@ class CollisionTest(unittest.TestCase):
         self.assertEqual(events[0]['label'], 'HIT')
         self.assertEqual(events[0]['car_id'], 0)
 
-    def test_sustained_collision_is_gated_by_cooldown(self):
+    def test_sustained_hit_logs_only_once(self):
         self.log.observe([car(0, 1, is_colliding=1)])
         self.clock.advance(0.1)
         self.assertEqual(self.log.observe([car(0, 1, is_colliding=1)]), [])
 
         self.clock.advance(EventLog.COOLDOWN_S)
+        self.assertEqual(self.log.observe([car(0, 1, is_colliding=1)]), [])
+
+    def test_recovery_rearms_hit_event(self):
+        self.log.observe([car(0, 1, is_colliding=1)])
+        self.clock.advance(1)
+        self.log.observe([car(0, 1, is_colliding=0)])
+        events = self.log.observe([car(0, 1, is_colliding=1)])
+        self.assertEqual(len(events), 1)
+
+    def test_clear_rearms_hit_event(self):
+        self.log.observe([car(0, 1, is_colliding=1)])
+        self.log.clear()
         self.assertEqual(len(self.log.observe([car(0, 1, is_colliding=1)])), 1)
 
     def test_disconnected_cars_are_ignored(self):
@@ -73,7 +85,7 @@ class RolloverTest(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]['kind'], 'rollover')
 
-        # Still flipped many ticks later — one incident, one event.
+        # Still flipped many ticks later â€” one incident, one event.
         for _ in range(5):
             self.clock.advance(2.0)
             self.assertEqual(self.log.observe([car(0, 1, is_rolled_over=1)]), [])
@@ -117,7 +129,7 @@ class OvertakeTest(unittest.TestCase):
 
     def test_overtakes_can_be_switched_off(self):
         # Practice/qualifying: a position gain is timing-screen shuffling,
-        # not a pass — but contact still matters.
+        # not a pass â€” but contact still matters.
         self.log.observe([car(0, 1), car(1, 2)], detect_overtakes=False)
         self.clock.advance(1.0)
         events = self.log.observe(

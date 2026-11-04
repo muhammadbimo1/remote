@@ -250,6 +250,7 @@ body {
    --------------------------------------------------------------------------- */
 .replay-bar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: var(--space-2);
     flex-shrink: 0;
@@ -261,6 +262,19 @@ body {
     padding: 5px 8px 7px;
     border-radius: var(--radius-sm);
     text-align: center;
+}
+
+.mark-back-control {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--type-small);
+    color: var(--ink-dim);
+}
+
+#mark-back {
+    width: 64px;
+    padding: 4px;
 }
 
 #live-btn[aria-pressed="true"] {
@@ -598,12 +612,13 @@ body {
     border-color: var(--amber-100);
 }
 
-/* Collision: the loudest state the system allows. The whole card snaps to
+/* HIT: the whole card snaps to
    inverse video and blinks. Per the framework, the inverse fill is what keeps
    this readable as an alarm when prefers-reduced-motion kills the blink — no
    extra rule needed. Redefining the ink/stroke/fill tokens on the card inverts
    its entire subtree, badges included, in one place. */
 .driver-item.colliding {
+    animation-duration: 0.3s;
     background: var(--rm-fill);
     border-color: var(--rm-fill);
     color: var(--rm-on-fill);

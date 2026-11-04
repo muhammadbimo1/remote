@@ -12,6 +12,80 @@ import remote_web
 from remote_web import build_update_data
 
 
+class MarkRewindTest(unittest.TestCase):
+    def test_backdated_mark_orders_by_event_time_and_expires(self):
+        from event_log import EventLog
+        log = EventLog(clock=lambda: 1000.0)
+        log.window_s = 60.0
+        recent = log.mark(0)
+        earlier = log.mark(1, back_s=10.0)
+        self.assertEqual([ev['id'] for ev in log.snapshot()],
+                         [recent['id'], earlier['id']])
+        expired = log.mark(2, back_s=90.0)
+        self.assertIsNone(log.get(expired['id']))
+        self.assertIsNotNone(log.get(recent['id']))
+
+    def test_backdated_mark_cooldown_uses_press_time(self):
+        from event_log import EventLog
+        log = EventLog(clock=lambda: 1000.0)
+        log.mark(0, back_s=10.0)
+        self.assertIsNone(log.mark(0, back_s=0.0))
+
+    def test_mark_offset_survives_journal_and_saved_replay(self):
+        import tempfile
+        from event_log import EventLog
+        from event_journal import EventJournal
+
+        log = EventLog(clock=lambda: 1000.0)
+        with tempfile.TemporaryDirectory() as directory:
+            journal = EventJournal(directory)
+            with patch.object(remote_web, 'event_log', log), \
+                    patch.object(remote_web, 'event_journal', journal), \
+                    patch.object(remote_web.ac_transport, 'is_connected', return_value=True), \
+                    patch.object(remote_web, 'journal_context', return_value={
+                        'replay_frame': 4000, 'replay_frame_ms': 25.0,
+                        'session_s': 100.0}), \
+                    patch.object(remote_web, 'emit'):
+                remote_web.handle_mark_event({'preroll_s': 12.5})
+            self.assertEqual(log.snapshot()[0]['t'], 987.5)
+            self.assertEqual(log.snapshot()[0]['age'], 12.5)
+            with open(journal.path, encoding='utf-8') as fh:
+                record = json.loads(fh.readline())
+            event = remote_web._review_event_from_record(record, 1, 25.0)
+            self.assertEqual(record['t'], 987.5)
+            self.assertEqual(record['session_s'], 87.5)
+            self.assertEqual(event['frame'], 3500)
+            self.assertEqual(event['seek_frame'], 3500)
+
+    def test_live_mark_jump_uses_its_offset_plus_elapsed_time(self):
+        from event_log import EventLog
+        log = EventLog(clock=lambda: 1000.0)
+        with patch.object(remote_web, 'event_log', log), \
+                patch.object(remote_web.ac_transport, 'is_connected', return_value=True), \
+                patch.object(remote_web, 'record_event'), \
+                patch.object(remote_web, 'review_journal', None), \
+                patch.object(remote_web.director, 'enabled', False), \
+                patch.object(remote_web.time, 'time', return_value=1020.0), \
+                patch.object(remote_web, 'send_replay_command', return_value=True) as send, \
+                patch.object(remote_web, 'emit'):
+            remote_web.handle_mark_event({'preroll_s': 12.5})
+            remote_web.handle_jump_to_event({'id': log.snapshot()[0]['id']})
+        self.assertEqual(send.call_args.kwargs['rewind_s'], 32.5)
+
+    def test_invalid_mark_offsets_are_rejected(self):
+        from event_log import EventLog
+        for value in (-1, 121, float('nan'), float('inf'), True, 'bad'):
+            with self.subTest(value=value):
+                log = EventLog(clock=lambda: 1000.0)
+                with patch.object(remote_web, 'event_log', log), \
+                        patch.object(remote_web.ac_transport, 'is_connected', return_value=True), \
+                        patch.object(remote_web, 'record_event'), \
+                        patch.object(remote_web, 'emit') as emit:
+                    remote_web.handle_mark_event({'preroll_s': value})
+                self.assertEqual(log.snapshot(), [])
+                self.assertFalse(emit.call_args.args[1]['ok'])
+
+
 class CarFixture(object):
     def __init__(self):
         self.car_id = 0
@@ -122,6 +196,15 @@ class TimetableStatusMarkupTest(unittest.TestCase):
 class ControlLayoutMarkupTest(unittest.TestCase):
     def setUp(self):
         self.html = remote_web.app.test_client().get('/').get_data(as_text=True)
+
+    def test_bumper_camera_can_be_selected(self):
+        self.assertRegex(self.html, r'<button[^>]*data-cam="6"[^>]*>Bumper</button>')
+        with patch.object(remote_web, 'send_command') as send:
+            response = remote_web.app.test_client().post('/', data={
+                'action': 'change_camera', 'camera': '6',
+            })
+        self.assertEqual(response.status_code, 204)
+        send.assert_called_once_with(remote_web.latest_focused_car, 6, -1)
 
     def test_f6_subcamera_controls_follow_camera_mode_controls(self):
         camera_modes = self.html.index('class="control-bar"')

@@ -21,7 +21,7 @@ Each Python process creates a new `connection_id` and includes it in camera and 
 
 Only `/ac-ipc` is restricted to the actual loopback peer (`127.0.0.1` or `::1`); never use forwarded headers for that decision. The rest of port 5000 must remain reachable from other devices on the same network. CSP is the WebSocket client and Python is the server. Telemetry is stale after 2 seconds, and either side must recover when the other restarts.
 
-Camera IDs use a custom 1-5 numbering (Track, Cockpit, Helicopter, Car/F6, Free) mapped to/from `ac.CameraMode` enums in Lua.
+Camera IDs use a custom 1-6 numbering (Track, Cockpit, Helicopter, Car/F6, Free, Bumper) mapped to/from `ac.CameraMode` enums in Lua. Bumper uses `ac.CameraMode.Drivable` with `ac.DrivableCamera.Bumper`; telemetry distinguishes it using `sim.driveableCameraMode`.
 
 ### Action Replay
 

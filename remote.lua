@@ -271,16 +271,40 @@ ac.onSessionStart(function(sessionIndex, restarted)
     sessionIndex, tostring(restarted), sessionGen))
 end)
 
--- Collision flags: consumed (and reset) by telemetry writer.
--- Callback fires reliably only for the local car; damage-array deltas
--- cover remote cars since damage state is replicated online.
--- Severity gate: kerb hits and wall brushes trigger the callback/damage
--- without any real impact, so we require a minimum speed drop in the
--- same tick before reporting a collision.
-local COLLISION_SPEED_DROP_KMH = 12
-local collisionFlags = {}
-local prevDamageSum = {}
-local prevSpeedKmh = {}
+-- Follow CostOfRacing's contact signal: a positive collisionDepth means the
+-- focused car is touching another body or the track. Capture it every frame so
+-- brief contacts survive the slower telemetry cadence.
+local hitCar = nil
+local hitActive = false
+local hitPending = false
+
+local function resetHitDetection()
+  hitCar = nil
+  hitActive = false
+  hitPending = false
+end
+
+local function updateHitDetection()
+  local cid = sim.focusedCar
+  if cid ~= hitCar then
+    resetHitDetection()
+    hitCar = cid
+  end
+  local car = ac.getCar(cid)
+  if sim.isReplayActive or sim.isReplayOnlyMode
+      or sim.timeToSessionStart >= -5000
+      or car == nil or not car.isConnected
+      or car.isInPit or car.isInPitlane then
+    resetHitDetection()
+    return
+  end
+  if (car.collisionDepth or 0) > 0 then
+    hitPending = true
+    hitActive = true
+  else
+    hitActive = false
+  end
+end
 
 -- Rollover detection: car.up.y < 0.5 means chassis is tilted > 60° from
 -- vertical (cos(60°) = 0.5). Asymmetric thresholds + a hold counter
@@ -290,14 +314,6 @@ local ROLLOVER_UP_Y_EXIT  = 0.6   -- cos(~53°)
 local ROLLOVER_HOLD_TICKS = 2     -- ~200ms at 10 Hz telemetry
 local rolloverState = {}
 local rolloverTickCount = {}
-
-ac.onCarCollision(-1, function(carIndex)
-  collisionFlags[carIndex] = true
-end)
-
--- A replay start/stop/jump teleports every car, which produces speed and damage
--- deltas large enough to trip the collision and rollover heuristics above. Drop
--- the previous-tick baselines so the next tick starts clean.
 
 
 -- Cached driver data for the UI (rebuilt each telemetry tick)
@@ -313,6 +329,7 @@ local CUSTOM_TO_CSP = {
   [3] = ac.CameraMode.Helicopter,
   [4] = ac.CameraMode.Car,
   [5] = ac.CameraMode.OnBoardFree,
+  [6] = ac.CameraMode.Drivable,
 }
 
 local CSP_TO_CUSTOM = {
@@ -331,6 +348,10 @@ local CAMERA_NAMES = {
 }
 
 local function cspCameraToCustom(mode)
+  if mode == ac.CameraMode.Drivable
+      and sim.driveableCameraMode == ac.DrivableCamera.Bumper then
+    return 6
+  end
   return CSP_TO_CUSTOM[mode] or 0
 end
 
@@ -362,6 +383,9 @@ local function changeCamera(cam, carIndex, subCam)
     end
   elseif cam == 5 then
     ac.setCurrentCamera(ac.CameraMode.OnBoardFree)
+  elseif cam == 6 then
+    ac.setCurrentCamera(ac.CameraMode.Drivable)
+    ac.setCurrentDrivableCamera(ac.DrivableCamera.Bumper)
   end
 end
 
@@ -662,16 +686,13 @@ end
 ac.onRelease(restoreObsHudWindows)
 
 ac.onReplay(function(event)
+  resetHitDetection()
   ac.log('Replay event: ' .. tostring(event))
   -- Every AC-side transition re-arms the settle window, so a command arriving
   -- mid-transition is ignored rather than stacked on top of it.
   replayBusyUntil = math.max(replayBusyUntil, os.preciseClock() + REPLAY_SETTLE_S)
 
-  -- A replay start/stop/jump teleports every car, which produces speed and
-  -- damage deltas large enough to trip the collision and rollover heuristics.
-  collisionFlags = {}
-  prevDamageSum = {}
-  prevSpeedKmh = {}
+  -- A replay start/stop/jump teleports cars: restart rollover hold counters.
   rolloverState = {}
   rolloverTickCount = {}
 
@@ -902,14 +923,7 @@ local function updateTelemetry()
   for i = 0, carCount - 1 do
     local car = ac.getCar(i)
     local position, lapCount = correctedStandings(i, car)
-    local dmgSum = car.damage[0] + car.damage[1] + car.damage[2] + car.damage[3] + car.damage[4]
-    local dmgJumped = prevDamageSum[i] ~= nil and dmgSum > prevDamageSum[i] + 0.01
-    prevDamageSum[i] = dmgSum
-    local speedDrop = prevSpeedKmh[i] and (prevSpeedKmh[i] - car.speedKmh) or 0
-    prevSpeedKmh[i] = car.speedKmh
-    local hardImpact = speedDrop >= COLLISION_SPEED_DROP_KMH
-    local isColliding = ((collisionFlags[i] or dmgJumped) and hardImpact) == true
-    collisionFlags[i] = false
+    local isHit = i == hitCar and (hitActive or hitPending)
 
     local upY = car.up.y
     local threshold = rolloverState[i] and ROLLOVER_UP_Y_EXIT or ROLLOVER_UP_Y_ENTER
@@ -936,13 +950,14 @@ local function updateTelemetry()
       car_cameras_count = car.carCamerasCount,
       is_in_pit = car.isInPitlane == true,
       is_connected = car.isConnected == true,
-      is_colliding = isColliding,
+      is_colliding = isHit,
       is_rolled_over = rolledOver,
       driver_name = car:driverName() or '',
       team_name = ac.getDriverTeam(i) or '',
     }
   end
 
+  hitPending = false
   packetID = packetID + 1
   local payload = {
     version = PROTOCOL_VERSION,
@@ -995,6 +1010,7 @@ function script.update(dt)
   processPiPCommands()
   syncPiPWindow()
   syncLeaderboard()
+  updateHitDetection()
   pollTimetable()
 
   updateAccum = updateAccum + dt
@@ -1052,108 +1068,55 @@ function renderStinger()
 end
 
 local COLOR_FOCUSED = rgbm(0.2, 0.6, 1.0, 1.0)
-local COLOR_PIT     = rgbm(1.0, 0.7, 0.2, 1.0)
 local COLOR_OFFLINE = rgbm(0.5, 0.5, 0.5, 1.0)
 local COLOR_DEFAULT = rgbm(1.0, 1.0, 1.0, 1.0)
 local COLOR_DIM     = rgbm(0.6, 0.6, 0.6, 1.0)
 
-local CAMERA_LABELS = { 'Track', 'Cockpit', 'Heli', 'F6', 'Orbit' }
+local COLOR_ROW_FOCUSED = rgbm(0.16, 0.22, 0.28, 1.0)
+
+local function drawDriverColumns(pos, width, height, position, name, interval, color)
+  local nameX = pos.x + 28
+  local intervalX = pos.x + width - 58
+  ui.drawTextClipped(position, pos, vec2(nameX - 4, pos.y + height),
+    COLOR_DIM, vec2(0, 0.5))
+  ui.drawTextClipped(name, vec2(nameX, pos.y), vec2(intervalX - 4, pos.y + height),
+    color, vec2(0, 0.5), true)
+  ui.drawTextClipped(interval, vec2(intervalX, pos.y), vec2(pos.x + width, pos.y + height),
+    color, vec2(1, 0.5))
+end
 
 function script.windowMain(dt)
   local focusedCar = sim.focusedCar
 
-  -- Status line
   ui.pushFont(ui.Font.Small)
-  ui.textColored(
-    string.format('Focused: #%d  |  Camera: %s', focusedCar, getCameraName(sim.cameraMode)),
-    rgbm(0.7, 0.9, 1.0, 1.0)
-  )
-  ui.popFont()
+  ui.pushStyleVar(ui.StyleVar.ItemSpacing, vec2(0, 0))
+  local rowHeight = math.max(20, ui.measureText('Ag').y + 4)
 
-  ui.offsetCursorY(4)
-
-  -- Camera buttons
-  local btnW = math.floor((ui.availableSpaceX() - 4 * 4) / 5)
-  for i = 1, 5 do
-    if i > 1 then ui.sameLine(0, 4) end
-    if ui.button(CAMERA_LABELS[i], vec2(btnW, 28)) then
-      changeCamera(i, focusedCar, -1)
-    end
-  end
-
-  ui.offsetCursorY(6)
-  ui.separator()
-  ui.offsetCursorY(4)
-
-  -- Column headers
-  ui.pushFont(ui.Font.Small)
-  ui.textColored('P', COLOR_DIM) ui.sameLine(24)
-  ui.textColored('Driver', COLOR_DIM) ui.sameLine(180)
-  ui.textColored('Gap', COLOR_DIM) ui.sameLine(250)
-  ui.textColored('Int', COLOR_DIM)
-  ui.popFont()
-  ui.offsetCursorY(2)
-
-  -- Driver list (scrollable)
+  -- Keep all three columns aligned even when the list needs a scrollbar.
   ui.beginChild('drivers', vec2(0, 0), false, ui.WindowFlags.None)
+  local width = ui.availableSpaceX()
+  drawDriverColumns(ui.getCursor(), width, rowHeight, 'P', 'Driver', 'Int', COLOR_DIM)
+  ui.dummy(vec2(width, rowHeight))
 
   for _, d in ipairs(driverRows) do
     local isFocused = d.carId == focusedCar
-    local statusText = ''
-    local nameColor = COLOR_DEFAULT
-
-    if not d.isConnected then
-      statusText = 'OFF'
-      nameColor = COLOR_OFFLINE
-    elseif d.isInPit then
-      statusText = 'PIT'
-      nameColor = COLOR_PIT
-    end
-
-    if isFocused then
-      nameColor = COLOR_FOCUSED
-    end
-
-    -- Position
-    ui.text(tostring(d.position))
-    ui.sameLine(24)
-
-    -- Name + status
-    ui.textColored(d.name, nameColor)
-    if statusText ~= '' then
-      ui.sameLine()
-      ui.pushFont(ui.Font.Small)
-      ui.textColored(statusText, nameColor)
-      ui.popFont()
-    end
-    ui.sameLine(180)
-
-    -- Gap
-    ui.pushFont(ui.Font.Small)
-    ui.text(d.gap or '')
-    ui.popFont()
-    ui.sameLine(250)
-
-    -- Interval
-    ui.pushFont(ui.Font.Small)
-    ui.text(d.interval or '')
-    ui.popFont()
-
-    -- Select button
-    ui.sameLine(310)
-    local disabled = isFocused or not d.isConnected
-    if disabled then
-      ui.pushStyleVar(ui.StyleVar.Alpha, 0.3)
-    end
-    if ui.button('Sel##' .. d.carId, vec2(50, 0)) and not disabled then
+    local color = isFocused and COLOR_FOCUSED
+      or (d.isConnected and COLOR_DEFAULT or COLOR_OFFLINE)
+    local pos = ui.getCursor()
+    if ui.invisibleButton('driver##' .. d.carId, vec2(width, rowHeight))
+        and d.isConnected and not isFocused then
       ac.focusCar(d.carId)
     end
-    if disabled then
-      ui.popStyleVar()
+    if isFocused then
+      ui.drawRectFilled(pos, vec2(pos.x + width, pos.y + rowHeight), COLOR_ROW_FOCUSED)
     end
+    drawDriverColumns(pos, width, rowHeight, tostring(d.position), d.name,
+      d.interval or '', color)
   end
 
   ui.endChild()
+  ui.popStyleVar()
+  ui.popFont()
 end
 
 local function parsePiPDriverName(value)

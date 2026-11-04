@@ -73,6 +73,7 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     raceSessionType = 3,
     isTimedRace = true,
     sessionTimeLeft = 3723000,
+    timeToSessionStart = -6000,
     windowWidth = 1920,
     windowHeight = 1080,
   }
@@ -81,11 +82,15 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     racePosition = 1,
     splinePosition = 0.5,
     speedKmh = 120,
+    acceleration = { x = 0, y = 1, z = 0 },
+    collisionDepth = 0,
     lapTimeMs = 50000,
     bestLapTimeMs = 100000,
     previousLapTimeMs = 101000,
     lapCount = 3,
     isInPitlane = false,
+    isInPit = false,
+    wheelsOutside = 0,
     isConnected = true,
     damage = { [0] = 0, 0, 0, 0, 0 },
     up = { y = 1 },
@@ -211,6 +216,7 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
       Track = 1, Cockpit = 2, Helicopter = 3, Car = 4, OnBoardFree = 5,
       Drivable = 6, Free = 7,
     },
+    DrivableCamera = { Chase = 0, Bumper = 3 },
     SessionType = { Race = 3 },
     FolderID = { ReplaysTemp = 1 },
     INIConfig = {
@@ -291,6 +297,7 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     end,
     getCar = function() return car end,
     getSessionName = function() return 'Race' end,
+    getTrackName = function() return 'Test Track' end,
     getReplayFilename = function() return '' end,
     getFolder = function() return 'C:/AC/replay/temp' end,
     getServerIP = function() return '' end,
@@ -312,6 +319,7 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     end,
     focusCar = function(car) sim.focusedCar = car end,
     setCurrentCamera = function(camera) sim.cameraMode = camera end,
+    setCurrentDrivableCamera = function(camera) sim.driveableCameraMode = camera end,
     setCurrentCarCamera = function(camera) sim.carCameraIndex = camera end,
     setWindowOpen = function(id, opened)
       windowOpenCalls[#windowOpenCalls + 1] = { id = id, opened = opened }
@@ -555,6 +563,34 @@ local function testTelemetryUsesVersionedProtocolAtTenHertz()
     'telemetry includes each drivers onboard camera count')
   assertEqual(payload.is_timed_session, true, 'telemetry identifies timed sessions')
   assertEqual(payload.session_time_left, 3723000, 'telemetry includes remaining session milliseconds')
+end
+
+local function testBumperCameraSelectionAndTelemetry()
+  local ctx = loadRemote(false)
+  ctx.deliver({
+    version = 1, type = 'command', command_seq = 1,
+    connection_id = 'server-a',
+    target_driver = 4, target_camera = 6, target_car_camera = -1,
+  })
+  ctx.update(0.1)
+  assertEqual(ctx.sim.cameraMode, ac.CameraMode.Drivable, 'bumper uses drivable mode')
+  assertEqual(ctx.sim.driveableCameraMode, ac.DrivableCamera.Bumper,
+    'bumper selects the explicit sub-camera')
+  assertEqual(ctx.telemetryPayloads[1].current_camera, 6, 'telemetry identifies bumper')
+
+  ctx.deliver({
+    version = 1, type = 'command', command_seq = 2,
+    connection_id = 'server-a',
+    target_driver = 5, target_camera = 6, target_car_camera = -1,
+  })
+  ctx.update(0.1)
+  assertEqual(ctx.sim.focusedCar, 5, 'bumper supports changing driver')
+  assertEqual(ctx.telemetryPayloads[2].current_camera, 6, 'driver picks preserve bumper')
+
+  ctx.sim.driveableCameraMode = ac.DrivableCamera.Chase
+  ctx.update(0.1)
+  assertEqual(ctx.telemetryPayloads[3].current_camera, 2,
+    'other drivable views retain their existing mapping')
 end
 
 local function testCameraCommandsApplyOnceAndMalformedMessagesAreIgnored()
@@ -937,6 +973,66 @@ local function testSavedReplaySeekAppliesEventShot()
   assertEqual(ctx.sim.cameraMode, 1, 'a saved replay jump selects the requested camera')
 end
 
+local function testFocusedCarContactHitDetection()
+  local cases = {
+    { depth = 0.01, want = true },
+    { depth = 0, x = 8, want = false },
+    { depth = 0.01, pit = true, want = false },
+    { depth = 0.01, pitlane = true, want = false },
+    { depth = 0.01, connected = false, want = false },
+    { depth = 0.01, replay = true, want = false },
+    { depth = 0.01, replayOnly = true, want = false },
+  }
+  for _, case in ipairs(cases) do
+    local ctx = loadRemote(case.replay == true)
+    ctx.car.collisionDepth = case.depth
+    ctx.car.acceleration.x = case.x or 0
+    ctx.car.isInPit = case.pit == true
+    ctx.car.isInPitlane = case.pitlane == true
+    ctx.car.isConnected = case.connected ~= false
+    ctx.sim.isReplayOnlyMode = case.replayOnly == true
+    ctx.update(0.1)
+    assertEqual(ctx.telemetryPayloads[1].cars[1].is_colliding, case.want,
+      'HIT follows focused-car contact depth and live-session gates')
+  end
+end
+
+local function testHitCapturesBriefContactUntilTelemetry()
+  local ctx = loadRemote(false)
+  ctx.car.collisionDepth = 0.1
+  ctx.update(0.01)
+  ctx.car.collisionDepth = 0
+  ctx.update(0.091)
+  assertEqual(ctx.telemetryPayloads[1].cars[1].is_colliding, true,
+    'a one-frame contact survives until telemetry sends it')
+  ctx.update(0.1)
+  assertEqual(ctx.telemetryPayloads[2].cars[1].is_colliding, false,
+    'contact clears after its pending event is sent')
+end
+
+local function testHitBelongsOnlyToFocusedCarAndDropsOldPendingContact()
+  local ctx = loadRemote(false)
+  ctx.sim.carsCount = 2
+  ctx.sim.focusedCar = 1
+  ctx.car.collisionDepth = 0.1
+  ctx.update(0.1)
+  assertEqual(ctx.telemetryPayloads[1].cars[1].is_colliding, false,
+    'non-focused cars never inherit focused contact')
+  assertEqual(ctx.telemetryPayloads[1].cars[2].is_colliding, true,
+    'HIT is attributed to the focused car')
+  ctx.update(0.01)
+  ctx.sim.focusedCar = 0
+  ctx.car.collisionDepth = 0
+  ctx.update(0.1)
+  for _, car in ipairs(ctx.telemetryPayloads[2].cars) do
+    assertEqual(car.is_colliding, false, 'focus switches discard pending contact')
+  end
+end
+
+testFocusedCarContactHitDetection()
+testHitCapturesBriefContactUntilTelemetry()
+testHitBelongsOnlyToFocusedCarAndDropsOldPendingContact()
+
 testReplaySuppressesForwardedAppsExceptIndicator()
 testReplaySuppressesNewlyForwardedApps()
 testReplayResuppressesAWindowWithoutLosingOriginalRedirect()
@@ -952,6 +1048,7 @@ testSavedReplaySeekAppliesEventShot()
 testStingerRendersInScenePassForCleanOutput()
 testWebSocketConnectsToLoopbackWithReconnect()
 testTelemetryUsesVersionedProtocolAtTenHertz()
+testBumperCameraSelectionAndTelemetry()
 testCameraCommandsApplyOnceAndMalformedMessagesAreIgnored()
 testNewServerEpochAcceptsAResetSequence()
 testPiPCommandDoesNotChangeMainShot()

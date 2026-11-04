@@ -498,8 +498,6 @@ def build_update_data(telem, cars_with_gaps=None):
     if cars_with_gaps is None:
         cars_with_gaps = compute_gaps(telem)
     for c in cars_with_gaps:
-        if c.get('is_colliding'):
-            print('[remote_web] collision flag from car {} ({})'.format(c['car_id'], c['name']))
         cid = c['car_id']
         rolled = bool(c.get('is_rolled_over'))
         if rolled != _prev_rollover_state.get(cid, False):
@@ -570,7 +568,19 @@ def record_event(event):
     if event is None:
         return
     first = event_journal.path is None
-    event_journal.append(event, journal_context(event.get('car_id')))
+    context = journal_context(event.get('car_id'))
+    back_s = event.get('mark_back_s', 0.0)
+    if back_s:
+        if context.get('session_s') is not None:
+            context['session_s'] = max(0.0, context['session_s'] - back_s)
+        frame_ms = context.get('replay_frame_ms')
+        if frame_ms and context.get('replay_frame') is not None:
+            context['replay_frame'] = max(
+                0, context['replay_frame'] - int(round(back_s * 1000.0 / frame_ms)))
+        # Current standings cannot describe a moment before the button press.
+        for key in ('lap', 'position', 'class_position'):
+            context.pop(key, None)
+    event_journal.append(event, context)
     if first and event_journal.path:
         print('[remote_web] event journal: {} (replay: {})'.format(
             event_journal.path, event_journal.replay_file or 'unmatched'))
@@ -636,7 +646,9 @@ def _review_event_from_record(record, index, default_frame_ms):
     seek_frame = frame
     if frame is not None and frame_ms:
         lead_in_frames = int(round(
-            REPLAY_REVIEW_PREROLL_S * 1000.0 / frame_ms))
+            (record.get('preroll_s', REPLAY_REVIEW_PREROLL_S)
+             if record.get('kind') == 'mark' else REPLAY_REVIEW_PREROLL_S)
+            * 1000.0 / frame_ms))
         seek_frame = max(0, frame - lead_in_frames)
     return {
         'id': index,
@@ -1014,7 +1026,9 @@ def handle_jump_to_event(data):
         emit('replay_status', {'ok': False, 'error': 'event expired'})
         return
 
-    rewind = time.time() - event['t'] + REPLAY_PREROLL_S
+    preroll = (event.get('preroll_s', REPLAY_PREROLL_S)
+               if event['kind'] == 'mark' else REPLAY_PREROLL_S)
+    rewind = time.time() - event['t'] + preroll
     rewind = max(REPLAY_MIN_REWIND_S, min(rewind, event_log.window_s))
 
     # A jump is a manual cut: the director must not fight it on the way back.
@@ -1068,11 +1082,18 @@ def handle_go_live():
 
 
 @socketio.on('mark_event')
-def handle_mark_event():
+def handle_mark_event(data=None):
     """Drop a marker on the focused car with no detection involved."""
     if not ac_transport.is_connected():
         emit('replay_status', {
             'ok': False, 'error': 'AC telemetry is disconnected'})
+        return
+    back_s = (data.get('back_s', data.get('preroll_s', REPLAY_PREROLL_S))
+              if isinstance(data, dict) else REPLAY_PREROLL_S)
+    if (isinstance(back_s, bool) or not isinstance(back_s, (int, float))
+            or not 0 <= back_s <= 120):
+        emit('replay_status', {
+            'ok': False, 'error': 'Mark back must be between 0 and 120 seconds'})
         return
     name = ''
     if _last_live_payload:
@@ -1080,7 +1101,7 @@ def handle_mark_event():
             if d['num'] - 1 == latest_focused_car:
                 name = d.get('name', '')
                 break
-    event = event_log.mark(latest_focused_car, name=name)
+    event = event_log.mark(latest_focused_car, name=name, back_s=back_s)
     record_event(event)
     emit('events', {'events': event_log.snapshot()}, broadcast=True)
     if event:
@@ -1566,8 +1587,20 @@ def index():
                 });
                 document.getElementById('mark-btn').addEventListener('pointerdown', function(e) {
                     e.preventDefault();
-                    socket.emit('mark_event');
+                    var input = document.getElementById('mark-back');
+                    if (!input.reportValidity()) return;
+                    var seconds = Number(input.value);
+                    try { localStorage.setItem('markBackSeconds', String(seconds)); } catch (_) {}
+                    socket.emit('mark_event', { back_s: seconds });
                 });
+                try {
+                    var savedMarkBack = localStorage.getItem('markBackSeconds');
+                    if (savedMarkBack !== null && savedMarkBack.trim() !== '' &&
+                            Number.isFinite(Number(savedMarkBack)) &&
+                            Number(savedMarkBack) >= 0 && Number(savedMarkBack) <= 120) {
+                        document.getElementById('mark-back').value = savedMarkBack;
+                    }
+                } catch (_) {}
                 document.querySelector('.view-tabs').addEventListener('pointerdown', function(e) {
                     var btn = e.target.closest('button[data-view]');
                     if (btn) {
@@ -1633,6 +1666,8 @@ def index():
                 var replay = data.replay || {};
                 replayActive = !!replay.active;
                 replayUnavailable = replay.last_result === 2;
+                document.getElementById('live-btn').style.display =
+                    data.ac_connected && replayActive ? '' : 'none';
 
                 // Saved-replay review: drives the review bar and the session
                 // picker when the auto-match came up empty.
@@ -1722,7 +1757,6 @@ def index():
                     visibleDrivers.forEach(function(d) {
                         if (d.colliding) {
                             collisionTimers[d.num] = Date.now();
-                            console.log('[collision] socket reports colliding: num=' + d.num + ' name=' + d.name);
                         }
                         var isColliding = collisionTimers[d.num]
                             && (Date.now() - collisionTimers[d.num] < INCIDENT_NOTICE_MS);
@@ -1735,7 +1769,7 @@ def index():
 
                         var cls = 'driver-item';
                         if (hasClass) cls += classRankClass(d.car_class);
-                        // Collision is the loudest state the palette allows: the
+                        // HIT is the loudest state the palette allows: the
                         // card snaps to inverse video (see remote.css) and blinks.
                         // The inverse fill is what carries it when blink is off.
                         if (isColliding) cls += ' colliding ac-blink';
@@ -1760,10 +1794,10 @@ def index():
                             grid += '<span class="ac-badge status-badge">Pit</span>';
                         }
                         if (isColliding) {
-                            grid += '<span class="ac-badge status-badge ac-badge--filled">Hit</span>';
+                            grid += '<span class="ac-badge status-badge ac-badge--filled" aria-label="Hit">!</span>';
                         }
                         // FLP blinks but leaves the card body alone, which is how
-                        // it stays distinguishable from a collision.
+                        // it stays distinguishable from a HIT.
                         if (isRolledOver) {
                             grid += '<span class="ac-badge status-badge ac-badge--filled ac-blink">Flp</span>';
                         }
@@ -1835,6 +1869,7 @@ def index():
             <div class="camera-buttons ac-tabs" role="tablist">
                 <button class="ac-tab" role="tab" aria-selected="false" data-cam="1">Track</button>
                 <button class="ac-tab" role="tab" aria-selected="false" data-cam="2">Cockpit</button>
+                <button class="ac-tab" role="tab" aria-selected="false" data-cam="6">Bumper</button>
                 <button class="ac-tab" role="tab" aria-selected="false" data-cam="3">Heli</button>
                 <button class="ac-tab" role="tab" aria-selected="false" data-cam="4">F6</button>
                 <button class="ac-tab" role="tab" aria-selected="false" data-cam="5">Orbit</button>
@@ -1855,8 +1890,11 @@ def index():
         </div>
 
         <div id="replay-bar" class="replay-bar">
-            <button id="live-btn" class="ac-btn" aria-pressed="false">Live</button>
+            <button id="live-btn" class="ac-btn" aria-pressed="false" style="display:none">Live</button>
             <button id="mark-btn" class="ac-btn" title="Drop a marker on the focused car">Mark</button>
+            <label class="mark-back-control" title="Place the marker this many seconds before pressing Mark. Playback starts at the marker, within the available buffer; live rewind has a 5-second minimum.">
+                Mark back <input id="mark-back" class="ac-input" type="number" min="0" max="120" step="0.5" value="3" required aria-label="Seconds before marker press"> s
+            </label>
             <span id="replay-readout" class="ac-readout ac-readout--inline" style="display:none">
                 <span class="ac-readout__label">Frame</span>
                 <span class="ac-readout__value" id="replay-frame">--</span>

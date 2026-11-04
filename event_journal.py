@@ -524,6 +524,10 @@ class EventJournal:
             'car_id': event.get('car_id'),
             'driver': event.get('name'),
         }
+        if event.get('preroll_s') is not None:
+            record['preroll_s'] = event['preroll_s']
+        if event.get('mark_back_s') is not None:
+            record['mark_back_s'] = event['mark_back_s']
         if event.get('lap') is not None:
             record['leader_lap'] = event['lap']
         if event.get('time_remaining_ms') is not None:

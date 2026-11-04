@@ -66,6 +66,7 @@ class EventLog:
         # Previous-tick state, keyed by car_id
         self._prev_position = {}
         self._prev_rolled = {}
+        self._prev_hit = {}
         self._current_lap = None
         self._time_remaining_ms = None
 
@@ -100,16 +101,22 @@ class EventLog:
             if prev_pos is not None:
                 prev_holder[prev_pos] = car['car_id']
         in_pit_now = {c['car_id']: bool(c.get('is_in_pit')) for c in cars}
+        connected_ids = {c['car_id'] for c in cars if c.get('is_connected')}
+        self._prev_hit = {cid: active for cid, active in self._prev_hit.items()
+                          if cid in connected_ids}
 
         for car in cars:
             cid = car['car_id']
             if not car.get('is_connected'):
                 continue
 
-            if car.get('is_colliding'):
-                ev = self._add(now, 'collision', car)
+            # One event per impact, while the G-force detector remains active.
+            hit = bool(car.get('is_colliding'))
+            if hit and not self._prev_hit.get(cid, False):
+                ev = self._add(now, 'collision', car, cooldown=0)
                 if ev:
                     new_events.append(ev)
+            self._prev_hit[cid] = hit
 
             rolled = bool(car.get('is_rolled_over'))
             if rolled and not self._prev_rolled.get(cid, False):
@@ -134,13 +141,14 @@ class EventLog:
 
         return new_events
 
-    def mark(self, car_id, name=''):
-        """Operator-triggered marker on the currently focused car."""
+    def mark(self, car_id, name='', back_s=0.0):
+        """Marker at back_s before the press, on the currently focused car."""
         now = self._clock()
         car = {'car_id': car_id, 'display_name': name}
-        return self._add(now, 'mark', car, cooldown=self.MARK_COOLDOWN_S)
+        return self._add(now, 'mark', car, cooldown=self.MARK_COOLDOWN_S,
+                         mark_back_s=back_s)
 
-    def _add(self, now, kind, car, cooldown=None):
+    def _add(self, now, kind, car, cooldown=None, mark_back_s=None):
         cid = car['car_id']
         key = (kind, cid)
         gate = self.COOLDOWN_S if cooldown is None else cooldown
@@ -156,12 +164,17 @@ class EventLog:
                 'label': self.KIND_LABELS.get(kind, kind.upper()[:3]),
                 'car_id': cid,
                 'name': car.get('display_name') or car.get('name') or '',
-                't': now,
+                't': now - (mark_back_s or 0.0),
             }
-            if self._current_lap is not None:
+            if mark_back_s is not None:
+                event['mark_back_s'] = mark_back_s
+                # The marker already points back; do not add a second lead-in.
+                event['preroll_s'] = 0.0
+            if self._current_lap is not None and not mark_back_s:
                 event['lap'] = self._current_lap
             if self._time_remaining_ms is not None:
-                event['time_remaining_ms'] = self._time_remaining_ms
+                event['time_remaining_ms'] = (self._time_remaining_ms
+                                              + (mark_back_s or 0.0) * 1000.0)
             self._next_id += 1
             self._events.append(event)
             return event
@@ -184,7 +197,7 @@ class EventLog:
                 item = dict(ev)
                 item['age'] = now - ev['t']
                 out.append(item)
-        out.reverse()
+        out.sort(key=lambda event: (event['t'], event['id']), reverse=True)
         return out
 
     def get(self, event_id):
@@ -204,6 +217,7 @@ class EventLog:
             self._last_seen.clear()
             self._prev_position.clear()
             self._prev_rolled.clear()
+            self._prev_hit.clear()
             self._current_lap = None
             self._time_remaining_ms = None
 
@@ -223,5 +237,7 @@ class EventLog:
         return self.window_s
 
     def _prune(self, now):
-        while self._events and now - self._events[0]['t'] > self.window_s:
-            self._events.popleft()
+        # Operator markers can be backdated behind newer detected events.
+        self._events = deque(
+            (event for event in self._events
+             if now - event['t'] <= self.window_s), maxlen=self.MAX_EVENTS)
