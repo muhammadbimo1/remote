@@ -40,6 +40,11 @@ class BuildBatchTests(unittest.TestCase):
                 f'copy /y "%CD%\\{asset}" "%STAGE%\\remote\\{asset}"',
                 build_script,
             )
+        self.assertIn(
+            'if exist "%CD%\\stinger.mp4" (\n'
+            '  copy /y "%CD%\\stinger.mp4" "%STAGE%\\remote\\stinger.mp4"',
+            build_script,
+        )
 
     def test_help_describes_repeatable_distribution_build(self):
         result = subprocess.run(

@@ -10,6 +10,7 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
   local toggleCalls = {}
   local seekCalls = {}
   local renderCalls = {}
+  local mediaPlayers = {}
   local socketURL = nil
   local socketParams = nil
   local socketCallback = nil
@@ -26,6 +27,7 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
   local drawnImages = {}
   local drawnTexts = {}
   local drawnRects = {}
+  local clippedTexts = {}
   local dwriteTexts = {}
   local dwriteFonts = {}
   local tonemappingCalls = {}
@@ -34,6 +36,7 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
   local sliderCalls = {}
   local buttonClicks = {}
   local driverTeam = 'PRO 7 | Team'
+  local carsByIndex = {}
   local cameraSections = {
     CAMERA_0 = {
       POSITION = { x = 1, y = 2, z = 3 },
@@ -84,6 +87,9 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     speedKmh = 120,
     acceleration = { x = 0, y = 1, z = 0 },
     collisionDepth = 0,
+    position = { x = 0, y = 0, z = 0 },
+    velocity = { x = 0, y = 0, z = 0 },
+    resetCounter = 0,
     lapTimeMs = 50000,
     bestLapTimeMs = 100000,
     previousLapTimeMs = 101000,
@@ -125,15 +131,32 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
   })
   _G.ui = {
     Font = { Small = 1 },
-    StyleVar = { Alpha = 1 },
+    StyleVar = { Alpha = 1, ItemSpacing = 2 },
     WindowFlags = { None = 0 },
     ImageFit = { Stretch = 0 },
     windowSize = function() return { x = 1920, y = 1080 } end,
     availableSpace = function() return { x = 480, y = 270 } end,
     getCursor = function() return { x = 0, y = 0 } end,
     setCursor = function() end,
+    pushFont = function() end,
+    popFont = function() end,
+    pushStyleVar = function() end,
+    popStyleVar = function() end,
+    measureText = function(value)
+      return { x = #value * 7, y = 16 }
+    end,
+    beginChild = function() end,
+    endChild = function() end,
+    availableSpaceX = function() return 480 end,
+    dummy = function() end,
+    invisibleButton = function() return false end,
     drawRectFilled = function(p1, p2, color)
       drawnRects[#drawnRects + 1] = { p1 = p1, p2 = p2, color = color }
+    end,
+    drawTextClipped = function(text, posMin, posMax, color)
+      clippedTexts[#clippedTexts + 1] = {
+        text = text, posMin = posMin, posMax = posMax, color = color,
+      }
     end,
     drawImage = function(image, p1, p2, color)
       drawnImages[#drawnImages + 1] = {
@@ -180,6 +203,35 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
       return clicked
     end,
   }
+  _G.ui.MediaPlayer = function(source, audioParams)
+    local player = {
+      source = source,
+      audioParams = audioParams,
+      ready = false,
+      playing = false,
+      endedFlag = false,
+      time = 0,
+      durationS = 2.0,
+    }
+    function player:setSource(value) self.source = value; return self end
+    function player:setMuted() return self end
+    function player:setVolume() return self end
+    function player:setLooping() return self end
+    function player:setAutoPlay() return self end
+    function player:setGenerateMips() return self end
+    function player:setUpdatePeriod() return self end
+    function player:linkToSimulationSpeed() return self end
+    function player:play() self.playing = true; self.endedFlag = false; return self end
+    function player:pause() self.playing = false; return self end
+    function player:setCurrentTime(value) self.time = value; return self end
+    function player:currentTime() return self.time end
+    function player:duration() return self.durationS end
+    function player:playing() return self.playing end
+    function player:ended() return self.endedFlag end
+    function player:hasVideo() return self.ready end
+    mediaPlayers[#mediaPlayers + 1] = player
+    return player
+  end
   _G.render = {
     BlendMode = { AlphaBlend = 1 },
     DepthMode = { Off = 2 },
@@ -295,7 +347,7 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     getSession = function()
       return { durationMinutes = 90 }
     end,
-    getCar = function() return car end,
+    getCar = function(i) return carsByIndex[i or 0] or car end,
     getSessionName = function() return 'Race' end,
     getTrackName = function() return 'Test Track' end,
     getReplayFilename = function() return '' end,
@@ -337,6 +389,17 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     toggleCalls = toggleCalls,
     seekCalls = seekCalls,
     renderCalls = renderCalls,
+    mediaPlayers = mediaPlayers,
+    stingerPlayer = function() return mediaPlayers[1] end,
+    setStingerVideoReady = function(value)
+      if mediaPlayers[1] ~= nil then mediaPlayers[1].ready = value end
+    end,
+    setStingerVideoTime = function(value)
+      if mediaPlayers[1] ~= nil then mediaPlayers[1].time = value end
+    end,
+    setStingerVideoEnded = function(value)
+      if mediaPlayers[1] ~= nil then mediaPlayers[1].endedFlag = value end
+    end,
     windows = windows,
     addWindow = function(window) windows[#windows + 1] = window end,
     settingsWrites = settingsWrites,
@@ -353,12 +416,20 @@ local function loadRemote(isReplayActive, hideObsHudInReplay)
     drawnImages = drawnImages,
     drawnTexts = drawnTexts,
     drawnRects = drawnRects,
+    clippedTexts = clippedTexts,
     dwriteTexts = dwriteTexts,
     dwriteFonts = dwriteFonts,
     tonemappingCalls = tonemappingCalls,
     geometryCreations = geometryCreations,
     sliderCalls = sliderCalls,
     car = car,
+    setCar = function(index, overrides)
+      local copy = {}
+      for key, value in pairs(car) do copy[key] = value end
+      for key, value in pairs(overrides or {}) do copy[key] = value end
+      carsByIndex[index] = copy
+      return copy
+    end,
     setDriverTeam = function(value) driverTeam = value end,
     setSlider = function(label, value)
       sliderResults[label] = { value = value, changed = true }
@@ -510,19 +581,63 @@ local function testStingerRendersInScenePassForCleanOutput()
   assertEqual(type(renderStinger), 'function', 'the app exposes a scene-render stinger callback')
   renderStinger()
   assertEqual(ctx.renderCalls[1].textures.txStinger, 'stinger.png',
-    'the scene pass samples the stinger asset')
+    'the scene pass falls back to the png strip without a decoded video')
+  assertEqual(ctx.renderCalls[1].values.gUseGreenKey, 0,
+    'the png fallback does not apply the green key')
   assertEqual(ctx.renderCalls[1].values.gOffsetX, -2,
     'the stinger starts just off the left edge')
-  assertEqual(ctx.renderCalls[1].values.gEmissive, 4,
+  assertEqual(ctx.renderCalls[1].values.gEmissive, 3,
     'the scene pass supplies HDR luminance for exposure-resistant color')
   assertEqual(ctx.renderCalls[1].depthMode, 2,
     'the stinger ignores scene depth')
 
-  ctx.setTime(0.200)
+  ctx.setTime(0.300)
   ctx.update()
   renderStinger()
   assertEqual(ctx.renderCalls[2].values.gOffsetX, -0.5,
     'the two-screen strip fully covers the game at the replay toggle')
+end
+
+local function testStingerUsesGreenScreenVideoWhenAvailable()
+  local ctx = loadRemote(true)
+  ctx.setStingerVideoReady(true)
+  requestReplay(ctx, 2)
+
+  ctx.update()
+  assertEqual(#ctx.toggleCalls, 0, 'video stinger waits for its cover cue')
+  assertEqual(ctx.stingerPlayer().playing, true,
+    'video starts as soon as the stinger is queued')
+
+  ctx.setStingerVideoTime(0.5)
+  ctx.update()
+  assertEqual(#ctx.toggleCalls, 1, 'video stinger toggles at the cover cue')
+  assertEqual(ctx.toggleCalls[1].active, false, 'video go-live exits replay')
+  assertEqual(ctx.stingerPlayer().playing, false,
+    'video holds the covered frame while replay settles')
+
+  renderStinger()
+  local pass = ctx.renderCalls[#ctx.renderCalls]
+  assertEqual(pass.textures.txStinger, ctx.stingerPlayer(),
+    'the scene pass samples the media player')
+  assertEqual(pass.values.gUseGreenKey, 1, 'the video path keys the green screen')
+  assertEqual(pass.values.gEmissive, 1,
+    'video frames are display-referred without the png HDR boost')
+  assertEqual(pass.values.gOffsetX, 0, 'the clip supplies its own wipe')
+
+  ctx.sim.isReplayActive = false
+  ctx.setStingerVideoTime(0.6)
+  ctx.update()
+  assertEqual(ctx.stingerPlayer().playing, true,
+    'video resumes for the reveal once replay settles')
+
+  ctx.setStingerVideoTime(2.0)
+  ctx.setStingerVideoEnded(true)
+  ctx.update()
+  assertEqual(ctx.stingerPlayer().time, 0, 'the video rewinds for the next stinger')
+  local callsBefore = #ctx.renderCalls
+  renderStinger()
+  assertEqual(#ctx.renderCalls, callsBefore,
+    'the stinger stops rendering after the reveal')
 end
 
 requestReplay = function(ctx, action)
@@ -973,10 +1088,18 @@ local function testSavedReplaySeekAppliesEventShot()
   assertEqual(ctx.sim.cameraMode, 1, 'a saved replay jump selects the requested camera')
 end
 
-local function testFocusedCarContactHitDetection()
+local function addSecondCar(ctx, z)
+  return ctx.setCar(1, {
+    racePosition = 2,
+    position = { x = 0, y = 0, z = z or 3 },
+    velocity = { x = 0, y = 0, z = 0 },
+  })
+end
+
+local function testHitFromCollisionDepthFlagsLocalCar()
   local cases = {
     { depth = 0.01, want = true },
-    { depth = 0, x = 8, want = false },
+    { depth = 0, want = false },
     { depth = 0.01, pit = true, want = false },
     { depth = 0.01, pitlane = true, want = false },
     { depth = 0.01, connected = false, want = false },
@@ -986,52 +1109,174 @@ local function testFocusedCarContactHitDetection()
   for _, case in ipairs(cases) do
     local ctx = loadRemote(case.replay == true)
     ctx.car.collisionDepth = case.depth
-    ctx.car.acceleration.x = case.x or 0
     ctx.car.isInPit = case.pit == true
     ctx.car.isInPitlane = case.pitlane == true
     ctx.car.isConnected = case.connected ~= false
     ctx.sim.isReplayOnlyMode = case.replayOnly == true
     ctx.update(0.1)
     assertEqual(ctx.telemetryPayloads[1].cars[1].is_colliding, case.want,
-      'HIT follows focused-car contact depth and live-session gates')
+      'contact depth still flags the local car and respects live-session gates')
   end
 end
 
-local function testHitCapturesBriefContactUntilTelemetry()
+local function testHitLatchesBriefContactUntilTelemetry()
   local ctx = loadRemote(false)
   ctx.car.collisionDepth = 0.1
-  ctx.update(0.01)
+  ctx.update(0.01)             -- first frame: depth latches, no telemetry yet
   ctx.car.collisionDepth = 0
-  ctx.update(0.091)
+  ctx.setTime(0.1)
+  ctx.update(0.095)            -- the 10 Hz tick must still carry the contact
   assertEqual(ctx.telemetryPayloads[1].cars[1].is_colliding, true,
-    'a one-frame contact survives until telemetry sends it')
+    'a one-frame contact survives the telemetry gap')
+  ctx.setTime(1.0)
   ctx.update(0.1)
   assertEqual(ctx.telemetryPayloads[2].cars[1].is_colliding, false,
-    'contact clears after its pending event is sent')
+    'the latch clears once its window has passed')
 end
 
-local function testHitBelongsOnlyToFocusedCarAndDropsOldPendingContact()
+local function testHitImpulseFlagsOnlyTheHarderCar()
   local ctx = loadRemote(false)
   ctx.sim.carsCount = 2
-  ctx.sim.focusedCar = 1
-  ctx.car.collisionDepth = 0.1
-  ctx.update(0.1)
-  assertEqual(ctx.telemetryPayloads[1].cars[1].is_colliding, false,
-    'non-focused cars never inherit focused contact')
-  assertEqual(ctx.telemetryPayloads[1].cars[2].is_colliding, true,
-    'HIT is attributed to the focused car')
-  ctx.update(0.01)
-  ctx.sim.focusedCar = 0
-  ctx.car.collisionDepth = 0
-  ctx.update(0.1)
-  for _, car in ipairs(ctx.telemetryPayloads[2].cars) do
-    assertEqual(car.is_colliding, false, 'focus switches discard pending contact')
-  end
+  ctx.car.position = { x = 0, y = 0, z = 0 }
+  ctx.car.velocity = { x = 0, y = 0, z = 0 }
+  local other = addSecondCar(ctx, 3)
+  ctx.update(0.05)             -- baselines for every car
+  ctx.setTime(0.05)
+  ctx.car.velocity = { x = 0, y = 0, z = 8.5 }   -- residual ~139 m/s^2
+  other.velocity = { x = 0, y = 0, z = 8.0 }     -- residual ~131 m/s^2
+  ctx.update(0.05)             -- detect and reach the 10 Hz telemetry tick
+  local cars = ctx.telemetryPayloads[1].cars
+  assertEqual(cars[1].is_colliding, true,
+    'the harder impulse owns the HIT')
+  assertEqual(cars[2].is_colliding, false,
+    'the partner does not log a second event for the same contact')
 end
 
-testFocusedCarContactHitDetection()
-testHitCapturesBriefContactUntilTelemetry()
-testHitBelongsOnlyToFocusedCarAndDropsOldPendingContact()
+local function testHitPartnerImpulseIsNotASecondEvent()
+  local ctx = loadRemote(false)
+  ctx.sim.carsCount = 2
+  ctx.car.position = { x = 0, y = 0, z = 0 }
+  ctx.car.velocity = { x = 0, y = 0, z = 0 }
+  local other = addSecondCar(ctx, 3)
+  ctx.update(0.05)
+  ctx.setTime(0.05)
+  ctx.car.velocity = { x = 0, y = 0, z = 9 }
+  ctx.update(0.05)
+  assertEqual(ctx.telemetryPayloads[1].cars[1].is_colliding, true,
+    'the first car owns the event')
+  ctx.setTime(0.2)
+  other.velocity = { x = 0, y = 0, z = 9 }       -- replicated partner impulse
+  ctx.update(0.1)
+  assertEqual(ctx.telemetryPayloads[2].cars[2].is_colliding, false,
+    'the partner impulse inside the pair cooldown is swallowed')
+end
+
+local function testHitIgnoresLandingBrakingTeleportAndReset()
+  local ctx = loadRemote(false)
+  ctx.update(0.05)                                -- baselines
+  ctx.setTime(0.05)
+  ctx.car.velocity.y = 9                          -- landing, purely vertical
+  ctx.update(0.05)
+  assertEqual(ctx.telemetryPayloads[1].cars[1].is_colliding, false,
+    'a vertical landing is not a hit')
+
+  local braking = loadRemote(false)
+  braking.car.velocity = { x = 0, y = 0, z = 50 }
+  braking.update(0.05)
+  for step = 1, 12 do
+    braking.setTime(step * 0.05)
+    braking.car.velocity.z = 50 - step * 0.5      -- ~1 g, tracked by the EMA
+    braking.update(0.05)
+  end
+  for _, payload in ipairs(braking.telemetryPayloads) do
+    assertEqual(payload.cars[1].is_colliding, false,
+      'sustained braking is not a contact')
+  end
+
+  local snap = loadRemote(false)
+  snap.update(0.05)
+  snap.setTime(0.05)
+  snap.car.position = { x = 500, y = 0, z = 0 }   -- network snap
+  snap.car.velocity = { x = 0, y = 0, z = 9 }
+  snap.update(0.05)
+  assertEqual(snap.telemetryPayloads[1].cars[1].is_colliding, false,
+    'a position snap does not read as a contact')
+  snap.setTime(0.1)
+  snap.car.resetCounter = 1
+  snap.car.velocity = { x = 0, y = 0, z = 9 }
+  snap.update(0.1)
+  assertEqual(snap.telemetryPayloads[2].cars[1].is_colliding, false,
+    'a car reset does not read as a contact')
+end
+
+local function drawnBadgeLabels(ctx, from)
+  local labels = {}
+  for i = (from or 0) + 1, #ctx.clippedTexts do
+    labels[ctx.clippedTexts[i].text] = true
+  end
+  return labels
+end
+
+local function testDriverListShowsHitBadgeAfterContact()
+  local ctx = loadRemote(false)
+  ctx.car.collisionDepth = 0.1
+  ctx.update(0.1)             -- latch contact and build the driver rows
+  ctx.car.collisionDepth = 0
+  ctx.update(0.1)             -- contact ends; the notice window keeps HIT lit
+  script.windowMain(0)
+
+  local labels = drawnBadgeLabels(ctx)
+  assertEqual(labels['HIT'], true,
+    'the car keeps a HIT badge after contact ends')
+  assertEqual(labels['FLP'], nil,
+    'a car that did not roll over shows no FLP badge')
+end
+
+local function testDriverListShowsFlipBadgeForRollover()
+  local ctx = loadRemote(false)
+  ctx.car.up.y = 0.4
+  ctx.update(0.1)             -- rollover hold tick 1
+  ctx.update(0.1)             -- rollover hold tick 2 -> flagged
+  script.windowMain(0)
+
+  local labels = drawnBadgeLabels(ctx)
+  assertEqual(labels['FLP'], true, 'a rolled-over driver shows a FLP badge')
+  assertEqual(labels['HIT'], nil,
+    'a car that did not contact anything shows no HIT badge')
+end
+
+local function testDriverListShowsImpulseDebug()
+  local ctx = loadRemote(false)
+  ctx.car.position = { x = 0, y = 0, z = 0 }
+  ctx.car.velocity = { x = 0, y = 0, z = 0 }
+  ctx.update(0.05)            -- baselines
+  ctx.setTime(0.05)
+  ctx.car.velocity = { x = 0, y = 0, z = 8 }
+  ctx.update(0.05)            -- residual ~131, telemetry tick, driver rows
+  script.windowMain(0)
+
+  local labels = drawnBadgeLabels(ctx)
+  assertEqual(labels['131'], true,
+    'the debug column shows the live impulse that fired the hit')
+
+  ctx.setTime(0.1)
+  ctx.update(0.1)             -- impulse ends, the peak stays readable
+  local before = #ctx.clippedTexts
+  script.windowMain(0)
+  labels = drawnBadgeLabels(ctx, before)
+  assertEqual(labels['131'], nil, 'the live impulse clears when motion settles')
+  assertEqual(labels['(131)'], true,
+    'the peak holds an impulse the 10 Hz redraw could have missed')
+end
+
+testHitFromCollisionDepthFlagsLocalCar()
+testHitLatchesBriefContactUntilTelemetry()
+testHitImpulseFlagsOnlyTheHarderCar()
+testHitPartnerImpulseIsNotASecondEvent()
+testHitIgnoresLandingBrakingTeleportAndReset()
+testDriverListShowsHitBadgeAfterContact()
+testDriverListShowsFlipBadgeForRollover()
+testDriverListShowsImpulseDebug()
 
 testReplaySuppressesForwardedAppsExceptIndicator()
 testReplaySuppressesNewlyForwardedApps()
@@ -1046,6 +1291,7 @@ testLiveWaitsUntilScreenIsCovered()
 testSeekWithinReplayDoesNotRunAStinger()
 testSavedReplaySeekAppliesEventShot()
 testStingerRendersInScenePassForCleanOutput()
+testStingerUsesGreenScreenVideoWhenAvailable()
 testWebSocketConnectsToLoopbackWithReconnect()
 testTelemetryUsesVersionedProtocolAtTenHertz()
 testBumperCameraSelectionAndTelemetry()

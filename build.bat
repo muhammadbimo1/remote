@@ -74,6 +74,9 @@ copy /y "%CD%\remote.lua" "%STAGE%\remote\remote.lua" >nul || goto :failed
 copy /y "%CD%\manifest.ini" "%STAGE%\remote\manifest.ini" >nul || goto :failed
 copy /y "%CD%\logo.png" "%STAGE%\remote\logo.png" >nul || goto :failed
 copy /y "%CD%\stinger.png" "%STAGE%\remote\stinger.png" >nul || goto :failed
+if exist "%CD%\stinger.mp4" (
+  copy /y "%CD%\stinger.mp4" "%STAGE%\remote\stinger.mp4" >nul || goto :failed
+)
 copy /y "%CD%\Michroma-Regular.ttf" "%STAGE%\remote\Michroma-Regular.ttf" >nul || goto :failed
 
 if exist "%SAVED_CONFIG%" (

@@ -84,6 +84,38 @@ counting while instant replay plays back). So `replay_frames * replay_frame_ms` 
 event-log retention window, the journal's `session_s`/`replay_frame`, and the session-start
 estimate — equals the recorded session length until the instant-replay buffer wraps.
 
+### Hit detection
+
+`collisionDepth` and `ac.onCarCollision` are fed by AC's regular physics component, which remote
+cars online and every car in a replay do not run. Per-pair ODE queries
+(`ac.areCarsColliding` / `physics.Collider.TrackWalls`) would cover them but do not scale to a full
+50+ car grid, so `remote.lua` detects contacts kinematically instead: a hit is a large impulse in
+`car.velocity` that the car's own recent acceleration (cornering, braking, network extrapolation)
+does not explain. Each car keeps a 0.25 s exponential average of its acceleration; the residual
+between the instantaneous and learned acceleration is the signal. A residual whose vertical
+component dominates is a landing or kerb, not a contact.
+
+Impulses are computed from CarState (`velocity`, `position`, `damage`, all available for remote
+cars), never from `collisionDepth`, which remains only as a free extra trigger for the local car.
+Resets (`resetCounter`), position snaps, pit lane, replays and session start all clear the
+baselines. One event per incident: the car with the larger residual owns the hit, and a 1 s pair
+cooldown swallows the partner's replicated impulse, which lands a packet or two later. The latched
+`is_colliding` lasts `HIT_LATCH_S` so the 10 Hz telemetry cannot miss a one-frame impulse; the
+driver list shows the residual/peak in the `Imp` debug column while tuning `HIT_RESIDUAL_MS2`.
+
+### Stinger
+
+`stinger.png` is the fallback; `stinger.mp4` (H.264 MP4, 16:9, green-screen, no audio) is the primary
+asset when CSP's `ui.MediaPlayer` has decoded it. The clip is bound as the `txStinger` texture of the
+transparent scene pass in `renderStinger`, so it survives CSP's clean-OBS mode. Create the player once
+at load because Media Foundation initialises lazily; swap only when `hasVideo()` is true, and rewind it
+to zero for every stinger. The shader derives alpha from green dominance, not RGB distance, to survive
+limited-range 4:2:0 edges, and suppresses green spill. Keep the PNG path, including its `gOffsetX` pan,
+working for when the video is unavailable. `STINGER_TIMING.videoToggleAtS` is the clip time where the
+wipe covers the screen and the replay toggle fires; `videoCoverTimeoutS` and `videoRevealTimeoutS` are
+stall guards because replay commands are ignored while a stinger is active. Tune
+`STINGER_VIDEO_KEY_THRESHOLD`/`SOFTNESS` and the video emissive on the rig.
+
 ### Event log vs event journal
 
 Two separate stores, on purpose. `event_log.py` is the **live window** feeding the panel: it

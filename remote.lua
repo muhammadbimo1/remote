@@ -241,17 +241,93 @@ local hideOtherObsHudAppsInReplay = obsHudSettings:get(
 local REPLAY_ENTER_NOMINAL_REWIND_S = 0.5
 local pendingSeek = nil        -- absolute frame to seek to once replay is active
 
--- Stinger timing configuration. Entering replay toggles as the stinger is
--- queued so the first stinger frame is already in replay. Going live waits
--- until the wipe has covered the game, then toggles. The hold after that
--- lasts only as long as AC needs to report the requested state, up to the
--- configured timeout.
+-- Stinger timing configuration. The 16:9 green-screen clip carries its own
+-- wipe, so `videoToggleAtS` is the clip time where it fully covers the screen
+-- and the replay toggle may fire. The slide timings remain for the PNG strip
+-- used as a fallback until Media Foundation has decoded the clip.
 local STINGER_TIMING = {
   slideInS = 0.3,
   coveredWaitTimeoutS = 1.5,
   slideOutS = 0.4,
+  videoToggleAtS = 0.5,
+  videoCoverTimeoutS = 3.0,
+  videoRevealTimeoutS = 4.0,
 }
 local stinger = nil            -- { phase, phaseStarted, action, ..., targetReplay, deadline }
+
+-- Video stinger. `ui.MediaPlayer` decodes through Media Foundation, so the clip
+-- must use a Windows codec (H.264 MP4). MMF initialises lazily, so the player
+-- is created once at load; until `hasVideo()` reports a decoded stream the PNG
+-- strip keeps working exactly as before.
+local STINGER_VIDEO_FILE = 'stinger.mp4'
+local STINGER_VIDEO_KEY_THRESHOLD = 0.35
+local STINGER_VIDEO_KEY_SOFTNESS = 0.25
+local stingerPlayer = nil
+if ui.MediaPlayer ~= nil then
+  local ok, player = pcall(ui.MediaPlayer, STINGER_VIDEO_FILE)
+  if ok and player ~= nil then
+    stingerPlayer = player
+    pcall(function()
+      player:setMuted(true)
+      player:setLooping(false)
+      player:setAutoPlay(false)
+      player:setUpdatePeriod(0)
+      player:linkToSimulationSpeed(false)
+    end)
+  end
+end
+
+local function stingerVideoReady()
+  if stingerPlayer == nil then return false end
+  local ok, ready = pcall(stingerPlayer.hasVideo, stingerPlayer)
+  return ok and ready == true
+end
+
+local function stingerVideoTime()
+  if stingerPlayer == nil then return 0 end
+  local ok, value = pcall(stingerPlayer.currentTime, stingerPlayer)
+  if ok and validNumber(value) then return value end
+  return 0
+end
+
+local function stingerVideoEnded()
+  if stingerPlayer == nil then return true end
+  local ok, ended = pcall(stingerPlayer.ended, stingerPlayer)
+  if ok and ended == true then return true end
+  local okTime, value = pcall(stingerPlayer.currentTime, stingerPlayer)
+  local okDuration, duration = pcall(stingerPlayer.duration, stingerPlayer)
+  if not (okTime and okDuration and validNumber(value) and validNumber(duration)) then
+    return true
+  end
+  return duration > 0 and value >= duration - 0.01
+end
+
+local function restartStingerVideo()
+  if stingerPlayer == nil then return end
+  pcall(function()
+    stingerPlayer:pause()
+    stingerPlayer:setCurrentTime(0)
+    stingerPlayer:play()
+  end)
+end
+
+local function holdStingerVideo()
+  if stingerPlayer == nil then return end
+  pcall(stingerPlayer.pause, stingerPlayer)
+end
+
+local function resumeStingerVideo()
+  if stingerPlayer == nil then return end
+  pcall(stingerPlayer.play, stingerPlayer)
+end
+
+local function resetStingerVideo()
+  if stingerPlayer == nil then return end
+  pcall(function()
+    stingerPlayer:pause()
+    stingerPlayer:setCurrentTime(0)
+  end)
+end
 
 -- Session identity. AC saves a separate replay per session and wipes the
 -- instant-replay buffer when one starts, so markers from the previous session
@@ -271,40 +347,233 @@ ac.onSessionStart(function(sessionIndex, restarted)
     sessionIndex, tostring(restarted), sessionGen))
 end)
 
--- Follow CostOfRacing's contact signal: a positive collisionDepth means the
--- focused car is touching another body or the track. Capture it every frame so
--- brief contacts survive the slower telemetry cadence.
-local hitCar = nil
-local hitActive = false
-local hitPending = false
+-- Hit detection.
+--
+-- `collisionDepth` and `ac.onCarCollision` are fed by AC's regular physics
+-- component. Remote cars online, and every car in a replay, run without it,
+-- so both signals stay empty exactly where the broadcast needs them. Per-pair
+-- ODE queries (`ac.areCarsColliding` / `physics.Collider.TrackWalls`) would
+-- cover remote cars but do not scale to a full 50+ car grid.
+--
+-- What every car does have is `car.velocity`. A contact is a large impulse
+-- that the car's own recent acceleration - cornering, braking, network
+-- extrapolation - does not explain. Track that residual per car, every frame.
+--
+-- One event per incident: the larger residual owns the hit. A remote partner's
+-- replicated impulse usually lands a packet or two later, so a short pair
+-- cooldown swallows it instead of logging a second event.
+local HIT_NOTICE_S = 6.0          -- badge hold, mirrors INCIDENT_NOTICE_MS
+local HIT_LATCH_S = 0.35          -- keep is_colliding up for the 10 Hz telemetry
+local HIT_RESIDUAL_MS2 = 120      -- unexplained impulse, ~12 g at 60 fps
+local HIT_ACCEL_TAU_S = 0.25      -- how fast the learned acceleration tracks
+local HIT_VERTICAL_RATIO = 0.8    -- |ry| > ratio * horizontal = landing or kerb
+local HIT_PAIR_RADIUS_M = 6.0     -- neighbour that counts as the other car
+local HIT_PAIR_HEIGHT_M = 3.0     -- overpass guard
+local HIT_PAIR_COOLDOWN_S = 1.0
+local HIT_CAR_COOLDOWN_S = 1.0
+local HIT_TELEPORT_SPEED_MPS = 20
+local HIT_TELEPORT_MARGIN_M = 0.5
 
-local function resetHitDetection()
-  hitCar = nil
-  hitActive = false
-  hitPending = false
+local hitState = {}          -- car_id -> velocity/position/damage baselines
+local hitLatchUntil = {}     -- car_id -> is_colliding holds until
+local hitPending = {}        -- car_id -> send this tick even if the latch just ended
+local hitNoticeUntil = {}    -- car_id -> badge holds until
+local hitCooldownUntil = {}  -- car_id -> cannot own another event until
+local hitPairCooldown = {}   -- lo * 128 + hi -> the pair already logged an event
+local hitDebugResidual = {}  -- car_id -> last residual, in m/s^2
+local hitDebugPeak = {}      -- car_id -> biggest residual this session
+local hitDebugDepth = {}     -- car_id -> collisionDepth when AC reports one
+local hitDebugPartner = {}   -- car_id -> neighbour at the last candidate
+local hitCandidates = {}
+local hitSessionIndex = -1
+local hitSessionTypeRaw = -1
+
+local function resetHitState()
+  table.clear(hitState)
+  table.clear(hitLatchUntil)
+  table.clear(hitPending)
+  table.clear(hitNoticeUntil)
+  table.clear(hitCooldownUntil)
+  table.clear(hitPairCooldown)
+  table.clear(hitDebugResidual)
+  table.clear(hitDebugPeak)
+  table.clear(hitDebugDepth)
+  table.clear(hitDebugPartner)
 end
 
-local function updateHitDetection()
-  local cid = sim.focusedCar
-  if cid ~= hitCar then
-    resetHitDetection()
-    hitCar = cid
-  end
-  local car = ac.getCar(cid)
+local function hitCarActive(car)
+  return car ~= nil and car.isConnected
+    and not car.isInPit and not car.isInPitlane
+end
+
+local function updateHitDetection(dt)
   if sim.isReplayActive or sim.isReplayOnlyMode
-      or sim.timeToSessionStart >= -5000
-      or car == nil or not car.isConnected
-      or car.isInPit or car.isInPitlane then
-    resetHitDetection()
+      or sim.timeToSessionStart >= -5000 or dt <= 0 then
+    resetHitState()
     return
   end
-  if (car.collisionDepth or 0) > 0 then
-    hitPending = true
-    hitActive = true
-  else
-    hitActive = false
+
+  -- A new session wipes the replay too, so every baseline is meaningless.
+  if sim.currentSessionIndex ~= hitSessionIndex
+      or sim.raceSessionType ~= hitSessionTypeRaw then
+    resetHitState()
+    hitSessionIndex = sim.currentSessionIndex
+    hitSessionTypeRaw = sim.raceSessionType
+  end
+
+  local now = os.preciseClock()
+  local carCount = math.min(sim.carsCount, 128)
+  local alpha = 1 - math.exp(-dt / HIT_ACCEL_TAU_S)
+  table.clear(hitCandidates)
+
+  for i = 0, carCount - 1 do
+    local car = ac.getCar(i)
+    if not hitCarActive(car) then
+      hitState[i] = nil
+      hitLatchUntil[i] = nil
+      hitDebugResidual[i] = 0
+      hitDebugDepth[i] = nil
+      hitDebugPartner[i] = nil
+    else
+      local vx, vy, vz = car.velocity.x, car.velocity.y, car.velocity.z
+      local px, py, pz = car.position.x, car.position.y, car.position.z
+      local dmg = (car.damage[0] or 0) + (car.damage[1] or 0)
+        + (car.damage[2] or 0) + (car.damage[3] or 0) + (car.damage[4] or 0)
+      local st = hitState[i]
+      local residual = 0
+      local residualHit = false
+      if st == nil then
+        -- First frame for this car in this session: only take baselines.
+        st = { vx = vx, vy = vy, vz = vz,
+               px = px, py = py, pz = pz,
+               ax = 0, ay = 0, az = 0, dmg = dmg,
+               reset = car.resetCounter, depthActive = false }
+        hitState[i] = st
+      else
+        local moved = math.sqrt((px - st.px) * (px - st.px)
+          + (py - st.py) * (py - st.py) + (pz - st.pz) * (pz - st.pz))
+        local allowed = (math.abs(car.speedKmh) / 3.6 + HIT_TELEPORT_SPEED_MPS) * dt
+          + HIT_TELEPORT_MARGIN_M
+        if car.resetCounter ~= st.reset or moved > allowed then
+          -- Reset, respawn or a network snap. Not a contact: restart clean.
+          st.vx, st.vy, st.vz = vx, vy, vz
+          st.ax, st.ay, st.az = 0, 0, 0
+          hitDebugResidual[i] = 0
+        else
+          local axInst = (vx - st.vx) / dt
+          local ayInst = (vy - st.vy) / dt
+          local azInst = (vz - st.vz) / dt
+          st.ax = st.ax + (axInst - st.ax) * alpha
+          st.ay = st.ay + (ayInst - st.ay) * alpha
+          st.az = st.az + (azInst - st.az) * alpha
+          local rx = axInst - st.ax
+          local ry = ayInst - st.ay
+          local rz = azInst - st.az
+          residual = math.sqrt(rx * rx + ry * ry + rz * rz)
+          hitDebugResidual[i] = residual
+          if residual > (hitDebugPeak[i] or 0) then hitDebugPeak[i] = residual end
+          if residual > HIT_RESIDUAL_MS2 then
+            -- A landing or a kerb is mostly vertical; a wall or car hit is not.
+            local horizontal = math.sqrt(rx * rx + rz * rz)
+            residualHit = math.abs(ry) <= HIT_VERTICAL_RATIO * horizontal
+          end
+          st.vx, st.vy, st.vz = vx, vy, vz
+        end
+        st.px, st.py, st.pz = px, py, pz
+        st.reset = car.resetCounter
+      end
+
+      -- These two need no velocity baseline and still cover the local car.
+      -- Depth is edge-triggered: a long wall scrape must not log every second.
+      local depth = car.collisionDepth or 0
+      local depthEdge = depth > 0 and not st.depthActive
+      st.depthActive = depth > 0
+      hitDebugDepth[i] = depth > 0 and depth or nil
+      local dmgJumped = st.dmg ~= nil and dmg > st.dmg + 0.01
+      st.dmg = dmg
+
+      local score = 0
+      local fires = false
+      if residualHit then
+        fires = true
+        score = residual
+      end
+      if dmgJumped then
+        fires = true
+        score = score + 100
+      end
+      if depthEdge then
+        fires = true
+        score = score + 200
+      end
+      if fires then
+        hitCandidates[#hitCandidates + 1] = {
+          id = i, score = score, residual = residual,
+        }
+      end
+    end
+  end
+
+  -- Attribution: the highest score owns the incident.
+  if #hitCandidates > 1 then
+    table.sort(hitCandidates, function(a, b) return a.score > b.score end)
+  end
+
+  for ci = 1, #hitCandidates do
+    local candidate = hitCandidates[ci]
+    local i = candidate.id
+    local car = ac.getCar(i)
+    if hitCarActive(car) and now >= (hitCooldownUntil[i] or 0) then
+      local cx, cy, cz = car.position.x, car.position.y, car.position.z
+      local partner, bestD2 = nil, HIT_PAIR_RADIUS_M * HIT_PAIR_RADIUS_M
+      for j = 0, carCount - 1 do
+        if j ~= i then
+          local other = ac.getCar(j)
+          if hitCarActive(other) then
+            local dx = other.position.x - cx
+            local dy = other.position.y - cy
+            local dz = other.position.z - cz
+            local d2 = dx * dx + dy * dy + dz * dz
+            if math.abs(dy) <= HIT_PAIR_HEIGHT_M and d2 < bestD2 then
+              bestD2 = d2
+              partner = j
+            end
+          end
+        end
+      end
+      hitDebugPartner[i] = partner
+
+      local blocked = false
+      if partner ~= nil then
+        local lo, hi = i, partner
+        if lo > hi then lo, hi = hi, lo end
+        local key = lo * 128 + hi
+        local untilS = hitPairCooldown[key]
+        if untilS ~= nil and now < untilS then
+          blocked = true
+        else
+          hitPairCooldown[key] = now + HIT_PAIR_COOLDOWN_S
+        end
+      end
+
+      if not blocked then
+        hitLatchUntil[i] = now + HIT_LATCH_S
+        hitPending[i] = true
+        hitNoticeUntil[i] = now + HIT_NOTICE_S
+        hitCooldownUntil[i] = now + HIT_CAR_COOLDOWN_S
+        ac.log(string.format('Hit car=%d residual=%.0f partner=%s',
+          i, candidate.residual, partner and tostring(partner) or 'wall'))
+      end
+    end
   end
 end
+
+-- DEBUG: the detector state per car, shown in the driver list. `d` is
+-- collisionDepth (local car only), `@n` the nearest car at a candidate, and a
+-- bare number is the live residual; the parenthesised number is the session
+-- peak. The peak is what makes threshold tuning readable at 10 Hz.
+local HIT_DEBUG = true
+local HIT_DEBUG_COL_W = 52
 
 -- Rollover detection: car.up.y < 0.5 means chassis is tilted > 60° from
 -- vertical (cos(60°) = 0.5). Asymmetric thresholds + a hold counter
@@ -478,6 +747,7 @@ end
 
 local function queueStinger(action, rewindS, driver, camera, subCam)
   local targetReplay = action == REPLAY_ENTER
+  local video = stingerVideoReady()
   stinger = {
     phase = 'cover',
     phaseStarted = os.preciseClock(),
@@ -487,9 +757,11 @@ local function queueStinger(action, rewindS, driver, camera, subCam)
     camera = camera,
     subCam = subCam,
     targetReplay = targetReplay,
+    video = video,
     toggled = false,
     toggleOk = false,
   }
+  if video then restartStingerVideo() end
   -- Instant-replay enter: toggle before the first stinger frame so AC's
   -- replay-in animation plays under the wipe. Go-live waits for coverage.
   if targetReplay then
@@ -562,10 +834,23 @@ end
 
 local function processStinger()
   if stinger == nil then return end
+  -- The player can drop the stream (unsupported codec, decode failure) after
+  -- the stinger was queued; degrade to the PNG path rather than stall.
+  if stinger.video and not stingerVideoReady() then stinger.video = false end
 
   local now = os.preciseClock()
   if stinger.phase == 'cover' then
-    if now - stinger.phaseStarted < STINGER_TIMING.slideInS then return end
+    local covered
+    if stinger.video then
+      -- A clip shorter than the cue, or a stalled decoder, must not wedge the
+      -- transition: replay commands are ignored while a stinger is active.
+      covered = stingerVideoEnded()
+        or stingerVideoTime() >= STINGER_TIMING.videoToggleAtS
+        or now - stinger.phaseStarted >= STINGER_TIMING.videoCoverTimeoutS
+    else
+      covered = now - stinger.phaseStarted >= STINGER_TIMING.slideInS
+    end
+    if not covered then return end
     if not stinger.toggled then
       stinger.toggleOk = fireStingerToggle(stinger) == true
       stinger.toggled = true
@@ -573,6 +858,8 @@ local function processStinger()
     if stinger.toggleOk then
       stinger.phase = 'wait'
       stinger.deadline = now + STINGER_TIMING.coveredWaitTimeoutS
+      -- Hold the cover frame; the reveal must not finish while AC settles.
+      if stinger.video then holdStingerVideo() end
     else
       stinger.phase = 'reveal'
       stinger.phaseStarted = now
@@ -581,9 +868,20 @@ local function processStinger()
     if sim.isReplayActive == stinger.targetReplay or now >= stinger.deadline then
       stinger.phase = 'reveal'
       stinger.phaseStarted = now
+      if stinger.video then resumeStingerVideo() end
     end
-  elseif stinger.phase == 'reveal' and now - stinger.phaseStarted >= STINGER_TIMING.slideOutS then
-    stinger = nil
+  elseif stinger.phase == 'reveal' then
+    local finished
+    if stinger.video then
+      finished = stingerVideoEnded()
+        or now - stinger.phaseStarted >= STINGER_TIMING.videoRevealTimeoutS
+    else
+      finished = now - stinger.phaseStarted >= STINGER_TIMING.slideOutS
+    end
+    if finished then
+      if stinger.video then resetStingerVideo() end
+      stinger = nil
+    end
   end
 end
 
@@ -686,7 +984,7 @@ end
 ac.onRelease(restoreObsHudWindows)
 
 ac.onReplay(function(event)
-  resetHitDetection()
+  resetHitState()
   ac.log('Replay event: ' .. tostring(event))
   -- Every AC-side transition re-arms the settle window, so a command arriving
   -- mid-transition is ignored rather than stacked on top of it.
@@ -855,6 +1153,7 @@ local function buildDriverRows()
   local rows = {}
   local trackLength = sim.trackLengthM
   local carCount = sim.carsCount
+  local now = os.preciseClock()
 
   for i = 0, carCount - 1 do
     local car = ac.getCar(i)
@@ -873,6 +1172,10 @@ local function buildDriverRows()
         isConnected = car.isConnected,
         name        = car:driverName(),
         totalProgress = lapCount + car.splinePosition,
+        -- HIT and FLIP are per-car: the detector tracks every car because
+        -- collisionDepth only exists for the local one.
+        isHit = now < (hitNoticeUntil[i] or 0),
+        isRolledOver = rolloverState[i] == true,
       }
     end
   end
@@ -918,12 +1221,14 @@ local function updateTelemetry()
     timetableNextPoll = 0
   end
 
+  local now = os.preciseClock()
   local cars = {}
 
   for i = 0, carCount - 1 do
     local car = ac.getCar(i)
     local position, lapCount = correctedStandings(i, car)
-    local isHit = i == hitCar and (hitActive or hitPending)
+    local isHit = hitPending[i] == true
+      or (hitLatchUntil[i] ~= nil and hitLatchUntil[i] > now)
 
     local upY = car.up.y
     local threshold = rolloverState[i] and ROLLOVER_UP_Y_EXIT or ROLLOVER_UP_Y_ENTER
@@ -957,7 +1262,7 @@ local function updateTelemetry()
     }
   end
 
-  hitPending = false
+  table.clear(hitPending)
   packetID = packetID + 1
   local payload = {
     version = PROTOCOL_VERSION,
@@ -1010,7 +1315,7 @@ function script.update(dt)
   processPiPCommands()
   syncPiPWindow()
   syncLeaderboard()
-  updateHitDetection()
+  updateHitDetection(dt)
   pollTimetable()
 
   updateAccum = updateAccum + dt
@@ -1033,9 +1338,26 @@ local stingerPass = {
   blendMode = render.BlendMode.AlphaBlend,
   depthMode = render.DepthMode.Off,
   textures = { txStinger = 'stinger.png' },
-  values = { gOffsetX = -2, gEmissive = 3, gWhiteReference = 1 },
+  values = {
+    gOffsetX = -2,
+    gEmissive = 3,
+    gWhiteReference = 1,
+    gUseGreenKey = 0,
+    gKeyThreshold = STINGER_VIDEO_KEY_THRESHOLD,
+    gKeySoftness = STINGER_VIDEO_KEY_SOFTNESS,
+  },
   shader = [[
     float4 main(PS_IN pin) {
+      if (gUseGreenKey > 0.5) {
+        // Green-screen key on green dominance, not RGB distance: H.264 is
+        // limited-range 4:2:0, so the flat key green drifts at edges.
+        float4 video = txStinger.Sample(samLinear, pin.Tex);
+        float dominance = video.g - max(video.r, video.b);
+        float alpha = saturate((gKeyThreshold - dominance) / gKeySoftness);
+        float spill = max(0.0, video.g - max(video.r, video.b));
+        video.g = video.g - spill * (1.0 - alpha);
+        return float4(video.rgb * gWhiteReference * gEmissive, alpha);
+      }
       float2 uv = float2((pin.Tex.x - gOffsetX) * 0.5, pin.Tex.y);
       if (uv.x < 0 || uv.x > 1) return float4(0, 0, 0, 0);
       float4 color = txStinger.Sample(samLinear, uv);
@@ -1049,18 +1371,29 @@ local stingerPass = {
 function renderStinger()
   if stinger == nil then return end
 
-  local x
-  if stinger.phase == 'cover' then
-    local t = smoothstep01((os.preciseClock() - stinger.phaseStarted) / STINGER_TIMING.slideInS)
-    x = -2 + 1.5 * t
-  elseif stinger.phase == 'wait' then
-    x = -0.5
+  local useVideo = stinger.video == true and stingerVideoReady()
+  stingerPass.textures.txStinger = useVideo and stingerPlayer or 'stinger.png'
+  stingerPass.values.gUseGreenKey = useVideo and 1 or 0
+  -- Video frames are display-referred; the PNG strip needs CSP's HDR boost.
+  stingerPass.values.gEmissive = useVideo and 1 or 3
+
+  if useVideo then
+    -- The clip carries its own wipe, so it is sampled full-screen.
+    stingerPass.values.gOffsetX = 0
   else
-    local t = smoothstep01((os.preciseClock() - stinger.phaseStarted) / STINGER_TIMING.slideOutS)
-    x = -0.5 + 1.5 * t
+    local x
+    if stinger.phase == 'cover' then
+      local t = smoothstep01((os.preciseClock() - stinger.phaseStarted) / STINGER_TIMING.slideInS)
+      x = -2 + 1.5 * t
+    elseif stinger.phase == 'wait' then
+      x = -0.5
+    else
+      local t = smoothstep01((os.preciseClock() - stinger.phaseStarted) / STINGER_TIMING.slideOutS)
+      x = -0.5 + 1.5 * t
+    end
+    stingerPass.values.gOffsetX = x
   end
 
-  stingerPass.values.gOffsetX = x
   -- Match CSP's HDR value for display white so exposure changes do not dim
   -- or brighten the stinger along with the scene.
   stingerPass.values.gWhiteReference = sim.whiteReferencePoint
@@ -1074,15 +1407,48 @@ local COLOR_DIM     = rgbm(0.6, 0.6, 0.6, 1.0)
 
 local COLOR_ROW_FOCUSED = rgbm(0.16, 0.22, 0.28, 1.0)
 
-local function drawDriverColumns(pos, width, height, position, name, interval, color)
+-- Incident badges in the in-game driver list. Unlike the amber web panel this
+-- window already uses a blue focus colour, so HIT/FLIP get their own hues.
+local COLOR_HIT  = rgbm(0.95, 0.24, 0.12, 1.0)   -- contact, most severe
+local COLOR_FLIP = rgbm(1.00, 0.82, 0.18, 1.0)   -- rollover
+
+local STATUS_COL_W = 42
+
+local function drawStatusBadge(pos, height, label, fill)
+  local p1 = vec2(pos.x, pos.y + 2)
+  local p2 = vec2(pos.x + STATUS_COL_W - 3, pos.y + height - 2)
+  ui.drawRectFilled(p1, p2, fill)
+  ui.drawTextClipped(label, p1, p2, rgbm(0, 0, 0, 1), vec2(0.5, 0.5))
+end
+
+local function drawDriverColumns(pos, width, height, position, name,
+    interval, color, status, statusColor, depth, depthColor)
   local nameX = pos.x + 28
-  local intervalX = pos.x + width - 58
+  local hasStatus = status ~= nil and status ~= ''
+  local statusW = hasStatus and STATUS_COL_W or 0
+  -- When no badge is present the interval stays flush to the window edge,
+  -- exactly as before; with a badge it yields 4 px so the two never touch.
+  local intervalRightX = pos.x + width - statusW - (hasStatus and 4 or 0)
+  local intervalX = intervalRightX - 58
+  -- The debug signal column takes its space from the name, not the interval:
+  -- gaps are the operator's primary read and must not shift.
+  local depthW = (depth ~= nil and HIT_DEBUG) and HIT_DEBUG_COL_W or 0
+  local depthRightX = intervalX - 4
+  local depthX = depthRightX - depthW
+  local nameRightX = depthW > 0 and (depthX - 4) or (intervalX - 4)
   ui.drawTextClipped(position, pos, vec2(nameX - 4, pos.y + height),
     COLOR_DIM, vec2(0, 0.5))
-  ui.drawTextClipped(name, vec2(nameX, pos.y), vec2(intervalX - 4, pos.y + height),
+  ui.drawTextClipped(name, vec2(nameX, pos.y), vec2(nameRightX, pos.y + height),
     color, vec2(0, 0.5), true)
-  ui.drawTextClipped(interval, vec2(intervalX, pos.y), vec2(pos.x + width, pos.y + height),
+  ui.drawTextClipped(interval, vec2(intervalX, pos.y), vec2(intervalRightX, pos.y + height),
     color, vec2(1, 0.5))
+  if depthW > 0 then
+    ui.drawTextClipped(depth, vec2(depthX, pos.y), vec2(depthRightX, pos.y + height),
+      depthColor or COLOR_DIM, vec2(1, 0.5))
+  end
+  if hasStatus then
+    drawStatusBadge(vec2(pos.x + width - STATUS_COL_W, pos.y), height, status, statusColor)
+  end
 end
 
 function script.windowMain(dt)
@@ -1095,13 +1461,38 @@ function script.windowMain(dt)
   -- Keep all three columns aligned even when the list needs a scrollbar.
   ui.beginChild('drivers', vec2(0, 0), false, ui.WindowFlags.None)
   local width = ui.availableSpaceX()
-  drawDriverColumns(ui.getCursor(), width, rowHeight, 'P', 'Driver', 'Int', COLOR_DIM)
+  drawDriverColumns(ui.getCursor(), width, rowHeight, 'P', 'Driver', 'Int',
+    COLOR_DIM, nil, nil, HIT_DEBUG and 'Imp' or nil, COLOR_DIM)
   ui.dummy(vec2(width, rowHeight))
 
   for _, d in ipairs(driverRows) do
     local isFocused = d.carId == focusedCar
     local color = isFocused and COLOR_FOCUSED
       or (d.isConnected and COLOR_DEFAULT or COLOR_OFFLINE)
+    local status, statusColor = nil, nil
+    if d.isRolledOver then
+      status, statusColor = 'FLP', COLOR_FLIP
+    elseif d.isHit then
+      status, statusColor = 'HIT', COLOR_HIT
+    end
+    local depthText, depthColor
+    if HIT_DEBUG then
+      local depth = hitDebugDepth[d.carId]
+      local live = hitDebugResidual[d.carId] or 0
+      local peak = hitDebugPeak[d.carId]
+      local partner = hitDebugPartner[d.carId]
+      if depth ~= nil then
+        depthText, depthColor = string.format('d%.2f', depth), COLOR_HIT
+      elseif live > HIT_RESIDUAL_MS2 * 0.25 then
+        depthText, depthColor = string.format('%.0f', live), COLOR_HIT
+      elseif partner ~= nil and d.isHit then
+        depthText, depthColor = string.format('@%d', partner), COLOR_HIT
+      elseif peak ~= nil and peak > HIT_RESIDUAL_MS2 * 0.25 then
+        depthText, depthColor = string.format('(%.0f)', peak), COLOR_DIM
+      else
+        depthText, depthColor = '-', COLOR_OFFLINE
+      end
+    end
     local pos = ui.getCursor()
     if ui.invisibleButton('driver##' .. d.carId, vec2(width, rowHeight))
         and d.isConnected and not isFocused then
@@ -1111,7 +1502,7 @@ function script.windowMain(dt)
       ui.drawRectFilled(pos, vec2(pos.x + width, pos.y + rowHeight), COLOR_ROW_FOCUSED)
     end
     drawDriverColumns(pos, width, rowHeight, tostring(d.position), d.name,
-      d.interval or '', color)
+      d.interval or '', color, status, statusColor, depthText, depthColor)
   end
 
   ui.endChild()
